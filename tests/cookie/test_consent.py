@@ -31,10 +31,18 @@ class FakeRunner:
     assert call counts.
     """
 
-    def __init__(self, *, status: tuple[int, bytes], retrieve: tuple[int, bytes], security: tuple[int, bytes]):
+    def __init__(
+        self,
+        *,
+        status: tuple[int, bytes],
+        retrieve: tuple[int, bytes],
+        security: tuple[int, bytes],
+        enroll: tuple[int, bytes] = (0, b""),
+    ):
         self.status = status
         self.retrieve = retrieve
         self.security = security
+        self.enroll = enroll
         self.calls: list[list[str]] = []
 
     async def __call__(
@@ -51,7 +59,7 @@ class FakeRunner:
                 case "vault-retrieve":
                     code, out = self.retrieve
                 case "vault-enroll":
-                    code, out = 0, b""
+                    code, out = self.enroll
                 case _:
                     raise AssertionError(f"unexpected command: {argv}")
         if check and code != 0:
@@ -106,6 +114,24 @@ async def test_enroll_then_retrieve_when_vault_missing(monkeypatch: pytest.Monke
     assert runner.verb_count("vault-retrieve") == 1
     enroll = next(argv for argv in runner.calls if argv[1] == "vault-enroll")
     assert enroll == [str(HELPER), "vault-enroll", VAULT, CHROME.keychain_service]
+
+
+async def test_enroll_failure_raises_consent_error(monkeypatch: pytest.MonkeyPatch, patched_helper: None) -> None:
+    # L3: vault-enroll runs with check=False; a nonzero exit must surface as ConsentError
+    # (its documented contract), not a raw subprocess.CalledProcessError.
+    runner = FakeRunner(
+        status=(2, b"biometry=true passcode=true vault=false\n"),
+        retrieve=(0, PASSWORD.encode()),
+        security=(1, b""),
+        enroll=(2, b"could not read 'Chrome Safe Storage' from the login keychain"),
+    )
+    _install(monkeypatch, runner)
+
+    with pytest.raises(ConsentError, match="enroll"):
+        await TouchIDConsent().obtain_key(CHROME, reason="post a tweet")
+
+    assert runner.verb_count("vault-enroll") == 1
+    assert runner.verb_count("vault-retrieve") == 0
 
 
 async def test_decline_raises_consent_error(monkeypatch: pytest.MonkeyPatch, patched_helper: None) -> None:

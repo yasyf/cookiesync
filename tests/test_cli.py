@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING
 import pytest
 from click.testing import CliRunner
 
-from cookiesync import cli, paths
+from cookiesync import helper, paths
 from cookiesync.cli import main
 
 if TYPE_CHECKING:
@@ -32,12 +32,16 @@ def test_hello_is_gone() -> None:
     assert result.exit_code != 0
 
 
-def _codesign_returns(monkeypatch: pytest.MonkeyPatch, code: int) -> None:
+def _codesign_returns(monkeypatch: pytest.MonkeyPatch, code: int) -> list[list[str]]:
+    calls: list[list[str]] = []
+
     async def fake(command: Sequence[str], *, check: bool = True, **_: object) -> subprocess.CompletedProcess[bytes]:
-        assert list(command)[0] == cli.CODESIGN
+        assert list(command)[0] == helper.CODESIGN
+        calls.append(list(command))
         return subprocess.CompletedProcess(list(command), code, stdout=b"", stderr=b"")
 
-    monkeypatch.setattr(cli.anyio, "run_process", fake)
+    monkeypatch.setattr(helper.anyio, "run_process", fake)
+    return calls
 
 
 def _install_helper(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
@@ -71,3 +75,16 @@ def test_doctor_fails_when_helper_missing(monkeypatch: pytest.MonkeyPatch, tmp_p
     result = CliRunner().invoke(main, ["doctor"])
     assert result.exit_code != 0
     assert "cookiesync install" in result.output
+
+
+def test_doctor_signature_check_uses_developer_id_anchor(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    # M1: an ad-hoc bundle passes a bare `codesign --verify --strict`; doctor must instead
+    # assert the Developer-ID anchor OID, so the check fails OPEN for ad-hoc signatures.
+    _install_helper(monkeypatch, tmp_path)
+    calls = _codesign_returns(monkeypatch, 0)
+    CliRunner().invoke(main, ["doctor"])
+    assert calls, "doctor never ran codesign"
+    argv = calls[0]
+    assert "-R" in argv
+    assert helper.DEVELOPER_ID_REQUIREMENT in argv
+    assert "1.2.840.113635.100.6.2.6" in helper.DEVELOPER_ID_REQUIREMENT

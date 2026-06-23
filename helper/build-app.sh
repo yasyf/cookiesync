@@ -20,6 +20,17 @@ set -euo pipefail
 TEAM_ID="${1:?usage: build-app.sh <TEAM_ID> [provisioning-profile-path]}"
 PROFILE_PATH="${2:-}"
 
+# The Swift keychain-access-group is a COMPILE-TIME literal in main.swift
+# (SXKCTF23Q2.com.yasyf.cookiesync.helper), but the entitlements template carries
+# $(TEAM_ID) from the cert. A cert from a different team would build a bundle whose
+# runtime keychain item group never matches the literal, so every SecItem call would
+# errSecMissingEntitlement. Fail loud before compiling so that can't ship.
+EXPECTED_TEAM_ID="SXKCTF23Q2"
+if [ "$TEAM_ID" != "$EXPECTED_TEAM_ID" ]; then
+	echo "build-app.sh: TEAM_ID '$TEAM_ID' != '$EXPECTED_TEAM_ID' — main.swift's keychain-access-group literal is bound to $EXPECTED_TEAM_ID; a different-team cert would errSecMissingEntitlement at runtime" >&2
+	exit 1
+fi
+
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SRC="$HERE/Sources/cookiesync-keyhelper/main.swift"
 INFO_PLIST="$HERE/Info.plist"

@@ -25,12 +25,6 @@ concurrency:
 jobs:
   build:
     runs-on: macos-15
-    env:
-      # Surface the gate secret as an env var so the step `if` can read it (a step
-      # `if:` can't read `secrets.*` directly). Empty when the signing secrets
-      # aren't configured — the build then fails loud at codesign, which is correct:
-      # an unsigned helper is useless (it can't touch the Secure Enclave).
-      MACOS_SIGN_P12: ${{ secrets.MACOS_SIGN_P12 }}
     steps:
       - uses: actions/checkout@v6
 
@@ -80,7 +74,12 @@ jobs:
 
       - name: Build, sign, notarize, and staple the helper .app
         run: |
-          VERSION="${GITHUB_REF_NAME#helper-v}"
+          # The release asset is versioned by the tag with the `helper-` prefix
+          # stripped (helper-vX.Y.Z -> vX.Y.Z), so the name reads
+          # cookiesync-keyhelper-vX.Y.Z-darwin.zip — not a doubled
+          # cookiesync-keyhelper-helper-vX.Y.Z. `cookiesync install` matches it by
+          # the cookiesync-keyhelper-*-darwin.zip glob.
+          ASSET_TAG="${GITHUB_REF_NAME#helper-}"
 
           # Assemble the bundle: compiles main.swift into Contents/MacOS, copies
           # Info.plist + the provisioning profile, and writes
@@ -130,9 +129,9 @@ jobs:
           # ditto -c -k preserves the bundle metadata a plain zip drops; zip the
           # STAPLED app so `cookiesync install` can fetch and verify it offline.
           mkdir -p dist
-          ditto -c -k --keepParent "$APP" "dist/cookiesync-keyhelper-${GITHUB_REF_NAME}-darwin.zip"
-          shasum -a 256 "dist/cookiesync-keyhelper-${GITHUB_REF_NAME}-darwin.zip" > "dist/cookiesync-keyhelper-${GITHUB_REF_NAME}-darwin.zip.sha256"
-          cat "dist/cookiesync-keyhelper-${GITHUB_REF_NAME}-darwin.zip.sha256"
+          ditto -c -k --keepParent "$APP" "dist/cookiesync-keyhelper-${ASSET_TAG}-darwin.zip"
+          shasum -a 256 "dist/cookiesync-keyhelper-${ASSET_TAG}-darwin.zip" > "dist/cookiesync-keyhelper-${ASSET_TAG}-darwin.zip.sha256"
+          cat "dist/cookiesync-keyhelper-${ASSET_TAG}-darwin.zip.sha256"
 
       - name: Create GitHub Release with the stapled .app asset
         # workflow_dispatch has no tag, so skip the release on a manual run — that

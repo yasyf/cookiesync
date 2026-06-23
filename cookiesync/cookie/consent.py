@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, NamedTuple, Protocol
 
 import anyio
 
@@ -33,6 +33,12 @@ if TYPE_CHECKING:
 
 SECURITY = "/usr/bin/security"
 REASON_CAP = 160
+
+
+class VaultStatus(NamedTuple):
+    returncode: int
+    has_passcode: bool
+    has_vault: bool
 
 
 class ConsentError(Exception):
@@ -80,10 +86,10 @@ class TouchIDConsent:
         env = os.environ | {"COOKIESYNC_TOUCHID_REASON": compose_reason(browser.display, reason)}
 
         status = await anyio.run_process([str(helper), "vault-status", vault], check=False)
-        match status.returncode, b"passcode=true" in status.stdout, b"vault=true" in status.stdout:
-            case 2, False, _:
+        match VaultStatus(status.returncode, b"passcode=true" in status.stdout, b"vault=true" in status.stdout):
+            case VaultStatus(returncode=2, has_passcode=False):
                 return derive_key(await self.read_safe_storage(browser.keychain_service))
-            case _, _, True:
+            case VaultStatus(has_vault=True):
                 return derive_key(await self.retrieve(helper, vault, browser.keychain_service, env=env))
             case _:
                 await self.enroll(helper, vault, browser.keychain_service)
@@ -108,7 +114,12 @@ class TouchIDConsent:
                 raise ConsentError("Touch ID vault retrieval failed after re-enrollment")
 
     async def enroll(self, helper: Path, vault: str, safe_storage_service: str) -> None:
-        await anyio.run_process([str(helper), "vault-enroll", vault, safe_storage_service])
+        result = await anyio.run_process([str(helper), "vault-enroll", vault, safe_storage_service], check=False)
+        if result.returncode != 0:
+            raise ConsentError(
+                f"could not enroll the Touch ID vault for {safe_storage_service!r} "
+                f"(exit {result.returncode}: {result.stderr.decode().strip() or 'no detail'})"
+            )
 
     async def read_safe_storage(self, service: str) -> SafeStorageKey:
         result = await anyio.run_process([SECURITY, "find-generic-password", "-w", "-s", service], check=False)

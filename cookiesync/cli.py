@@ -8,19 +8,18 @@ import anyio
 import click
 from loguru import logger
 
-from cookiesync import paths, state
+from cookiesync import helper, paths, state
 from cookiesync.cookie import OutputFormat, StorageState, render
 from cookiesync.cookie.browsers import REGISTRY
 from cookiesync.daemon import rpc
 from cookiesync.daemon.rpc import RpcError
 from cookiesync.daemon.wire import cookie_from_wire
+from cookiesync.helper import HelperState
 from cookiesync.registry import RegistryError, reposync_registry, reposync_self
 from cookiesync.state import BrowserEndpoint, BrowserId, SshTarget, parse_duration
 
 if TYPE_CHECKING:
     from cookiesync.daemon.wire import Response
-
-CODESIGN = "/usr/bin/codesign"
 
 
 @click.group()
@@ -126,16 +125,29 @@ async def run_watch() -> None:
 @main.command()
 @click.option("--tick-only", is_flag=True, help="Install only the periodic reconcile tick, not the watch daemon.")
 def install(tick_only: bool) -> None:
-    """Install the cookiesync LaunchAgents (watch daemon and reconcile tick)."""
+    """Fetch the signed key helper, then install the cookiesync LaunchAgents (watch daemon and reconcile tick)."""
     anyio.run(run_install, tick_only)
 
 
 async def run_install(tick_only: bool) -> None:
     from cookiesync.service import LaunchctlLauncher, install
 
-    await report_helper()
+    await ensure_helper()
     await install(LaunchctlLauncher(), tick_only=tick_only)
     click.echo("Installed cookiesync agents." if not tick_only else "Installed the cookiesync reconcile tick.")
+
+
+async def ensure_helper() -> None:
+    match await helper.helper_state():
+        case HelperState.OK:
+            click.echo(f"Key helper present and Developer-ID-signed: {paths.helper_app_path()}")
+        case _:
+            click.echo("Fetching the signed key helper from the latest release…", err=True)
+            try:
+                app = await helper.install_helper()
+            except helper.HelperInstallError as exc:
+                raise click.ClickException(str(exc)) from exc
+            click.echo(f"Installed and verified key helper: {app}")
 
 
 @main.command()
@@ -145,42 +157,17 @@ def doctor() -> None:
 
 
 async def run_doctor() -> None:
-    match await helper_state():
-        case "ok":
+    match await helper.helper_state():
+        case HelperState.OK:
             click.echo(f"key helper OK: {paths.helper_app_path()} (Developer ID signed)")
-        case "unsigned":
+        case HelperState.UNSIGNED:
             raise click.ClickException(
-                f"key helper at {paths.helper_app_path()} is not Developer-ID-signed; reinstall the notarized .app"
+                f"key helper at {paths.helper_app_path()} is not Developer-ID-signed; "
+                "reinstall the notarized .app via 'cookiesync install'"
             )
-        case "missing":
+        case HelperState.MISSING:
             raise click.ClickException(
                 f"key helper not installed at {paths.helper_app_path()}; run 'cookiesync install' to fetch it"
-            )
-
-
-async def helper_state() -> str:
-    """Classify the installed key helper as ``ok`` (signed), ``unsigned``, or ``missing``."""
-    if not paths.helper_binary().is_file():
-        return "missing"
-    result = await anyio.run_process([CODESIGN, "--verify", "--strict", str(paths.helper_app_path())], check=False)
-    return "ok" if result.returncode == 0 else "unsigned"
-
-
-async def report_helper() -> None:
-    match await helper_state():
-        case "ok":
-            return
-        case "unsigned":
-            click.echo(
-                f"Warning: key helper at {paths.helper_app_path()} is not Developer-ID-signed; "
-                "reinstall the notarized .app — Secure-Enclave operations will fail closed.",
-                err=True,
-            )
-        case "missing":
-            click.echo(
-                f"Warning: key helper not installed at {paths.helper_app_path()}; "
-                "Touch-ID consent and the key cache will fail closed until it is installed.",
-                err=True,
             )
 
 

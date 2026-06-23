@@ -79,7 +79,7 @@ exact names:
 
 4. **The signed `.app` lands as a release asset.** When the run is green, the
    GitHub release for the tag carries
-   `cookiesync-keyhelper-helper-v1.0.0-darwin.zip` (the stapled bundle) and its
+   `cookiesync-keyhelper-v1.0.0-darwin.zip` (the stapled bundle) and its
    `.sha256`. `cookiesync install` downloads and unzips it on the user's Mac.
 
 ## Validating the Secure Enclave
