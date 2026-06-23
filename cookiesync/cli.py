@@ -235,7 +235,7 @@ async def run_auth(browser_name: str, profile: str, reason: str | None, ttl: str
 
 
 @main.command()
-@click.argument("url")
+@click.argument("urls", nargs=-1, required=True)
 @click.option(
     "--browser", "browser_name", default="chrome", show_default=True, help="The browser to read cookies from."
 )
@@ -248,13 +248,20 @@ async def run_auth(browser_name: str, profile: str, reason: str | None, ttl: str
     show_default=True,
     help="The output wire format.",
 )
-def cookies(url: str, browser_name: str, profile: str, fmt: str) -> None:
-    """Stream URL's cookies in the chosen format, decrypting with the daemon's cached key."""
-    anyio.run(run_cookies, url, browser_name, profile, fmt)
+def cookies(urls: tuple[str, ...], browser_name: str, profile: str, fmt: str) -> None:
+    """Stream the cookies for one or more URLS in the chosen format, merged into one document.
+
+    Pass several hosts (e.g. an app and the API host it calls) to get a single storageState
+    spanning them all — one cached-key decrypt, no extra Touch ID prompt.
+    """
+    anyio.run(run_cookies, urls, browser_name, profile, fmt)
 
 
-async def run_cookies(url: str, browser_name: str, profile: str, fmt: str) -> None:
-    result = await daemon_call("get_cookies", {"url": url, "browser": browser_name, "profile": profile})
+async def run_cookies(urls: tuple[str, ...], browser_name: str, profile: str, fmt: str) -> None:
+    # Dual-field wire: a new daemon prefers "urls" and merges every host; an older resident
+    # daemon still reads "url" and serves the first host, so the call degrades, never crashes.
+    params = {"url": urls[0], "urls": list(urls), "browser": browser_name, "profile": profile}
+    result = await daemon_call("get_cookies", params)
     state_obj = StorageState(tuple(cookie_from_wire(c) for c in result["cookies"]))
     for line in render(state_obj, OutputFormat(fmt)):
         click.echo(line)

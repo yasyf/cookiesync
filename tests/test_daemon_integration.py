@@ -238,6 +238,68 @@ async def test_get_cookies_returns_wire_cookies_from_the_cache(
     assert [c["value"] for c in resp.result["cookies"]] == ["s3cr3t"]
 
 
+async def test_get_cookies_merges_multiple_urls_into_one_set(sock_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    cache = KeyCache(FakeWrapper())
+    await cache.put("me@laptop:chrome:Default", KEY, ttl=300.0)
+    daemon = make_daemon(consent=FakeConsent(), cache=cache, engine=FakeEngine())
+
+    seen: list[str] = []
+    per_host = {
+        "https://app.example.com": cookie("app", "A"),
+        "https://api.example.com": cookie("api", "B"),
+    }
+
+    async def fake_extract(url: str, *, browser, key, backend, profile, **_kw) -> StorageState:
+        seen.append(url)
+        return StorageState((per_host[url],))
+
+    monkeypatch.setattr(server, "extract", fake_extract)
+
+    async with serving(daemon.dispatcher()):
+        resp = await call(
+            "get_cookies",
+            {
+                "url": "https://app.example.com",
+                "urls": ["https://app.example.com", "https://api.example.com"],
+                "browser": "chrome",
+            },
+        )
+
+    assert resp.ok, resp.error
+    # One cached-key decrypt per host (no extra prompt), unioned into a single document.
+    assert seen == ["https://app.example.com", "https://api.example.com"]
+    assert {(c["name"], c["value"]) for c in resp.result["cookies"]} == {("app", "A"), ("api", "B")}
+
+
+async def test_get_cookies_dedups_a_shared_domain_cookie_across_hosts(
+    sock_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cache = KeyCache(FakeWrapper())
+    await cache.put("me@laptop:chrome:Default", KEY, ttl=300.0)
+    daemon = make_daemon(consent=FakeConsent(), cache=cache, engine=FakeEngine())
+
+    # A .example.com domain cookie is sent to BOTH hosts, so the per-URL extracts each return it.
+    shared = cookie("sid", "s")
+
+    async def fake_extract(url: str, *, browser, key, backend, profile, **_kw) -> StorageState:
+        return StorageState((shared,))
+
+    monkeypatch.setattr(server, "extract", fake_extract)
+
+    async with serving(daemon.dispatcher()):
+        resp = await call(
+            "get_cookies",
+            {
+                "url": "https://example.com",
+                "urls": ["https://example.com", "https://api.example.com"],
+                "browser": "chrome",
+            },
+        )
+
+    assert resp.ok, resp.error
+    assert len(resp.result["cookies"]) == 1, "a domain cookie shared by overlapping hosts collapses to one row"
+
+
 async def test_get_cookies_fails_closed_when_the_cache_is_cold(sock_path: Path) -> None:
     daemon = make_daemon(consent=FakeConsent(), cache=KeyCache(FakeWrapper()), engine=FakeEngine())
 

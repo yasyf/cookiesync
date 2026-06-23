@@ -15,8 +15,9 @@ The method set splits in two:
 * **Local methods** are terminal and carry no origin — what the CLI on this box invokes:
   ``prime_auth`` obtains the Safe Storage key (locally behind Touch ID when a session is live,
   else by routing the user-presence gate to the active peer and then releasing this host's
-  *own* key non-interactively) and caches it; ``get_cookies`` renders a url's cookies from the
-  cached key, failing closed when cold; ``auth_status`` reports cache warmth; ``request_consent``
+  *own* key non-interactively) and caches it; ``get_cookies`` renders one or more urls' cookies,
+  merged into one set, from the cached key, failing closed when cold; ``auth_status`` reports cache
+  warmth; ``request_consent``
   shows the Touch-ID prompt for the named browser to the person at *this* machine and echoes the
   requester's nonce + endpoint to bind the approval — the key never crosses hosts.
 
@@ -35,7 +36,7 @@ from typing import TYPE_CHECKING
 import anyio
 
 from cookiesync import state as state_module
-from cookiesync.cookie import LocalBackend, extract
+from cookiesync.cookie import LocalBackend, extract, merge
 from cookiesync.cookie.browsers import REGISTRY, BrowserName
 from cookiesync.cookie.consent import ConsentError
 from cookiesync.cookie.crypto import DecryptError, decrypt_value
@@ -338,15 +339,23 @@ class Daemon:
             raise AuthRequired(
                 f"no cached key for {endpoint_id(state.self_target, browser, profile)}; run cookiesync auth"
             )
-        result = await extract(
-            params["url"],
-            browser=browser_for(browser),
-            key=AesKey(key),
-            backend=LocalBackend(self.consent),
-            profile=profile,
-            fallback=False,
-        )
-        return {"cookies": [cookie_to_wire(c) for c in result.cookies]}
+        # New CLIs send "urls" (one or more hosts); older ones send a single "url". Decrypt each
+        # host with the same cached key — no extra prompt — and union them by logical identity, so
+        # a domain cookie shared by overlapping hosts collapses to one row.
+        urls = params.get("urls") or [params["url"]]
+        backend = LocalBackend(self.consent)
+        states = [
+            await extract(
+                url,
+                browser=browser_for(browser),
+                key=AesKey(key),
+                backend=backend,
+                profile=profile,
+                fallback=False,
+            )
+            for url in urls
+        ]
+        return {"cookies": [cookie_to_wire(c) for c in merge(*(s.cookies for s in states))]}
 
     async def handle_auth_status(self, params: dict) -> dict:
         state = await self.load_state()

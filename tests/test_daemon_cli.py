@@ -168,6 +168,32 @@ def test_cookies_streams_a_playwright_state_to_stdout(daemon: RunningDaemon, mon
     assert {(c["name"], c["value"]) for c in payload["cookies"]} == {("sid", "s3cr3t"), ("uid", "42")}
 
 
+def test_cookies_merges_multiple_urls_in_one_call(daemon: RunningDaemon, monkeypatch: pytest.MonkeyPatch) -> None:
+    from cookiesync.cli import main
+
+    per_host = {
+        "https://app.example.com": cookie("app", "A"),
+        "https://api.example.com": cookie("api", "B"),
+    }
+
+    async def fake_extract(url, *, browser, key, backend, profile, **_kw) -> StorageState:
+        return StorageState((per_host[url],))
+
+    monkeypatch.setattr(server, "extract", fake_extract)
+
+    CliRunner().invoke(main, ["auth", "--browser", "chrome"])
+    # Several hosts in one invocation -> one daemon call -> one merged storageState (run_cookies
+    # makes exactly one get_cookies call regardless of host count).
+    result = CliRunner().invoke(
+        main, ["cookies", "https://app.example.com", "https://api.example.com", "--browser", "chrome"]
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["origins"] == []
+    assert {(c["name"], c["value"]) for c in payload["cookies"]} == {("app", "A"), ("api", "B")}
+
+
 def test_cookies_default_format_is_playwright(daemon: RunningDaemon, monkeypatch: pytest.MonkeyPatch) -> None:
     from cookiesync.cli import main
 
