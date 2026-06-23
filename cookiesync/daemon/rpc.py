@@ -12,6 +12,7 @@ from __future__ import annotations
 import os
 import socket
 import struct
+import sys
 from typing import TYPE_CHECKING
 
 import anyio
@@ -134,7 +135,10 @@ async def serve(dispatcher: Dispatcher, *, task_status: TaskStatus[None] = anyio
 
     async def handle(stream: SocketStream) -> None:
         async with stream:
-            if (uid := peer_uid(stream.extra(SocketAttribute.raw_socket))) != os.getuid():
+            # LOCAL_PEERCRED is macOS-only; this daemon runs only on macOS, where the
+            # same-uid check is enforced. Off-macOS (CI/import only) the 0700 socket dir
+            # is the boundary, so skip the unsupported getsockopt.
+            if sys.platform == "darwin" and (uid := peer_uid(stream.extra(SocketAttribute.raw_socket))) != os.getuid():
                 await stream.send(encode_response(Response(ok=False, error=f"peer uid {uid} is not {os.getuid()}")))
                 return
             with anyio.move_on_after(READ_TIMEOUT) as scope:
