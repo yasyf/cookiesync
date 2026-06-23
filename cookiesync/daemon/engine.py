@@ -32,6 +32,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, NewType, Protocol
 
 import anyio
+from loguru import logger
 
 from cookiesync.cookie import REGISTRY
 from cookiesync.cookie.browsers import BrowserName
@@ -101,10 +102,19 @@ async def cookies_mtime(endpoint: BrowserEndpoint) -> float:
 
 
 async def watch_endpoint(endpoint: BrowserEndpoint) -> AsyncIterator[object]:
-    """Yield once per ``watchfiles`` change batch on an endpoint's profile directory."""
+    """Yield once per ``watchfiles`` change batch on an endpoint's profile directory.
+
+    A local endpoint whose profile directory does not exist yet — e.g. a registered sync
+    target this host has not created — has nothing to watch. Log and return rather than let
+    ``watchfiles`` raise ``FileNotFoundError`` and tear the whole daemon down.
+    """
     from watchfiles import awatch
 
-    async for changes in awatch(watch_dir(endpoint)):
+    directory = watch_dir(endpoint)
+    if not await anyio.Path(str(directory)).exists():
+        logger.warning("not watching {}: profile dir {} does not exist", endpoint.id, directory)
+        return
+    async for changes in awatch(directory):
         yield changes
 
 

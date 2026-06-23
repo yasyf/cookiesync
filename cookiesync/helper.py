@@ -50,7 +50,9 @@ async def developer_id_signed(app_path: Path) -> bool:
     returns ``False``.
     """
     result = await anyio.run_process(
-        [CODESIGN, "--verify", "--strict", "-R", DEVELOPER_ID_REQUIREMENT, str(app_path)],
+        # -R takes the requirement inline via `-R=<req>`; as a separate argv (`-R`, `<req>`)
+        # codesign reads it as a requirement *file* path and fails "invalid requirement".
+        [CODESIGN, "--verify", "--strict", f"-R={DEVELOPER_ID_REQUIREMENT}", str(app_path)],
         check=False,
     )
     return result.returncode == 0
@@ -76,7 +78,11 @@ async def supports_contract() -> bool:
         [str(paths.helper_binary()), "vault-status", PROBE_VAULT],
         check=False,
     )
-    return result.returncode == 0 and CONTRACT_LINE.search(result.stdout) is not None
+    # vault-status prints the contract line then exits 2 ("unavailable") for a vault that
+    # doesn't exist — our probe vault never does — so the contract line on stdout, not the
+    # exit code, is the capability signal. A helper lacking the subcommand prints usage to
+    # stderr and emits no such line.
+    return CONTRACT_LINE.search(result.stdout) is not None
 
 
 async def install_helper() -> Path:

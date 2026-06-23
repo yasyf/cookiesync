@@ -107,7 +107,10 @@ async def test_developer_id_signed_evaluates_the_developer_id_anchor(monkeypatch
     argv = captured[0]
     assert argv[0] == helper.CODESIGN
     assert "--verify" in argv and "--strict" in argv
-    assert "-R" in argv and helper.DEVELOPER_ID_REQUIREMENT in argv
+    # codesign takes the requirement inline as `-R=<req>`; passing it as a separate
+    # `-R`, `<req>` makes codesign read the requirement as a (missing) file and reject
+    # every bundle, so the exact `-R=` form is the regression guard.
+    assert f"-R={helper.DEVELOPER_ID_REQUIREMENT}" in argv
     assert "1.2.840.113635.100.6.2.6" in helper.DEVELOPER_ID_REQUIREMENT
 
 

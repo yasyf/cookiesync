@@ -163,6 +163,6 @@ def test_doctor_signature_check_uses_developer_id_anchor(monkeypatch: pytest.Mon
     CliRunner().invoke(main, ["doctor"])
     assert calls, "doctor never ran codesign"
     argv = calls[0]
-    assert "-R" in argv
-    assert helper.DEVELOPER_ID_REQUIREMENT in argv
+    # codesign needs the requirement inline (`-R=<req>`); `-R`, `<req>` is read as a file path.
+    assert f"-R={helper.DEVELOPER_ID_REQUIREMENT}" in argv
     assert "1.2.840.113635.100.6.2.6" in helper.DEVELOPER_ID_REQUIREMENT

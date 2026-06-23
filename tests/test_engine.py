@@ -284,3 +284,15 @@ async def wait_for(predicate, *, tries: int = 1000) -> None:
             return
         await anyio.sleep(0)
     raise AssertionError("predicate never held")
+
+
+async def test_watch_endpoint_skips_a_missing_profile_dir(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A registered local endpoint whose profile dir doesn't exist (a sync target this host
+    # hasn't created) must be skipped — not crash the daemon by letting watchfiles raise
+    # FileNotFoundError up through the task group.
+    from pathlib import Path
+
+    from cookiesync.daemon import engine
+
+    monkeypatch.setattr(engine, "watch_dir", lambda _e: Path("/cookiesync/does-not-exist"))
+    assert [event async for event in engine.watch_endpoint(ENDPOINT)] == []
