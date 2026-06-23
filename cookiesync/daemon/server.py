@@ -274,10 +274,12 @@ class Daemon:
         state = await self.load_state()
         browser = BrowserId(params["browser"])
         profile = params.get("profile", DEFAULT_PROFILE)
-        await self.prime_auth(browser, profile, state)
+        await self.prime_auth(browser, profile, state, reason=params.get("reason") or CONSENT_REASON)
         return {"primed": True, "endpoint": endpoint_id(state.self_target, browser, profile)}
 
-    async def prime_auth(self, browser: BrowserId, profile: str, state: State) -> AesKey:
+    async def prime_auth(
+        self, browser: BrowserId, profile: str, state: State, *, reason: str = CONSENT_REASON
+    ) -> AesKey:
         """Obtain the Safe Storage key and cache it under the endpoint's TTL.
 
         A live local session releases the key behind one Touch-ID tap here. Otherwise the user
@@ -288,7 +290,7 @@ class Daemon:
         :class:`AuthRequired` when no peer can approve or the reply fails to bind.
         """
         if await has_active_session(probe=self.probe):
-            key = await self.consent.obtain_key(browser_for(browser), reason=CONSENT_REASON)
+            key = await self.consent.obtain_key(browser_for(browser), reason=reason)
         else:
             key = await self.routed_release(browser, profile, state)
         await self.cache.put(

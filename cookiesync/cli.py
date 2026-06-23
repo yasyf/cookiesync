@@ -220,16 +220,18 @@ async def run_sync(browser_name: str) -> None:
 @main.command()
 @click.option("--browser", "browser_name", default="chrome", show_default=True, help="The browser to authenticate.")
 @click.option("--profile", default="Default", show_default=True, help="The profile to authenticate.")
+@click.option("--reason", default=None, help="What the Touch ID prompt should say you're unlocking the cookies to do.")
 @click.option("--ttl", default=None, help="Override the cache TTL (Go-style duration, e.g. 15m).")
-def auth(browser_name: str, profile: str, ttl: str | None) -> None:
+def auth(browser_name: str, profile: str, reason: str | None, ttl: str | None) -> None:
     """Release the Safe Storage key behind one Touch ID tap and cache it for a short window."""
-    anyio.run(run_auth, browser_name, profile, ttl)
+    anyio.run(run_auth, browser_name, profile, reason, ttl)
 
 
-async def run_auth(browser_name: str, profile: str, ttl: str | None) -> None:
+async def run_auth(browser_name: str, profile: str, reason: str | None, ttl: str | None) -> None:
     if ttl is not None:
         await state.update(lambda s: replace(s, settings=replace(s.settings, auth_ttl=parse_duration(ttl))))
-    result = await daemon_call("prime_auth", {"browser": browser_name, "profile": profile})
+    params = {"browser": browser_name, "profile": profile} | ({"reason": reason} if reason else {})
+    result = await daemon_call("prime_auth", params)
     click.echo(f"Authenticated {result['endpoint']}.")
 
 

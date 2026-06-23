@@ -20,7 +20,12 @@ logged-in session too: hand a CI job or an agent the cookies it needs, never a p
 
 ## Install
 
-Run with [uvx](https://docs.astral.sh/uv/): `uvx cookiesync --help`.
+Install the `cookiesync` command with [uv](https://docs.astral.sh/uv/):
+
+```bash
+uv tool install cookiesync-cli
+cookiesync --help
+```
 
 ## Quickstart
 

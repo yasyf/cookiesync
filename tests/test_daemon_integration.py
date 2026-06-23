@@ -201,6 +201,18 @@ async def test_prime_auth_caches_a_key_on_the_active_session_path(sock_path: Pat
     assert await cache.get("me@laptop:chrome:Default") == KEY
 
 
+async def test_prime_auth_forwards_a_custom_reason_to_the_consent_gate(sock_path: Path) -> None:
+    consent = FakeConsent()
+    daemon = make_daemon(consent=consent, cache=KeyCache(FakeWrapper()), engine=FakeEngine())
+
+    async with serving(daemon.dispatcher()):
+        resp = await call("prime_auth", {"browser": "chrome", "profile": "Default", "reason": "post a tweet"})
+
+    assert resp.ok, resp.error
+    # `cookiesync auth --reason` reaches the consent gate verbatim, so the Touch ID prompt is task-specific.
+    assert consent.prompts == ["post a tweet"]
+
+
 async def test_get_cookies_returns_wire_cookies_from_the_cache(
     sock_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
