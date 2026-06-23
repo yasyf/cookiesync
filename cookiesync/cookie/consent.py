@@ -77,6 +77,8 @@ class Consent(Protocol):
 
     async def obtain_key(self, browser: Browser, *, reason: str) -> AesKey: ...
 
+    async def obtain_key_unprompted(self, browser: Browser) -> AesKey: ...
+
 
 @dataclass(frozen=True, slots=True)
 class TouchIDConsent:
@@ -85,6 +87,16 @@ class TouchIDConsent:
     Example:
         >>> await TouchIDConsent().obtain_key(REGISTRY[BrowserName("chrome")], reason="post a tweet")
     """
+
+    async def obtain_key_unprompted(self, browser: Browser) -> AesKey:
+        """Release ``browser``'s key non-interactively, via a bare Keychain read — no Touch ID.
+
+        For the owning host *only*, and *only* after a verified routed approval from the
+        active-session peer has already gated the release: this performs the unlocked
+        ``security`` read with no user-presence prompt, so the user-presence check must
+        have happened over the routed-consent handshake first.
+        """
+        return derive_key(await self.read_safe_storage(browser.keychain_service))
 
     async def obtain_key(self, browser: Browser, *, reason: str) -> AesKey:
         helper = await compile_helper()

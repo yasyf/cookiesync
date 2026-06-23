@@ -7,8 +7,9 @@ identity. The key is the *schema-superset* uniqueness tuple
 has_cross_site_ancestor)``; a ``Cookie`` from a v18 store (which lacks the last three
 columns) already carries the model's sentinel defaults for them, so heterogeneous
 v18/v24 cookies share one logical key space. Within a key, the winner is the max by
-``(last_update_utc, content_hash, endpoint_id)`` with a deterministic, content-derived
-final tie-break, so the result is independent of source order.
+``(last_update_utc, content_hash)``: ``content_hash`` breaks a timestamp tie
+deterministically from the cookie's value and flags, so the result is independent of
+source order — and two cookies with identical content collapse to the same stored row.
 """
 
 from __future__ import annotations
@@ -22,7 +23,7 @@ if TYPE_CHECKING:
     from collections.abc import Iterable
 
 MergeKey = tuple[str, str, str, str, int, int, int]
-MergeRank = tuple[int, str, str]
+MergeRank = tuple[int, str]
 
 
 def merge_key(cookie: Cookie) -> MergeKey:
@@ -52,16 +53,16 @@ def content_hash(cookie: Cookie) -> str:
 
 
 def merge_rank(cookie: Cookie) -> MergeRank:
-    return (int(cookie.last_update_utc), (h := content_hash(cookie)), f"{merge_key(cookie)}\x00{h}")
+    return (int(cookie.last_update_utc), content_hash(cookie))
 
 
 def merge(*sources: Iterable[Cookie]) -> tuple[Cookie, ...]:
     """Union all ``sources`` into one cookie set, keeping the newest per logical key.
 
     Each cookie is keyed by its schema-superset uniqueness tuple; for each key the winner
-    is the cookie with the greatest ``(last_update_utc, content_hash, content-derived
-    fallback)``, so the result is deterministic regardless of source order. No tombstones:
-    a cookie missing from a source is never a deletion.
+    is the cookie with the greatest ``(last_update_utc, content_hash)``, so the result is
+    deterministic regardless of source order. No tombstones: a cookie missing from a source
+    is never a deletion.
 
     Example:
         >>> merge(machine_a_cookies, machine_b_cookies)

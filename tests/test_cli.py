@@ -11,7 +11,13 @@ def test_help_exits_cleanly() -> None:
     assert result.output.startswith("Usage: main")
 
 
-def test_hello_greets() -> None:
-    result = CliRunner().invoke(main, ["hello"])
+def test_help_lists_daemon_commands() -> None:
+    result = CliRunner().invoke(main, ["--help"])
     assert result.exit_code == 0
-    assert result.output == "Hello from cookiesync!\n"
+    for command in ("watch", "install", "uninstall", "reconcile", "sync", "auth", "cookies", "rpc", "self"):
+        assert command in result.output
+
+
+def test_hello_is_gone() -> None:
+    result = CliRunner().invoke(main, ["hello"])
+    assert result.exit_code != 0

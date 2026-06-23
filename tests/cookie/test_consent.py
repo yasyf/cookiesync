@@ -185,6 +185,29 @@ async def test_invalidated_vault_reenrolls_then_retrieves(
     assert runner.verb_count("retrieve") == 2
 
 
+async def test_obtain_key_unprompted_does_a_bare_security_read_no_touch_id(
+    monkeypatch: pytest.MonkeyPatch, patched_helper: None
+) -> None:
+    # SF1: the owning-host non-interactive release reads Safe Storage directly via `security`
+    # and never invokes the Touch ID vault helper (status/retrieve/enroll).
+    runner = FakeRunner(
+        status=(0, b"biometry=true passcode=true vault=true\n"),
+        retrieve=(0, b"should-not-be-used"),
+        security=(0, PASSWORD.encode() + b"\n"),
+    )
+    _install(monkeypatch, runner)
+
+    key = await TouchIDConsent().obtain_key_unprompted(CHROME)
+
+    assert key == derive_key(SafeStorageKey(PASSWORD))
+    assert runner.verb_count(consent.SECURITY) == 1
+    assert runner.verb_count("retrieve") == 0
+    assert runner.verb_count("status") == 0
+    assert runner.verb_count("enroll") == 0
+    security = next(argv for argv in runner.calls if argv[0] == consent.SECURITY)
+    assert security == [consent.SECURITY, "find-generic-password", "-w", "-s", CHROME.keychain_service]
+
+
 def test_compose_reason_collapses_whitespace_and_caps() -> None:
     assert compose_reason("Chrome", "post   a\n\ttweet") == "access your Chrome session to post a tweet"
     long = "x" * 300
