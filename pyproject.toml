@@ -1,5 +1,5 @@
 [project]
-name = "cookiesync"
+name = "cookiesync-cli"
 version = "0.1.0"
 description = "Sync your browser cookies across machines."
 readme = "README.md"

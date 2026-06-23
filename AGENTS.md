@@ -1,6 +1,6 @@
 # cookiesync Development Guide
 
-Sync your browser cookies across machines. Published to PyPI as `cookiesync`; the CLI is `cookiesync`, run as `uvx cookiesync`.
+Sync your browser cookies across machines. Published to PyPI as `cookiesync-cli` (the bare `cookiesync` is blocked by PyPI's name-similarity guard); the CLI is `cookiesync`, installed via `uv tool install cookiesync-cli`.
 
 ## Repository Structure
 

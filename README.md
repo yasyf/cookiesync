@@ -2,8 +2,8 @@
 
 ![cookiesync banner](https://github.com/yasyf/cookiesync/raw/main/docs/assets/readme-banner.webp)
 
-[![PyPI](https://img.shields.io/pypi/v/cookiesync.svg)](https://pypi.org/project/cookiesync/)
-[![Python](https://img.shields.io/pypi/pyversions/cookiesync.svg)](https://pypi.org/project/cookiesync/)
+[![PyPI](https://img.shields.io/pypi/v/cookiesync-cli.svg)](https://pypi.org/project/cookiesync-cli/)
+[![Python](https://img.shields.io/pypi/pyversions/cookiesync-cli.svg)](https://pypi.org/project/cookiesync-cli/)
 [![License: PolyForm Noncommercial 1.0.0](https://img.shields.io/badge/License-PolyForm--Noncommercial--1.0.0-blue.svg)](https://github.com/yasyf/cookiesync/blob/main/LICENSE)
 
 Sync your browser cookies across machines.
@@ -20,33 +20,35 @@ re-authenticating anywhere.
 
 ## Install
 
-Run everything through [uvx](https://docs.astral.sh/uv/) — no install needed:
+cookiesync publishes on PyPI as `cookiesync-cli` and installs a `cookiesync`
+command. You'll reach for it often, so install it onto your PATH with
+[uv](https://docs.astral.sh/uv/):
 
 ```bash
-uvx cookiesync --help
+uv tool install cookiesync-cli
+cookiesync --help
 ```
 
-`uvx` fetches cookiesync into a throwaway environment and runs it. To add it to
-a project instead:
+To add it to a project instead:
 
 ```bash
-uv add cookiesync
+uv add cookiesync-cli
 ```
 
 ## Quickstart
 
 ```bash
 # Fetch the signed key helper and start the sync daemon (one time)
-uvx cookiesync install
+cookiesync install
 
 # Confirm the helper is installed and Developer-ID signed
-uvx cookiesync doctor
+cookiesync doctor
 
 # Track a browser to sync between this Mac and another host
-uvx cookiesync browser add other-host chrome
+cookiesync browser add other-host chrome
 
 # Hand a logged-in session to a script without giving it a password
-uvx cookiesync cookies https://example.com --browser chrome
+cookiesync cookies https://example.com --browser chrome
 ```
 
 Once a browser is tracked, the resident daemon watches its cookie store and
