@@ -38,6 +38,7 @@ pytestmark = pytest.mark.anyio
 
 SELF = SshTarget("me@laptop")
 PEER = SshTarget("peer@desktop")
+THIRD = SshTarget("third@server")
 CHROME = BrowserId("chrome")
 KEY = AesKey(bytes(range(32)))
 XOR_MASK = 0x5A
@@ -294,7 +295,7 @@ async def test_auth_status_reports_cache_warmth(sock_path: Path) -> None:
     assert warm.result == {"endpoint": "me@laptop:chrome:Default", "authenticated": True}
 
 
-async def test_sync_converges_a_group_and_skips_the_origin(sock_path: Path) -> None:
+async def test_sync_converges_the_union_and_skips_the_origin(sock_path: Path) -> None:
     cache = KeyCache(FakeWrapper())
     await cache.put("me@laptop:chrome:Default", KEY, ttl=300.0)
     local = FakeSource(cookies=(cookie("sid", "local"),))
@@ -307,11 +308,51 @@ async def test_sync_converges_a_group_and_skips_the_origin(sock_path: Path) -> N
         local=local,
     )
 
+    # No --browser: the union converge is browser-independent. Origin is the peer, so it is skipped.
     async with serving(daemon.dispatcher()):
-        resp = await call("sync", {"browser": "chrome", "origin": "peer@desktop"})
+        resp = await call("sync", {"origin": "peer@desktop"})
 
     assert resp.ok, resp.error
     assert resp.result == {"converged": True, "cookies": 1}
+
+
+async def test_sync_unions_across_browsers_anchored_on_the_first_warm_local(sock_path: Path) -> None:
+    cache = KeyCache(FakeWrapper())
+    await cache.put("me@laptop:chrome:Default", KEY, ttl=300.0)
+    local = FakeSource(cookies=(cookie("sid", "local"),))
+    arc = BrowserId("arc")
+    # A Chrome local anchor plus an Arc endpoint on a peer: one union, not two browser universes.
+    browsers = (BrowserEndpoint(SELF, CHROME, "Default"), BrowserEndpoint(PEER, arc, "Default"))
+    daemon = make_daemon(
+        consent=FakeConsent(),
+        cache=cache,
+        engine=FakeEngine(),
+        state=make_state(browsers=browsers),
+        local=local,
+    )
+
+    async with serving(daemon.dispatcher()):
+        resp = await call("sync", {})
+
+    assert resp.ok, resp.error
+    assert resp.result == {"converged": True, "cookies": 1}
+
+
+async def test_sync_reports_no_warm_anchor_when_local_key_is_cold(sock_path: Path) -> None:
+    # No cached key for the local endpoint -> no warm anchor -> the union converge is skipped.
+    browsers = (BrowserEndpoint(SELF, CHROME, "Default"), BrowserEndpoint(PEER, CHROME, "Default"))
+    daemon = make_daemon(
+        consent=FakeConsent(),
+        cache=KeyCache(FakeWrapper()),
+        engine=FakeEngine(),
+        state=make_state(browsers=browsers),
+    )
+
+    async with serving(daemon.dispatcher()):
+        resp = await call("sync", {})
+
+    assert resp.ok, resp.error
+    assert resp.result == {"converged": False, "reason": "no warm local endpoint to anchor the union"}
 
 
 async def test_request_consent_unavailable_when_headless(sock_path: Path) -> None:
@@ -619,7 +660,78 @@ async def test_watch_serves_rpc_and_notifies_peers_on_a_settle(sock_path: Path) 
         tg.cancel_scope.cancel()
 
     assert resp.result == {"on_console": True, "locked": False, "console_user": "me"}
-    assert any("peer@desktop" in n and "rpc sync --browser chrome" in n for n in notified)
+    # The notify carries no --browser: the union converge is browser-independent.
+    assert any("peer@desktop" in n and "rpc sync --origin me@laptop" in n for n in notified)
+    assert all("--browser" not in n for n in notified)
+
+
+# ── active_peer routing: consent_route_to short-circuits the scan ───────────────────────
+
+
+@dataclass(slots=True)
+class WhoamiSsh:
+    """A fake ssh answering ``rpc whoami`` per target from a live-set, recording the order asked."""
+
+    live: frozenset[SshTarget]
+    asked: list[SshTarget] = field(default_factory=list)
+
+    async def __call__(self, target: SshTarget, remote_cmd: str, *, stdin: bytes | None = None) -> str:
+        assert "rpc whoami" in remote_cmd
+        self.asked.append(target)
+        on_console = target in self.live
+        return json.dumps({"on_console": on_console, "locked": False, "console_user": "u" if on_console else None})
+
+
+def _active_peer_daemon(run_ssh: WhoamiSsh, *, route_to: SshTarget | None) -> Daemon:
+    state = State(
+        SELF,
+        (BrowserEndpoint(PEER, CHROME, "Default"), BrowserEndpoint(THIRD, CHROME, "Default")),
+        Settings(auth_ttl=timedelta(minutes=5)),
+        consent_route_to=route_to,
+    )
+
+    async def load_state() -> State:
+        return state
+
+    return Daemon(
+        consent=FakeConsent(),
+        cache=KeyCache(FakeWrapper()),
+        engine=FakeEngine(),
+        probe=probe(HEADLESS),
+        run_ssh=run_ssh,
+        load_state=load_state,
+    )
+
+
+async def test_active_peer_short_circuits_to_the_routed_target_when_live() -> None:
+    # consent_route_to=THIRD is live and unlocked -> it is returned FIRST, without scanning PEER.
+    ssh = WhoamiSsh(live=frozenset({PEER, THIRD}))
+    daemon = _active_peer_daemon(ssh, route_to=THIRD)
+
+    chosen = await daemon.active_peer(await daemon.load_state())
+
+    assert chosen == THIRD
+    assert ssh.asked == [THIRD]  # only the routed target was probed
+
+
+async def test_active_peer_falls_back_to_scan_when_routed_target_is_not_live() -> None:
+    # The routed target is offline -> fall back to the existing scan over the endpoint hosts.
+    ssh = WhoamiSsh(live=frozenset({PEER}))
+    daemon = _active_peer_daemon(ssh, route_to=THIRD)
+
+    chosen = await daemon.active_peer(await daemon.load_state())
+
+    assert chosen == PEER
+    assert THIRD in ssh.asked  # the routed target was tried first, then the scan ran
+
+
+async def test_active_peer_scans_when_no_route_is_configured() -> None:
+    ssh = WhoamiSsh(live=frozenset({PEER, THIRD}))
+    daemon = _active_peer_daemon(ssh, route_to=None)
+
+    chosen = await daemon.active_peer(await daemon.load_state())
+
+    assert chosen in {PEER, THIRD}
 
 
 class Elapsed:

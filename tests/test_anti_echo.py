@@ -77,15 +77,13 @@ def cookie(name: str, value: str, *, last_update: ChromeMicros) -> Cookie:
     )
 
 
-@pytest.fixture
-def store(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[BrowserEndpoint]:
-    profile = "Default"
-    (tmp_path / profile).mkdir(parents=True, exist_ok=True)
+def make_v24_browser(name: str, display: str, root: Path, profile: str) -> Browser:
+    (root / profile).mkdir(parents=True, exist_ok=True)
     browser = Browser(
-        name=BrowserName("chrome"),
-        display="Chrome",
-        data_root=tmp_path,
-        keychain_service="Chrome Safe Storage",
+        name=BrowserName(name),
+        display=display,
+        data_root=root,
+        keychain_service=f"{display} Safe Storage",
     )
     con = sqlite3.connect(str(browser.cookies_db(profile)))
     try:
@@ -93,6 +91,13 @@ def store(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[BrowserEn
         con.commit()
     finally:
         con.close()
+    return browser
+
+
+@pytest.fixture
+def store(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[BrowserEndpoint]:
+    profile = "Default"
+    browser = make_v24_browser("chrome", "Chrome", tmp_path, profile)
     # fingerprint() resolves the endpoint's browser through engine.REGISTRY; point it at
     # this temp-rooted store so the real read path runs against our fixture.
     monkeypatch.setitem(engine_mod.REGISTRY, BrowserName("chrome"), browser)
@@ -127,3 +132,41 @@ async def test_rewriting_the_same_set_is_a_stable_fingerprint(store: BrowserEndp
     second = await fingerprint(store)
 
     assert first == second == logical_digest(merged)
+
+
+async def test_cross_browser_union_reaches_a_fixed_point_in_one_converge(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The union must terminate across browsers: once Chrome and Arc both hold the union, a
+    # second converge is a no-op. Prove it on REAL stores — write each browser's distinct set,
+    # form the cross-browser union, write it to BOTH, and assert (a) both stores fingerprint to
+    # logical_digest(union) — so a watcher's post-write digest equals the recorded last_applied
+    # and evaluate stops — and (b) merge(union, union) == union, so re-converging is idempotent.
+    profile = "Default"
+    chrome = make_v24_browser("chrome", "Chrome", tmp_path / "chrome", profile)
+    arc = make_v24_browser("arc", "Arc", tmp_path / "arc", profile)
+    monkeypatch.setitem(engine_mod.REGISTRY, BrowserName("chrome"), chrome)
+    monkeypatch.setitem(engine_mod.REGISTRY, BrowserName("arc"), arc)
+    chrome_ep = BrowserEndpoint(SshTarget("me@laptop"), BrowserId("chrome"), profile)
+    arc_ep = BrowserEndpoint(SshTarget("peer@desktop"), BrowserId("arc"), profile)
+
+    chrome_only = cookie("chrome_sid", "c", last_update=ChromeMicros(BASE + 1 * 1_000_000))
+    arc_only = cookie("arc_sid", "a", last_update=ChromeMicros(BASE + 2 * 1_000_000))
+    await write_rows(chrome, profile, (chrome_only,), KEY)
+    await write_rows(arc, profile, (arc_only,), KEY)
+
+    union = merge((chrome_only,), (arc_only,))
+    recorded = logical_digest(union)
+    await write_rows(chrome, profile, union, KEY)
+    await write_rows(arc, profile, union, KEY)
+
+    # Both browsers now hold the identical union, and both fingerprint to the recorded digest.
+    assert await fingerprint(chrome_ep) == recorded
+    assert await fingerprint(arc_ep) == recorded
+    # Newest-wins is idempotent: a second converge over the union yields the same union.
+    assert merge(union, union) == union
+    # A second write of the union leaves both fingerprints unchanged — the fixed point.
+    await write_rows(chrome, profile, merge(union, union), KEY)
+    await write_rows(arc, profile, merge(union, union), KEY)
+    assert await fingerprint(chrome_ep) == recorded
+    assert await fingerprint(arc_ep) == recorded

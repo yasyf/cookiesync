@@ -113,7 +113,30 @@ async def test_durations_serialize_as_go_strings(isolated_config: Path) -> None:
             "op_timeout": "2m",
             "auth_ttl": "24h",
         },
+        "consent_route_to": None,
     }
+
+
+async def test_consent_route_to_round_trips(isolated_config: Path) -> None:
+    saved = await replace(sample_state(), consent_route_to=SshTarget("approver@imac")).save()
+    assert saved.consent_route_to == SshTarget("approver@imac")
+    assert (await load()).consent_route_to == SshTarget("approver@imac")
+
+
+async def test_consent_route_to_serializes_the_target(isolated_config: Path) -> None:
+    await replace(sample_state(), consent_route_to=SshTarget("approver@imac")).save()
+    assert json.loads(state_path().read_text())["consent_route_to"] == "approver@imac"
+
+
+async def test_legacy_state_without_consent_route_defaults_to_none(isolated_config: Path) -> None:
+    # A state.json written before the field existed has no `consent_route_to` key.
+    legacy = sample_state().to_json()
+    del legacy["consent_route_to"]
+    assert State.from_json(legacy).consent_route_to is None
+
+
+def test_default_state_has_no_consent_route() -> None:
+    assert State(SshTarget("me@laptop")).consent_route_to is None
 
 
 @pytest.mark.parametrize(

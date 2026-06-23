@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 import pytest
+from loguru import logger
 
 from cookiesync.cookie.browsers import REGISTRY, BrowserName
 from cookiesync.cookie.models import ChromeMicros, Cookie, HostKey
@@ -287,7 +288,7 @@ async def test_same_machine_peer_converges_in_process_not_over_ssh() -> None:
     assert [e for e in log if e[0] == "extract"] == [("extract", "local"), ("extract", "local")]
 
 
-async def test_reconcile_runs_converge_over_each_browser_group() -> None:
+async def test_reconcile_unions_every_browser_into_one_group() -> None:
     log: list = []
     registry = {CHROME: REGISTRY[BrowserName("chrome")], ARC: REGISTRY[BrowserName("arc")]}
     chrome_local = BrowserEndpoint(SELF, CHROME, "Default")
@@ -295,8 +296,9 @@ async def test_reconcile_runs_converge_over_each_browser_group() -> None:
     arc_local = BrowserEndpoint(SELF, ARC, "Default")
     arc_peer_only = BrowserEndpoint(PEER, ARC, "Default")
 
-    local = FakeSource((cookie("sid", "v", last_update=ChromeMicros(BASE)),), log, label="local")
-    peer = FakeSource((cookie("sid", "v", last_update=ChromeMicros(BASE)),), log, label="peer")
+    # Arc holds the newest value; it must win across the cross-browser union, not stay siloed.
+    local = FakeSource((cookie("sid", "chrome-local", last_update=ChromeMicros(BASE)),), log, label="local")
+    peer = FakeSource((cookie("sid", "arc-newest", last_update=ChromeMicros(BASE + 9 * MICROS)),), log, label="peer")
 
     results = await reconcile(
         [chrome_local, chrome_peer, arc_local, arc_peer_only],
@@ -308,14 +310,38 @@ async def test_reconcile_runs_converge_over_each_browser_group() -> None:
         source_for=sources_factory({PEER: peer}),
     )
 
-    # Both browser groups have a local anchor on this host, so both are reconciled.
-    assert set(results) == {chrome_local.id, arc_local.id}
+    # One union group anchored on the first warm local endpoint (chrome_local), every endpoint merged.
+    assert set(results) == {chrome_local.id}
+    assert {c.value for c in results[chrome_local.id]} == {"arc-newest"}
 
 
-async def test_reconcile_skips_a_group_with_no_local_anchor() -> None:
+async def test_reconcile_excludes_unregistered_browsers_from_the_union() -> None:
     log: list = []
     registry = {CHROME: REGISTRY[BrowserName("chrome")]}
-    # Both endpoints live on peers; this host has nothing local to merge from.
+    chrome_local = BrowserEndpoint(SELF, CHROME, "Default")
+    unknown = BrowserEndpoint(PEER, BrowserId("netscape"), "Default")
+    local = FakeSource((cookie("sid", "v", last_update=ChromeMicros(BASE)),), log, label="local")
+
+    def boom(_target: SshTarget) -> FakeSource:
+        raise AssertionError("an unregistered-browser endpoint must not be reached")
+
+    results = await reconcile(
+        [chrome_local, unknown],
+        self_target=SELF,
+        registry=registry,
+        cache=WarmCache(),
+        engine=FakeEngine(log),
+        local_source=local,
+        source_for=boom,
+    )
+
+    assert set(results) == {chrome_local.id}
+
+
+async def test_reconcile_skips_when_no_warm_local_anchor() -> None:
+    log: list = []
+    registry = {CHROME: REGISTRY[BrowserName("chrome")]}
+    # Both endpoints live on peers; this host has nothing local to anchor the union.
     peer_a = BrowserEndpoint(PEER, CHROME, "Default")
     peer_b = BrowserEndpoint(THIRD, CHROME, "Default")
     local = FakeSource((), log, label="local")
@@ -332,3 +358,57 @@ async def test_reconcile_skips_a_group_with_no_local_anchor() -> None:
 
     assert results == {}
     assert local.extracted == 0
+
+
+async def test_reconcile_skips_when_local_anchor_is_cold() -> None:
+    log: list = []
+    registry = {CHROME: REGISTRY[BrowserName("chrome")]}
+    chrome_local = BrowserEndpoint(SELF, CHROME, "Default")
+    chrome_peer = BrowserEndpoint(PEER, CHROME, "Default")
+    local = FakeSource((), log, label="local")
+
+    results = await reconcile(
+        [chrome_local, chrome_peer],
+        self_target=SELF,
+        registry=registry,
+        cache=WarmCache(cold=frozenset({chrome_local.id})),
+        engine=FakeEngine(log),
+        local_source=local,
+        source_for=sources_factory({PEER: FakeSource((), log, label="peer")}),
+    )
+
+    assert results == {}
+    assert local.extracted == 0
+
+
+async def test_converge_skips_a_cold_same_host_peer() -> None:
+    log: list = []
+    cold_profile = BrowserEndpoint(SELF, CHROME, "Profile 1")
+    remote = BrowserEndpoint(PEER, ARC, "Default")
+    local = FakeSource((cookie("sid", "local", last_update=ChromeMicros(BASE)),), log, label="local")
+    peer = FakeSource((cookie("sid", "remote", last_update=ChromeMicros(BASE + 4 * MICROS)),), log, label="peer")
+
+    warnings: list[str] = []
+    sink = logger.add(warnings.append, level="WARNING", format="{message}")
+    # The same-host other profile is cold; converge must skip it (never extract) but still
+    # merge the remote peer, whose warmth is resolved remotely.
+    try:
+        merged = await converge(
+            LOCAL,
+            [cold_profile, remote],
+            self_target=SELF,
+            cache=WarmCache(cold=frozenset({cold_profile.id})),
+            engine=FakeEngine(log),
+            local_source=local,
+            source_for=sources_factory({PEER: peer}),
+        )
+    finally:
+        logger.remove(sink)
+
+    # The remote peer (warmth resolved remotely) is still merged and wins.
+    assert {c.value for c in merged} == {"remote"}
+    # The cold same-host profile was read exactly never; local_source served only the anchor.
+    assert [e for e in log if e == ("extract", "local")] == [("extract", "local")]
+    assert ("extract", "peer") in log
+    # The skip is logged, not silent — a regression that drops the warning is caught here.
+    assert any(cold_profile.id in line for line in warnings)

@@ -102,12 +102,14 @@ class State:
     self_target: SshTarget
     browsers: tuple[BrowserEndpoint, ...] = ()
     settings: Settings = field(default_factory=Settings)
+    consent_route_to: SshTarget | None = None
 
     def to_json(self) -> dict[str, object]:
         return {
             "self_target": self.self_target,
             "browsers": [endpoint.to_json() for endpoint in self.browsers],
             "settings": self.settings.to_json(),
+            "consent_route_to": self.consent_route_to,
         }
 
     @classmethod
@@ -116,6 +118,7 @@ class State:
             SshTarget(raw["self_target"]),
             tuple(BrowserEndpoint.from_json(endpoint) for endpoint in raw["browsers"]),
             Settings.from_json(raw["settings"]),
+            SshTarget(route) if (route := raw.get("consent_route_to")) is not None else None,
         )
 
     async def save(self) -> State:

@@ -206,14 +206,13 @@ async def run_reconcile() -> None:
 
 
 @main.command("sync")
-@click.option("--browser", "browser_name", required=True, help="The browser group to converge.")
-def sync_cmd(browser_name: str) -> None:
-    """Ask the daemon to converge one browser group across this host and its peers."""
-    anyio.run(run_sync, browser_name)
+def sync_cmd() -> None:
+    """Ask the daemon to converge the union of every tracked endpoint across this host and its peers."""
+    anyio.run(run_sync)
 
 
-async def run_sync(browser_name: str) -> None:
-    result = await daemon_call("sync", {"browser": browser_name})
+async def run_sync() -> None:
+    result = await daemon_call("sync", {})
     click.echo(json.dumps(result, indent=2))
 
 
@@ -293,11 +292,10 @@ def rpc_apply(browser_name: str, profile: str, origin: str | None) -> None:
 
 
 @rpc_group.command("sync")
-@click.option("--browser", "browser_name", required=True)
 @click.option("--origin", default=None)
-def rpc_sync(browser_name: str, origin: str | None) -> None:
-    """Ask the daemon to converge one browser group, tagged with the notifying peer's origin."""
-    anyio.run(run_rpc_passthrough, "sync", {"browser": browser_name, "origin": origin})
+def rpc_sync(origin: str | None) -> None:
+    """Ask the daemon to converge the union of every tracked endpoint, tagged with the notifying peer's origin."""
+    anyio.run(run_rpc_passthrough, "sync", {"origin": origin})
 
 
 @rpc_group.command("reconcile")
@@ -328,6 +326,18 @@ def rpc_request_consent(browser_name: str, profile: str, nonce: str, endpoint: s
 
 async def run_rpc_passthrough(method: str, params: dict) -> None:
     click.echo(json.dumps(await daemon_call(method, params)))
+
+
+@main.command("route-consent")
+@click.argument("target")
+def route_consent(target: str) -> None:
+    """Route the consent gate to TARGET first when it has a live, unlocked session."""
+    anyio.run(run_route_consent, SshTarget(target))
+
+
+async def run_route_consent(target: SshTarget) -> None:
+    await state.update(lambda s: replace(s, consent_route_to=target))
+    click.echo(f"Routing consent to {target}.")
 
 
 @main.command(name="self")

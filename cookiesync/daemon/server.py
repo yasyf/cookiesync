@@ -46,7 +46,7 @@ from cookiesync.daemon.backend_ssh import SshBackend
 from cookiesync.daemon.engine import Engine, logical_digest
 from cookiesync.daemon.rpc import Dispatcher
 from cookiesync.daemon.session import has_active_session, probe_session, session_summary
-from cookiesync.daemon.sync import Extracted, NeedsAuth, converge, reconcile
+from cookiesync.daemon.sync import Extracted, NeedsAuth, converge, reconcile, warm_anchor
 from cookiesync.daemon.wire import cookie_from_wire, cookie_to_wire
 from cookiesync.state import BrowserId, SshTarget
 from cookiesync.transport import shell_quote, ssh
@@ -189,18 +189,16 @@ class Daemon:
             tg.start_soon(self.engine.run, local_endpoints)
 
     async def notify_peers(self, endpoint: BrowserEndpoint) -> None:
-        """A local endpoint settled: ssh every peer to converge that browser, tagged with our origin."""
+        """A local endpoint settled: converge the local union here, then ssh every other host to converge."""
+        await self.handle_sync({"origin": None})
         state = await self.load_state()
-        peers = {e.host for e in state.browsers if e.browser == endpoint.browser and e.host != state.self_target}
+        peers = {e.host for e in state.browsers if e.host != state.self_target}
         async with anyio.create_task_group() as tg:
             for peer in peers:
-                tg.start_soon(self.notify_peer, peer, endpoint.browser, state.self_target)
+                tg.start_soon(self.notify_peer, peer, state.self_target)
 
-    async def notify_peer(self, peer: SshTarget, browser: BrowserId, self_target: SshTarget) -> None:
-        await self.run_ssh(
-            peer,
-            f"cookiesync rpc sync --browser {shell_quote(browser)} --origin {shell_quote(self_target)}",
-        )
+    async def notify_peer(self, peer: SshTarget, self_target: SshTarget) -> None:
+        await self.run_ssh(peer, f"cookiesync rpc sync --origin {shell_quote(self_target)}")
 
     def dispatcher(self) -> Dispatcher:
         """Build the :class:`~cookiesync.daemon.rpc.Dispatcher` with every peer and local method bound."""
@@ -218,12 +216,11 @@ class Daemon:
 
     async def handle_sync(self, params: dict) -> dict:
         state = await self.load_state()
-        browser = BrowserId(params["browser"])
         origin = SshTarget(params["origin"]) if params.get("origin") else None
-        group = [e for e in state.browsers if e.browser == browser]
-        anchor = next((e for e in group if e.host == state.self_target), None)
+        group = [e for e in state.browsers if BrowserName(e.browser) in REGISTRY]
+        anchor = await warm_anchor(group, self_target=state.self_target, cache=self.cache)
         if anchor is None:
-            return {"converged": False, "reason": "no local endpoint for this browser"}
+            return {"converged": False, "reason": "no warm local endpoint to anchor the union"}
         merged = await converge(
             anchor,
             [e for e in group if e is not anchor],
@@ -322,11 +319,16 @@ class Daemon:
         return await self.consent.obtain_key_unprompted(browser_for(browser))
 
     async def active_peer(self, state: State) -> SshTarget:
+        if (routed := state.consent_route_to) is not None and await self.peer_is_live(routed):
+            return routed
         for peer in {e.host for e in state.browsers if e.host != state.self_target}:
-            summary = json.loads(await self.run_ssh(peer, "cookiesync rpc whoami"))
-            if summary.get("on_console") and not summary.get("locked"):
+            if await self.peer_is_live(peer):
                 return peer
         raise AuthRequired("no peer has a live session to approve consent")
+
+    async def peer_is_live(self, peer: SshTarget) -> bool:
+        summary = json.loads(await self.run_ssh(peer, "cookiesync rpc whoami"))
+        return bool(summary.get("on_console") and not summary.get("locked"))
 
     async def handle_get_cookies(self, params: dict) -> dict:
         state = await self.load_state()
