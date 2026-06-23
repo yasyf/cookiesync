@@ -1,6 +1,7 @@
 [project]
 name = "cookiesync-cli"
-version = "0.1.0"
+# Inert sentinel: the real version is set from the release tag (uv version --frozen); never written back here.
+version = "0.0.0"
 description = "Sync your browser cookies across machines."
 readme = "README.md"
 license = "PolyForm-Noncommercial-1.0.0"
