@@ -40,6 +40,7 @@ func deleteStaleCacheKeys() {
         kSecClass as String: kSecClassKey,
         kSecAttrKeyType as String: kSecAttrKeyTypeECSECPrimeRandom,
         kSecAttrTokenID as String: kSecAttrTokenIDSecureEnclave,
+        kSecUseDataProtectionKeychain as String: true,
     ] as CFDictionary)
 }
 
@@ -49,6 +50,7 @@ func loadPrivateKey(_ label: String) -> SecKey? {
         kSecAttrKeyType as String: kSecAttrKeyTypeECSECPrimeRandom,
         kSecAttrApplicationTag as String: applicationTag(label),
         kSecAttrTokenID as String: kSecAttrTokenIDSecureEnclave,
+        kSecUseDataProtectionKeychain as String: true,
         kSecReturnRef as String: true,
     ]
     var item: CFTypeRef?
@@ -75,6 +77,7 @@ func newkey(_ label: String) -> Int32 {
         kSecAttrKeyType as String: kSecAttrKeyTypeECSECPrimeRandom,
         kSecAttrKeySizeInBits as String: 256,
         kSecAttrTokenID as String: kSecAttrTokenIDSecureEnclave,
+        kSecUseDataProtectionKeychain as String: true,
         kSecPrivateKeyAttrs as String: [
             kSecAttrIsPermanent as String: true,
             kSecAttrApplicationTag as String: applicationTag(label),
@@ -139,6 +142,7 @@ func dropkey(_ label: String) -> Int32 {
         kSecAttrKeyType as String: kSecAttrKeyTypeECSECPrimeRandom,
         kSecAttrApplicationTag as String: applicationTag(label),
         kSecAttrTokenID as String: kSecAttrTokenIDSecureEnclave,
+        kSecUseDataProtectionKeychain as String: true,
     ] as CFDictionary)
     return 0
 }
