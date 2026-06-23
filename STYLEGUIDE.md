@@ -314,10 +314,9 @@ Docstrings are the one exception, scoped by surface. Public API surfaces and
 user-facing classes carry Google-style docstrings, so they earn their place.
 Internal helpers get none, and a docstring that restates the signature is
 clutter to delete.
-Great Docs renders these docstrings into the published docs site.
 
 ```python
-# Good — public class, documented; example renders on the docs site
+# Good — public class, documented
 @dataclass(frozen=True, slots=True)
 class Matcher:
     """Matches a record against a regex pattern.

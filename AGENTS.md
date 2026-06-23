@@ -85,7 +85,7 @@ Reach for **`Grep`** only for material neither tool indexes: literal *content* o
 
 Target Python 3.13+. Run `uv sync --extra dev`, `uv run pytest`, and `uv build`.
 
-**Docstrings on the public API only.** User-facing surfaces carry Google-style docstrings; they render into the docs site via Great Docs. Internal helpers get none. No comments except TODOs, non-obvious workarounds, or disabled code.
+**Docstrings on the public API only.** User-facing surfaces carry Google-style docstrings. Internal helpers get none. No comments except TODOs, non-obvious workarounds, or disabled code.
 
 **Async-native from day 1.** Anything that touches I/O is `async def`, backed by a library with a native async API (e.g. `aiosqlite`) rather than a blocking call wrapped in `asyncio.to_thread`. Concurrency and tests run through `anyio`. See STYLEGUIDE.md § Async.
 
@@ -122,8 +122,6 @@ Target Python 3.13+. Run `uv sync --extra dev`, `uv run pytest`, and `uv build`.
 **Testing.** The suite lives in `tests/`; run it with `uv run pytest`. Use strict assertions and mock external dependencies while leaving the code under test real. Databases and other stateful services are not mock boundaries — when a test needs one, run a real ephemeral instance via `testcontainers` instead of mocking the driver.
 
 **Writing docs.** When writing or revising docs, a README, a tutorial, a how-to, or reference, use the `writing-docs` skill (Diataxis modes, voice rules, and runnable code-sample rules) and run `slop-cop check <file> --lang=markdown` before you finish.
-
-**Docs.** Any public API change must keep `uv run great-docs build` green; run `uv sync --group docs` first.
 
 **Version control.** This repo is a colocated `jj` repo over git — prefer `jj` (`jj describe` / `jj commit`, `jj git push`) over raw `git` for day-to-day work. Commits stay atomic and scoped: one logical change each. A dirty tree is just the working-copy commit `@` — to land work on an updated remote, `jj git fetch` then `jj rebase` (your in-flight `@` rides along untouched); never `git stash` or a worktree + cherry-pick dance.
 

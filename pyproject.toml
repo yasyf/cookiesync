@@ -37,7 +37,6 @@ cookiesync = "cookiesync.cli:main"
 
 [project.urls]
 Homepage = "https://github.com/yasyf/cookiesync"
-Documentation = "https://yasyf.github.io/cookiesync/"
 Repository = "https://github.com/yasyf/cookiesync"
 Issues = "https://github.com/yasyf/cookiesync/issues"
 Changelog = "https://github.com/yasyf/cookiesync/blob/main/CHANGELOG.md"
@@ -103,17 +102,3 @@ select = ["E", "F", "I", "UP"]
 # __init__.py re-exports the public API via plain imports (`from .foo import
 # Bar`; no `as` alias, no __all__). F401 stays active in every other module.
 "__init__.py" = ["F401"]
-
-[dependency-groups]
-docs = [
-    # great-docs imports griffe's 2.x module layout; griffelib is the modern
-    # griffe (2.x) distribution, overriding the legacy griffe<2 pin great-docs
-    # itself still declares.
-    "griffelib>=2.0",
-    # Tracking great-docs main until a release newer than 0.13.0: main carries
-    # build-time GitHub widget stats (embedded via the CI GITHUB_TOKEN), which
-    # drop the navbar widget's client-side API calls — the source of GitHub 403
-    # errors on the published site.
-    # Revert to a PyPI pin (`great-docs>=0.14`) once a release newer than 0.13.0 ships.
-    "great-docs @ git+https://github.com/posit-dev/great-docs@main",
-]

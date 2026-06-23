@@ -4,8 +4,7 @@
 
 [![PyPI](https://img.shields.io/pypi/v/cookiesync.svg)](https://pypi.org/project/cookiesync/)
 [![Python](https://img.shields.io/pypi/pyversions/cookiesync.svg)](https://pypi.org/project/cookiesync/)
-[![Docs](https://img.shields.io/github/actions/workflow/status/yasyf/cookiesync/docs.yml?branch=main&label=docs)](https://yasyf.github.io/cookiesync/)
-[![License: PolyForm-Noncommercial-1.0.0](https://img.shields.io/badge/License-PolyForm-Noncommercial-1.0.0-blue.svg)](https://github.com/yasyf/cookiesync/blob/main/LICENSE)
+[![License: PolyForm Noncommercial 1.0.0](https://img.shields.io/badge/License-PolyForm--Noncommercial--1.0.0-blue.svg)](https://github.com/yasyf/cookiesync/blob/main/LICENSE)
 
 Sync your browser cookies across machines.
 
@@ -15,16 +14,20 @@ laptops. It reuses your existing browser session instead of asking for
 passwords again, so logins, 2FA, and SSO state carry over without you
 re-authenticating anywhere.
 
+> **macOS only.** cookiesync keeps your browser's Safe Storage key behind a
+> Touch ID prompt and a Secure Enclave–bound daemon, so decrypted cookies never
+> land on disk. The key helper is a Developer-ID-signed, notarized `.app`.
+
 ## Install
 
-No install needed — run everything through [uvx](https://docs.astral.sh/uv/):
+Run everything through [uvx](https://docs.astral.sh/uv/) — no install needed:
 
 ```bash
 uvx cookiesync --help
 ```
 
-`uvx` fetches cookiesync into a throwaway environment and runs it. To add it
-to a project instead:
+`uvx` fetches cookiesync into a throwaway environment and runs it. To add it to
+a project instead:
 
 ```bash
 uv add cookiesync
@@ -32,15 +35,40 @@ uv add cookiesync
 
 ## Quickstart
 
-Check that the CLI runs:
-
 ```bash
-$ uvx cookiesync hello
-Hello from cookiesync!
+# Fetch the signed key helper and start the sync daemon (one time)
+uvx cookiesync install
+
+# Confirm the helper is installed and Developer-ID signed
+uvx cookiesync doctor
+
+# Track a browser to sync between this Mac and another host
+uvx cookiesync browser add other-host chrome
+
+# Hand a logged-in session to a script without giving it a password
+uvx cookiesync cookies https://example.com --browser chrome
 ```
 
-That's the starter command. The sync commands land next; see the
-[docs](https://yasyf.github.io/cookiesync/) for the current surface.
+Once a browser is tracked, the resident daemon watches its cookie store and
+converges it across your hosts. Run `cookiesync reconcile` to force a full pass.
+
+## Commands
+
+| Command | What it does |
+| --- | --- |
+| `install` | Fetch the signed key helper, then install the LaunchAgents (watch daemon + reconcile tick). |
+| `uninstall` | Remove the cookiesync LaunchAgents. |
+| `doctor` | Check that the key helper is installed and Developer-ID signed. |
+| `browser add/ls/rm` | Track, list, and untrack the browser profiles cookiesync syncs across hosts. |
+| `watch` | Run the resident sync daemon: watch local stores and serve the RPC socket. |
+| `sync --browser <name>` | Converge one browser group across this host and its peers. |
+| `reconcile` | Run a full reconcile pass over every tracked browser group. |
+| `auth` | Release the Safe Storage key behind one Touch ID tap and cache it for a short window. |
+| `cookies <url>` | Stream a URL's cookies in the chosen format (Playwright by default). |
+| `self` | Print this host's SSH target, as reposync reports it. |
+| `rpc <method>` | Low-level RPC client for the resident daemon. |
+
+Run `cookiesync --help`, or `cookiesync <command> --help`, for the full reference.
 
 ## What problems does this solve?
 
@@ -53,6 +81,6 @@ That's the starter command. The sync commands land next; see the
 - Automation needs a logged-in session but should never hold a password. Hand a
   CI job or an agent the cookies it needs instead of a credential it can leak.
 
-## Docs
+## License
 
-[Read the docs](https://yasyf.github.io/cookiesync/) for the full guide and API reference.
+PolyForm Noncommercial 1.0.0 — see [LICENSE](https://github.com/yasyf/cookiesync/blob/main/LICENSE).
