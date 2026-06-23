@@ -5,16 +5,29 @@ that guards the browser Safe Storage password behind Touch ID and wraps the
 daemon key cache against a per-boot Secure Enclave key. An ad-hoc binary is
 SIGKILLed at exec on macOS 15/26 and is refused Secure Enclave keygen; only a
 signed `.app` with an embedded provisioning profile and a `keychain-access-groups`
-entitlement clears the AMFI kill. CI builds, signs, notarizes, staples, and
-attaches the bundle to a GitHub release so `cookiesync install` can download it.
+entitlement clears the AMFI kill. CI builds, signs, notarizes, and staples the
+bundle, attaches it to a GitHub release, and publishes a Homebrew cask to the
+shared central tap `yasyf/homebrew-tap`. `cookiesync install` shells out to
+`brew install yasyf/tap/cookiesync-keyhelper`, so the same tap serves both the CLI
+flow and a manual `brew install`.
 
-The pipeline lives in
-[`.github/workflows/helper-release.yml`](.github/workflows/helper-release.yml):
-it imports the Developer ID cert into a throwaway keychain, derives the signing
-identity and Team ID from the cert (never hardcoded), embeds the provisioning
+The helper ships on the same `v*` tag that releases the package; the
+sign/notarize/cask-publish runs only when `helper/` changed since the previous tag
+(the `detect-helper-changes` job gates the costly macOS build). The pipeline lives in
+the unified
+[`.github/workflows/release-pypi.yml`](.github/workflows/release-pypi.yml):
+the `helper-build` job imports the Developer ID cert into a throwaway keychain, derives the
+signing identity and Team ID from the cert (never hardcoded), embeds the provisioning
 profile, signs the inner binary and the bundle with a hardened runtime, notarizes
-the bundle and fails loud unless the result is `Accepted`, staples the ticket,
-and uploads the stapled `.app` (zipped) as a release asset.
+the bundle and fails loud unless the result is `Accepted`, staples the ticket, and
+uploads the stapled `.app` (zipped) as a release asset. The `publish-cask` job then
+renders `Casks/cookiesync-keyhelper.rb` — an `app` cask pointing at that release
+asset, with its `sha256` — and pushes it to `yasyf/homebrew-tap` through the shared
+`yasyf/homebrew-tap/.github/actions/publish` composite action. The cask uses an `app`
+stanza (not a bare `binary` symlink) because the embedded provisioning profile that
+authorizes the Secure Enclave is bundle-relative, so the whole `.app` must stay
+intact; it carries no `--no-quarantine` hook because the bundle is notarized and
+stapled.
 
 ## Facts
 
@@ -24,8 +37,9 @@ and uploads the stapled `.app` (zipped) as a release asset.
 | Team ID | `SXKCTF23Q2` (derived from the cert at CI time, never hardcoded) |
 | Keychain access group | `<TEAM_ID>.com.yasyf.cookiesync.helper` |
 | Provisioning profile | "cookiesync helper Developer ID" (keychain-access-groups `SXKCTF23Q2.*`, OSX) |
-| Release trigger | a `helper-v*` tag (or a manual `workflow_dispatch` run, which builds + signs but cuts no release) |
-| Runner | `macos-15` |
+| Homebrew cask | `yasyf/tap/cookiesync-keyhelper` in the shared central tap `yasyf/homebrew-tap` (not in this repo) |
+| Release trigger | the same `v*` tag that releases the package; the helper sign/notarize/cask-publish runs only when `helper/` changed since the previous tag |
+| Runner | `macos-15` (build); `ubuntu-latest` (cask publish) |
 
 ## Required secrets
 
@@ -41,7 +55,7 @@ exact names:
 | `MACOS_NOTARY_KEY_ID` | App Store Connect API key id (`--key-id`) |
 | `MACOS_NOTARY_KEY` | base64 App Store Connect API `.p8` key |
 | `MACOS_PROVISION_PROFILE_COOKIESYNC` | base64 "cookiesync helper Developer ID" provisioning profile |
-| `HOMEBREW_TAP_TOKEN` | (unused by this workflow; the release asset is the primary distribution) |
+| `HOMEBREW_TAP_TOKEN` | PAT (or fine-grained token) with `contents:write` on `yasyf/homebrew-tap`; the `publish-cask` job pushes the cask there (the default `GITHUB_TOKEN` can't push cross-repo) |
 
 ## Deploy steps (one-time, then per release)
 
@@ -69,18 +83,33 @@ exact names:
    `HOMEBREW_TAP_TOKEN`) — add it to the `SECRETS` variable in that script so the
    profile lands as a repo secret.
 
-3. **Push a `helper-v*` tag to trigger the workflow.** For example:
+3. **Push a `v*` tag to release the package and (if `helper/` changed) the helper.**
+   For example:
 
    ```bash
-   git tag helper-v1.0.0 && git push origin helper-v1.0.0
+   git tag v1.0.0 origin/main && git push origin v1.0.0
    ```
 
-   The signing pipeline runs on a `macos-15` runner.
+   The unified release runs from this one tag. The `detect-helper-changes` job
+   diffs `helper/` against the previous `v*` tag; only when it changed (or on the
+   first release, which has no prior tag) does the `helper-build` job run on a
+   `macos-15` runner to sign, notarize, and staple the bundle.
 
-4. **The signed `.app` lands as a release asset.** When the run is green, the
-   GitHub release for the tag carries
-   `cookiesync-keyhelper-v1.0.0-darwin.zip` (the stapled bundle) and its
-   `.sha256`. `cookiesync install` downloads and unzips it on the user's Mac.
+4. **CI releases the asset and publishes the cask.** When the run is green and
+   `helper/` changed: the GitHub release for the tag carries
+   `cookiesync-keyhelper-v1.0.0-darwin.zip` (the stapled bundle) and its `.sha256`,
+   and the `publish-cask` job pushes `Casks/cookiesync-keyhelper.rb` to the shared
+   central tap `yasyf/homebrew-tap` (not in this repo). A hyphenated prerelease tag
+   (e.g. `v1.0.0-rc1`) ships the release asset but skips the cask publish, so a
+   prerelease never becomes the tap's latest.
+
+5. **Users install from the tap.** `cookiesync install` shells out to
+   `brew install yasyf/tap/cookiesync-keyhelper`, or install it by hand with the
+   same command. brew downloads the asset, verifies its checksum, and lays the
+   stapled `.app` into the cask appdir (`/Applications`, or `~/Applications`
+   without admin rights). The notarized + stapled bundle clears Gatekeeper with no
+   `--no-quarantine` hook; cookiesync then re-asserts the Developer-ID anchor before
+   trusting it.
 
 ## Validating the Secure Enclave
 

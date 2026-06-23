@@ -142,7 +142,9 @@ async def ensure_helper() -> None:
         case HelperState.OK:
             click.echo(f"Key helper present and Developer-ID-signed: {paths.helper_app_path()}")
         case _:
-            click.echo("Fetching the signed key helper from the latest release…", err=True)
+            click.echo(
+                "Installing the signed key helper via Homebrew (brew install yasyf/tap/cookiesync-keyhelper)…", err=True
+            )
             try:
                 app = await helper.install_helper()
             except helper.HelperInstallError as exc:
@@ -158,8 +160,13 @@ def doctor() -> None:
 
 async def run_doctor() -> None:
     match await helper.helper_state():
+        case HelperState.OK if await helper.supports_contract():
+            click.echo(f"key helper OK: {paths.helper_app_path()} (Developer ID signed, key-helper contract supported)")
         case HelperState.OK:
-            click.echo(f"key helper OK: {paths.helper_app_path()} (Developer ID signed)")
+            raise click.ClickException(
+                f"key helper at {paths.helper_app_path()} is installed but does not support the required "
+                "key-helper contract (likely a stale cask); reinstall the key helper: cookiesync install"
+            )
         case HelperState.UNSIGNED:
             raise click.ClickException(
                 f"key helper at {paths.helper_app_path()} is not Developer-ID-signed; "

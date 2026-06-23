@@ -2,8 +2,9 @@
 
 The config dir honours ``XDG_CONFIG_HOME`` (falling back to ``~/.config``) and holds a
 ``cookiesync`` subdirectory shared by every writer of ``state.json``. The signed
-Secure-Enclave helper ``.app`` lives in the data dir under ``XDG_DATA_HOME`` (falling
-back to ``~/.local/share``).
+Secure-Enclave helper ships as a Homebrew cask (``yasyf/tap/cookiesync-keyhelper``) and
+installs its ``.app`` into the Homebrew cask appdir — ``/Applications`` by default, or
+``~/Applications`` when brew runs without admin rights.
 """
 
 from __future__ import annotations
@@ -34,9 +35,21 @@ def data_dir() -> Path:
     return Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local" / "share") / DATA_SUBDIR
 
 
+def cask_app_dirs() -> tuple[Path, ...]:
+    """The Homebrew cask appdirs an ``app`` stanza may install into, most-specific first."""
+    return Path("/Applications"), Path.home() / "Applications"
+
+
 def helper_app_path() -> Path:
-    """The installed ``cookiesync-keyhelper.app`` bundle path in the data dir."""
-    return data_dir() / HELPER_APP
+    """The cask-installed ``cookiesync-keyhelper.app`` bundle path.
+
+    ``brew install yasyf/tap/cookiesync-keyhelper`` moves the signed ``.app`` into the
+    Homebrew cask appdir — ``/Applications`` by default, or ``~/Applications`` when brew
+    runs without admin rights. Returns the first appdir that holds the bundle, falling back
+    to the default appdir so a not-yet-installed helper still reports a stable path.
+    """
+    dirs = cask_app_dirs()
+    return next((app for d in dirs if (app := d / HELPER_APP).is_dir()), dirs[0] / HELPER_APP)
 
 
 def helper_binary() -> Path:

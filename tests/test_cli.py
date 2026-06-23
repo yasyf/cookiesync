@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING
 import pytest
 from click.testing import CliRunner
 
-from cookiesync import helper, paths
+from cookiesync import helper, paths, service
 from cookiesync.cli import main
 
 if TYPE_CHECKING:
@@ -32,13 +32,28 @@ def test_hello_is_gone() -> None:
     assert result.exit_code != 0
 
 
-def _codesign_returns(monkeypatch: pytest.MonkeyPatch, code: int) -> list[list[str]]:
+def _helper_processes(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    codesign: int,
+    probe: tuple[int, bytes] = (0, b"biometry=false passcode=false vault=false\n"),
+) -> list[list[str]]:
+    # doctor shells out to codesign (signature) and then the helper binary (`vault-status`
+    # contract probe). Route each by argv: codesign returns `codesign`, the probe returns
+    # `probe`.
     calls: list[list[str]] = []
 
     async def fake(command: Sequence[str], *, check: bool = True, **_: object) -> subprocess.CompletedProcess[bytes]:
-        assert list(command)[0] == helper.CODESIGN
-        calls.append(list(command))
-        return subprocess.CompletedProcess(list(command), code, stdout=b"", stderr=b"")
+        argv = list(command)
+        calls.append(argv)
+        match argv:
+            case [helper.CODESIGN, *_]:
+                return subprocess.CompletedProcess(argv, codesign, stdout=b"", stderr=b"")
+            case [_, "vault-status", helper.PROBE_VAULT]:
+                code, stdout = probe
+                return subprocess.CompletedProcess(argv, code, stdout=stdout, stderr=b"")
+            case _:
+                raise AssertionError(f"unexpected helper invocation: {argv}")
 
     monkeypatch.setattr(helper.anyio, "run_process", fake)
     return calls
@@ -53,17 +68,31 @@ def _install_helper(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
     return binary
 
 
-def test_doctor_reports_ok_when_helper_signed(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+def test_doctor_reports_ok_when_helper_signed_and_contract_supported(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     _install_helper(monkeypatch, tmp_path)
-    _codesign_returns(monkeypatch, 0)
+    _helper_processes(monkeypatch, codesign=0, probe=(0, b"biometry=true passcode=true vault=false\n"))
     result = CliRunner().invoke(main, ["doctor"])
     assert result.exit_code == 0
     assert "key helper OK" in result.output
+    assert "key-helper contract supported" in result.output
+
+
+def test_doctor_fails_when_helper_contract_unsupported(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    # A stale cask: the bundle is present and Developer-ID-signed, but `vault-status` predates
+    # the contract — nonzero exit or a stdout line that doesn't match the documented shape.
+    _install_helper(monkeypatch, tmp_path)
+    _helper_processes(monkeypatch, codesign=0, probe=(0, b"usage: cookiesync-keyhelper <command>\n"))
+    result = CliRunner().invoke(main, ["doctor"])
+    assert result.exit_code != 0
+    assert "does not support the required" in result.output
+    assert "cookiesync install" in result.output
 
 
 def test_doctor_fails_when_helper_unsigned(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     _install_helper(monkeypatch, tmp_path)
-    _codesign_returns(monkeypatch, 1)
+    _helper_processes(monkeypatch, codesign=1)
     result = CliRunner().invoke(main, ["doctor"])
     assert result.exit_code != 0
     assert "not Developer-ID-signed" in result.output
@@ -77,11 +106,50 @@ def test_doctor_fails_when_helper_missing(monkeypatch: pytest.MonkeyPatch, tmp_p
     assert "cookiesync install" in result.output
 
 
+def test_install_fetches_helper_via_brew_then_installs_agents(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    # `cookiesync install` finds no signed helper, so it shells out to brew to install the
+    # cask, re-verifies the Developer-ID anchor, then lays down the LaunchAgents.
+    app = tmp_path / "Applications" / "cookiesync-keyhelper.app"
+    (app / "Contents" / "MacOS").mkdir(parents=True)  # bundle dir exists; inner binary does not yet
+    monkeypatch.setattr(paths, "helper_app_path", lambda: app)
+    monkeypatch.setattr(paths, "helper_binary", lambda: app / "Contents" / "MacOS" / "cookiesync-keyhelper")
+    monkeypatch.setattr(helper.shutil, "which", lambda name: "/opt/homebrew/bin/brew")
+
+    brew_calls: list[list[str]] = []
+
+    async def fake_run(
+        command: Sequence[str], *, check: bool = True, **_: object
+    ) -> subprocess.CompletedProcess[bytes]:
+        brew_calls.append(list(command))
+        return subprocess.CompletedProcess(list(command), 0, stdout=b"", stderr=b"")
+
+    monkeypatch.setattr(helper.anyio, "run_process", fake_run)
+
+    async def signed(_app: Path) -> bool:
+        return True
+
+    monkeypatch.setattr(helper, "developer_id_signed", signed)
+
+    agents: list[bool] = []
+
+    async def fake_service_install(_launcher: object, *, tick_only: bool = False) -> None:
+        agents.append(tick_only)
+
+    monkeypatch.setattr(service, "install", fake_service_install)
+    monkeypatch.setattr(service, "LaunchctlLauncher", lambda: object())
+
+    result = CliRunner().invoke(main, ["install"])
+
+    assert result.exit_code == 0, result.output
+    assert agents == [False]
+    assert brew_calls == [["/opt/homebrew/bin/brew", "install", "--cask", helper.BREW_CASK]]
+
+
 def test_doctor_signature_check_uses_developer_id_anchor(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     # M1: an ad-hoc bundle passes a bare `codesign --verify --strict`; doctor must instead
     # assert the Developer-ID anchor OID, so the check fails OPEN for ad-hoc signatures.
     _install_helper(monkeypatch, tmp_path)
-    calls = _codesign_returns(monkeypatch, 0)
+    calls = _helper_processes(monkeypatch, codesign=0)
     CliRunner().invoke(main, ["doctor"])
     assert calls, "doctor never ran codesign"
     argv = calls[0]
