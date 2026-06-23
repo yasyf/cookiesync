@@ -41,11 +41,11 @@ SESSION_TYPE = "Aqua"
 
 RECONCILE_INTERVAL = 900
 
-# launchctl's tolerated-error strings vary by macOS version: pre-13 said "Could not
-# find specified service" / "service already loaded"; 13+ says "No such process" (exit 3)
-# for a not-loaded bootout. Tolerate every spelling so install/uninstall stay idempotent.
-ALREADY_LOADED = ("service already loaded", "service already bootstrapped")
-NOT_LOADED = ("Could not find specified service", "No such process")
+# launchctl bootout returns exit 3 (ESRCH) when the target agent isn't loaded — the only
+# tolerated failure, so uninstall and re-install of an absent agent are idempotent. Install
+# boots out before bootstrap (bootstrap_agent), so bootstrap never races an already-loaded
+# agent; any nonzero bootstrap exit is a real error (a malformed plist also exits nonzero).
+NOT_LOADED_EXIT = 3
 
 
 class ServiceError(Exception):
@@ -106,16 +106,17 @@ class Launcher(Protocol):
 class LaunchctlLauncher:
     """The production :class:`Launcher`: shells out to ``launchctl bootstrap``/``bootout``.
 
-    Both verbs target the caller's ``gui/<uid>`` domain. An "already loaded" bootstrap
-    and a "not loaded" bootout are tolerated so install and uninstall are idempotent;
-    any other non-zero exit raises :class:`ServiceError`.
+    Both verbs target the caller's ``gui/<uid>`` domain. ``bootout`` tolerates exit 3
+    (``ESRCH`` — the agent wasn't loaded) so uninstall and re-install stay idempotent;
+    ``bootstrap`` tolerates nothing, since install boots out first. Any other non-zero
+    exit raises :class:`ServiceError`.
     """
 
     async def bootstrap(self, plist: Path) -> None:
-        await run_launchctl("bootstrap", gui_domain(), str(plist), tolerate=ALREADY_LOADED)
+        await run_launchctl("bootstrap", gui_domain(), str(plist))
 
     async def bootout(self, label: Label) -> None:
-        await run_launchctl("bootout", f"{gui_domain()}/{label}", tolerate=NOT_LOADED)
+        await run_launchctl("bootout", f"{gui_domain()}/{label}", ok=(NOT_LOADED_EXIT,))
 
 
 def gui_domain() -> str:
@@ -168,15 +169,10 @@ def agent_for(label: Label, program_args: Sequence[str]) -> AgentSpec:
             raise ServiceError(f"{label} runs {agent.command!r}, not {list(program_args)!r}")
 
 
-async def run_launchctl(*args: str, tolerate: tuple[str, ...]) -> None:
+async def run_launchctl(*args: str, ok: tuple[int, ...] = ()) -> None:
     result = await anyio.run_process(["launchctl", *args], check=False)
-    match result.returncode:
-        case 0:
-            return
-        case _ if any(t in result.stderr.decode() for t in tolerate):
-            return
-        case code:
-            raise ServiceError(f"launchctl {args[0]}: exit {code}: {result.stderr.decode().strip()}")
+    if (code := result.returncode) and code not in ok:
+        raise ServiceError(f"launchctl {args[0]}: exit {code}: {result.stderr.decode().strip()}")
 
 
 async def install(launcher: Launcher, *, tick_only: bool = False) -> None:

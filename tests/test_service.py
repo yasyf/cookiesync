@@ -221,28 +221,25 @@ async def test_launchctl_launcher_bootout_targets_label_in_gui_domain(launchctl:
     assert launchctl.calls == [["launchctl", "bootout", f"gui/501/{WATCH_LABEL}"]]
 
 
-async def test_bootstrap_tolerates_already_loaded(launchctl: FakeLaunchctl) -> None:
-    launchctl.fail(5, b"service already loaded")
-
-    await LaunchctlLauncher().bootstrap(Path("/x/watch.plist"))
-
-
-async def test_bootout_tolerates_not_loaded(launchctl: FakeLaunchctl) -> None:
-    launchctl.fail(3, b"Could not find specified service")
-
-    await LaunchctlLauncher().bootout(WATCH_LABEL)
-
-
-async def test_bootout_tolerates_modern_no_such_process(launchctl: FakeLaunchctl) -> None:
-    # macOS 13+ reports a not-loaded bootout as exit 3 "Boot-out failed: 3: No such process",
-    # not the pre-13 "Could not find specified service"; a fresh install must tolerate it.
+async def test_bootout_tolerates_exit_3_not_loaded(launchctl: FakeLaunchctl) -> None:
+    # bootout of a not-loaded agent returns exit 3 (ESRCH); tolerate it by exit code, not by
+    # stderr text (which varies across macOS versions).
     launchctl.fail(3, b"Boot-out failed: 3: No such process")
 
     await LaunchctlLauncher().bootout(WATCH_LABEL)
 
 
-async def test_bootstrap_raises_on_other_failure(launchctl: FakeLaunchctl) -> None:
-    launchctl.fail(1, b"Bootstrap failed: 5: Input/output error")
+async def test_bootout_raises_on_other_exit(launchctl: FakeLaunchctl) -> None:
+    launchctl.fail(5, b"Boot-out failed: 5: Input/output error")
 
-    with pytest.raises(ServiceError, match="Input/output error"):
+    with pytest.raises(ServiceError, match="exit 5"):
+        await LaunchctlLauncher().bootout(WATCH_LABEL)
+
+
+async def test_bootstrap_raises_on_any_failure(launchctl: FakeLaunchctl) -> None:
+    # bootstrap tolerates nothing — install boots out first, so a nonzero exit (e.g. a bad
+    # plist) is always a real error.
+    launchctl.fail(5, b"Bootstrap failed: 5: Input/output error")
+
+    with pytest.raises(ServiceError, match="exit 5"):
         await LaunchctlLauncher().bootstrap(Path("/x/watch.plist"))
