@@ -118,8 +118,13 @@ jobs:
   #
   # Secure Enclave keygen cannot be validated here: CI macOS runners have no usable
   # Secure Enclave. SE validation happens on the user's real Mac after install.
+  #
+  # Depends on github-release so the v* release already exists before the attach
+  # step runs: github-release owns release creation (gh release create, which errors
+  # if the release exists), and this job only ADDS the .app asset (softprops, which
+  # updates an existing release). Without the ordering the two race on the same tag.
   helper-build:
-    needs: [verify-tag-on-main, detect-helper-changes]
+    needs: [verify-tag-on-main, detect-helper-changes, github-release]
     if: needs.detect-helper-changes.outputs.changed == 'true'
     runs-on: macos-15
     permissions:
@@ -246,7 +251,9 @@ jobs:
           files: |
             dist/cookiesync-keyhelper-*-darwin.zip
             dist/cookiesync-keyhelper-*-darwin.zip.sha256
-          generate_release_notes: true
+          # github-release already generated the notes when it created the release;
+          # this job only adds the .app asset, so it must not regenerate the body.
+          generate_release_notes: false
           prerelease: ${{ contains(github.ref_name, '-') }}
 
   publish-cask:
