@@ -233,6 +233,14 @@ async def test_bootout_tolerates_not_loaded(launchctl: FakeLaunchctl) -> None:
     await LaunchctlLauncher().bootout(WATCH_LABEL)
 
 
+async def test_bootout_tolerates_modern_no_such_process(launchctl: FakeLaunchctl) -> None:
+    # macOS 13+ reports a not-loaded bootout as exit 3 "Boot-out failed: 3: No such process",
+    # not the pre-13 "Could not find specified service"; a fresh install must tolerate it.
+    launchctl.fail(3, b"Boot-out failed: 3: No such process")
+
+    await LaunchctlLauncher().bootout(WATCH_LABEL)
+
+
 async def test_bootstrap_raises_on_other_failure(launchctl: FakeLaunchctl) -> None:
     launchctl.fail(1, b"Bootstrap failed: 5: Input/output error")
 

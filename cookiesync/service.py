@@ -41,8 +41,11 @@ SESSION_TYPE = "Aqua"
 
 RECONCILE_INTERVAL = 900
 
-ALREADY_LOADED = "service already loaded"
-NOT_LOADED = "Could not find specified service"
+# launchctl's tolerated-error strings vary by macOS version: pre-13 said "Could not
+# find specified service" / "service already loaded"; 13+ says "No such process" (exit 3)
+# for a not-loaded bootout. Tolerate every spelling so install/uninstall stay idempotent.
+ALREADY_LOADED = ("service already loaded", "service already bootstrapped")
+NOT_LOADED = ("Could not find specified service", "No such process")
 
 
 class ServiceError(Exception):
@@ -165,12 +168,12 @@ def agent_for(label: Label, program_args: Sequence[str]) -> AgentSpec:
             raise ServiceError(f"{label} runs {agent.command!r}, not {list(program_args)!r}")
 
 
-async def run_launchctl(*args: str, tolerate: str) -> None:
+async def run_launchctl(*args: str, tolerate: tuple[str, ...]) -> None:
     result = await anyio.run_process(["launchctl", *args], check=False)
     match result.returncode:
         case 0:
             return
-        case _ if tolerate in result.stderr.decode():
+        case _ if any(t in result.stderr.decode() for t in tolerate):
             return
         case code:
             raise ServiceError(f"launchctl {args[0]}: exit {code}: {result.stderr.decode().strip()}")
