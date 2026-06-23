@@ -23,7 +23,7 @@ if TYPE_CHECKING:
 
 
 @click.group()
-@click.version_option(package_name="cookiesync")
+@click.version_option(package_name="cookiesync-cli")
 def main() -> None:
     """Sync your browser cookies across machines."""
 

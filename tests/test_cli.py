@@ -32,6 +32,16 @@ def test_hello_is_gone() -> None:
     assert result.exit_code != 0
 
 
+def test_version_resolves_the_distribution_name() -> None:
+    # --version reads installed distribution metadata; the dist is `cookiesync-cli`
+    # while the import package is `cookiesync`, so version_option must name the
+    # distribution explicitly or Click raises "'cookiesync' is not installed".
+    result = CliRunner().invoke(main, ["--version"])
+    assert result.exit_code == 0, result.output
+    assert result.exception is None
+    assert "version" in result.output
+
+
 def _helper_processes(
     monkeypatch: pytest.MonkeyPatch,
     *,
