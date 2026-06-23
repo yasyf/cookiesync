@@ -330,7 +330,7 @@ async def test_request_consent_prompts_for_params_browser_and_echoes_nonce_and_e
     assert resp.ok, resp.error
     assert resp.result == {"status": "approved", "nonce": "nonce-xyz", "endpoint": "peer@desktop:arc:Default"}
     # The Touch ID prompt named the requested endpoint, proving it was for the right browser.
-    assert consent.prompts == ["release peer@desktop:arc:Default"]
+    assert consent.prompts == ["sync them to peer@desktop:arc:Default"]
 
 
 async def test_request_consent_denied_propagates(sock_path: Path) -> None:

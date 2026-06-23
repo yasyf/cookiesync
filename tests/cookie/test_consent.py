@@ -254,8 +254,8 @@ async def test_obtain_key_fails_closed_when_helper_missing(monkeypatch: pytest.M
 
 
 def test_compose_reason_collapses_whitespace_and_caps() -> None:
-    assert compose_reason("Chrome", "post   a\n\ttweet") == "access your Chrome session to post a tweet"
+    assert compose_reason("Chrome", "post   a\n\ttweet") == "unlock your Chrome cookies to post a tweet"
     long = "x" * 300
     composed = compose_reason("Chrome", long)
-    assert composed == f"access your Chrome session to {'x' * consent.REASON_CAP}"
+    assert composed == f"unlock your Chrome cookies to {'x' * consent.REASON_CAP}"
     assert composed.endswith("x" * consent.REASON_CAP)

@@ -46,12 +46,12 @@ class ConsentError(Exception):
 
 
 def compose_reason(host: str, reason: str) -> str:
-    """Touch ID prompt text: domain first, the caller's reason as a 'to …' clause.
+    """Touch ID prompt text: concise and specific — what is unlocked, then a short why.
 
     ``reason`` is collapsed to a single line and capped, since it surfaces verbatim in
-    a security dialog.
+    the Touch ID dialog.
     """
-    return f"access your {host} session to {' '.join(reason.split())[:REASON_CAP]}"
+    return f"unlock your {host} cookies to {' '.join(reason.split())[:REASON_CAP]}"
 
 
 class Consent(Protocol):

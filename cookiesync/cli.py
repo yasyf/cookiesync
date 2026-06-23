@@ -119,6 +119,9 @@ async def run_watch() -> None:
     from cookiesync.daemon import Daemon
 
     logger.debug("starting cookiesync daemon")
+    # The daemon needs the signed helper for the SE key vault and cache; install it
+    # if absent so the helper is fully CLI-managed (the user never runs brew by hand).
+    await ensure_helper()
     await (await Daemon.build()).watch()
 
 

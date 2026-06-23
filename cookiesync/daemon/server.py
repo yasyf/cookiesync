@@ -65,7 +65,7 @@ if TYPE_CHECKING:
 PEER_METHODS = ("sync", "reconcile", "extract", "apply", "whoami")
 LOCAL_METHODS = ("prime_auth", "get_cookies", "auth_status", "request_consent")
 
-CONSENT_REASON = "sync your cookies across your machines"
+CONSENT_REASON = "sync them across your Macs"
 DEFAULT_PROFILE = "Default"
 
 
@@ -368,7 +368,7 @@ class Daemon:
         if not await has_active_session(probe=self.probe):
             return {"status": "unavailable"}
         try:
-            await self.consent.obtain_key(browser_for(browser), reason=f"release {endpoint}")
+            await self.consent.obtain_key(browser_for(browser), reason=f"sync them to {endpoint}")
         except ConsentError:
             return {"status": "denied"}
         return {"status": "approved", "nonce": nonce, "endpoint": endpoint}
