@@ -7,38 +7,36 @@ keychain item bound to biometry-or-passcode, so every retrieval forces a genuine
 biometric (or device-passcode) evaluation through the keychain. On a host with neither
 biometrics nor a passcode (headless, no Touch ID), it falls back to the device-unlock
 ``security`` read.
+
+The biometric vault and re-store run inside the installed, Developer-ID-signed
+``cookiesync-keyhelper.app`` (``vault-status`` / ``vault-retrieve`` / ``vault-enroll``).
+An ad-hoc helper is SIGKILLed at exec by AMFI, so a missing helper fails closed rather
+than degrading to an unsigned build — see :func:`cookiesync.paths.require_helper`.
 """
 
 from __future__ import annotations
 
 import os
-import shutil
 from dataclasses import dataclass
-from pathlib import Path
 from typing import TYPE_CHECKING, Protocol
 
 import anyio
 
+from cookiesync import paths
 from cookiesync.cookie.crypto import derive_key
 from cookiesync.cookie.models import AesKey, SafeStorageKey
 
 if TYPE_CHECKING:
+    from pathlib import Path
+
     from cookiesync.cookie.browsers import Browser
 
-SWIFT_SRC = Path(__file__).parent / "vault" / "keyvault.swift"
 SECURITY = "/usr/bin/security"
 REASON_CAP = 160
 
 
 class ConsentError(Exception):
     """The user explicitly declined the Touch ID / passcode prompt, or the vault read failed."""
-
-
-def data_dir() -> Path:
-    """Persistent data dir for the compiled helper; cache fallback off-plugin."""
-    if base := os.environ.get("CLAUDE_PLUGIN_DATA"):
-        return Path(base)
-    return Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "cookiesync"
 
 
 def compose_reason(host: str, reason: str) -> str:
@@ -48,28 +46,6 @@ def compose_reason(host: str, reason: str) -> str:
     a security dialog.
     """
     return f"access your {host} session to {' '.join(reason.split())[:REASON_CAP]}"
-
-
-async def compile_helper() -> Path:
-    """Compile (once) and ad-hoc sign the key-vault helper, cached by source mtime."""
-    bin_path = data_dir() / "bin" / "keyvault"
-    if bin_path.is_file() and bin_path.stat().st_mtime >= SWIFT_SRC.stat().st_mtime:
-        return bin_path
-    bin_path.parent.mkdir(parents=True, exist_ok=True)
-    await anyio.run_process(
-        [
-            shutil.which("swiftc"),
-            str(SWIFT_SRC),
-            "-framework",
-            "Security",
-            "-framework",
-            "LocalAuthentication",
-            "-o",
-            str(bin_path),
-        ],
-    )
-    await anyio.run_process([shutil.which("codesign"), "-s", "-", "-f", str(bin_path)])
-    return bin_path
 
 
 class Consent(Protocol):
@@ -99,11 +75,11 @@ class TouchIDConsent:
         return derive_key(await self.read_safe_storage(browser.keychain_service))
 
     async def obtain_key(self, browser: Browser, *, reason: str) -> AesKey:
-        helper = await compile_helper()
+        helper = paths.require_helper()
         vault = f"cookiesync.vault.{browser.name}"
         env = os.environ | {"COOKIESYNC_TOUCHID_REASON": compose_reason(browser.display, reason)}
 
-        status = await anyio.run_process([str(helper), "status", vault], check=False)
+        status = await anyio.run_process([str(helper), "vault-status", vault], check=False)
         match status.returncode, b"passcode=true" in status.stdout, b"vault=true" in status.stdout:
             case 2, False, _:
                 return derive_key(await self.read_safe_storage(browser.keychain_service))
@@ -116,7 +92,7 @@ class TouchIDConsent:
     async def retrieve(
         self, helper: Path, vault: str, safe_storage_service: str, *, env: dict[str, str]
     ) -> SafeStorageKey:
-        result = await anyio.run_process([str(helper), "retrieve", vault], check=False, env=env)
+        result = await anyio.run_process([str(helper), "vault-retrieve", vault], check=False, env=env)
         match result.returncode:
             case 0:
                 return SafeStorageKey(result.stdout.decode("utf-8"))
@@ -126,13 +102,13 @@ class TouchIDConsent:
                 # errSecItemNotFound / errSecAuthFailed: the biometryCurrentSet ACL
                 # invalidated (the fingerprint set changed). Re-enroll once, then retry.
                 await self.enroll(helper, vault, safe_storage_service)
-                second = await anyio.run_process([str(helper), "retrieve", vault], check=False, env=env)
+                second = await anyio.run_process([str(helper), "vault-retrieve", vault], check=False, env=env)
                 if second.returncode == 0:
                     return SafeStorageKey(second.stdout.decode("utf-8"))
                 raise ConsentError("Touch ID vault retrieval failed after re-enrollment")
 
     async def enroll(self, helper: Path, vault: str, safe_storage_service: str) -> None:
-        await anyio.run_process([str(helper), "enroll", vault, safe_storage_service])
+        await anyio.run_process([str(helper), "vault-enroll", vault, safe_storage_service])
 
     async def read_safe_storage(self, service: str) -> SafeStorageKey:
         result = await anyio.run_process([SECURITY, "find-generic-password", "-w", "-s", service], check=False)

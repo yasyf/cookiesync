@@ -8,7 +8,7 @@ import anyio
 import click
 from loguru import logger
 
-from cookiesync import state
+from cookiesync import paths, state
 from cookiesync.cookie import OutputFormat, StorageState, render
 from cookiesync.cookie.browsers import REGISTRY
 from cookiesync.daemon import rpc
@@ -19,6 +19,8 @@ from cookiesync.state import BrowserEndpoint, BrowserId, SshTarget, parse_durati
 
 if TYPE_CHECKING:
     from cookiesync.daemon.wire import Response
+
+CODESIGN = "/usr/bin/codesign"
 
 
 @click.group()
@@ -131,8 +133,55 @@ def install(tick_only: bool) -> None:
 async def run_install(tick_only: bool) -> None:
     from cookiesync.service import LaunchctlLauncher, install
 
+    await report_helper()
     await install(LaunchctlLauncher(), tick_only=tick_only)
     click.echo("Installed cookiesync agents." if not tick_only else "Installed the cookiesync reconcile tick.")
+
+
+@main.command()
+def doctor() -> None:
+    """Check that the signed Secure-Enclave key helper is installed and Developer-ID-signed."""
+    anyio.run(run_doctor)
+
+
+async def run_doctor() -> None:
+    match await helper_state():
+        case "ok":
+            click.echo(f"key helper OK: {paths.helper_app_path()} (Developer ID signed)")
+        case "unsigned":
+            raise click.ClickException(
+                f"key helper at {paths.helper_app_path()} is not Developer-ID-signed; reinstall the notarized .app"
+            )
+        case "missing":
+            raise click.ClickException(
+                f"key helper not installed at {paths.helper_app_path()}; run 'cookiesync install' to fetch it"
+            )
+
+
+async def helper_state() -> str:
+    """Classify the installed key helper as ``ok`` (signed), ``unsigned``, or ``missing``."""
+    if not paths.helper_binary().is_file():
+        return "missing"
+    result = await anyio.run_process([CODESIGN, "--verify", "--strict", str(paths.helper_app_path())], check=False)
+    return "ok" if result.returncode == 0 else "unsigned"
+
+
+async def report_helper() -> None:
+    match await helper_state():
+        case "ok":
+            return
+        case "unsigned":
+            click.echo(
+                f"Warning: key helper at {paths.helper_app_path()} is not Developer-ID-signed; "
+                "reinstall the notarized .app — Secure-Enclave operations will fail closed.",
+                err=True,
+            )
+        case "missing":
+            click.echo(
+                f"Warning: key helper not installed at {paths.helper_app_path()}; "
+                "Touch-ID consent and the key cache will fail closed until it is installed.",
+                err=True,
+            )
 
 
 @main.command()

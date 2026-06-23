@@ -7,16 +7,35 @@ reversible XOR :class:`FakeWrapper` and the clock is injected — the cache logi
 
 from __future__ import annotations
 
+import stat
 from dataclasses import dataclass
+from pathlib import Path
 
 import pytest
 
-from cookiesync.daemon.cache import KeyCache
+from cookiesync import paths
+from cookiesync.daemon.cache import KeyCache, SecureEnclaveWrapper
+from cookiesync.paths import HelperError
 
 ENDPOINT = "yasyf-home:chrome:Default"
 OTHER = "yasyf-work:arc:Profile 1"
 KEY = bytes(range(32))
 XOR_MASK = 0x5A
+
+# A fake cookiesync-keyhelper that emulates the cache-* subcommand contract: an XOR
+# round-trip wrapper standing in for the Secure-Enclave ECIES blob, with newkey/dropkey
+# as no-op exit-0s and the label recorded to a state file so tests can assert on it.
+FAKE_HELPER = f"""#!/usr/bin/env python3
+import sys
+verb, label = sys.argv[1], sys.argv[2]
+state = __import__("os").environ["FAKE_HELPER_STATE"]
+if verb in ("cache-newkey", "cache-dropkey"):
+    open(state, "a").write(verb + " " + label + "\\n")
+    sys.exit(0)
+data = sys.stdin.buffer.read()
+sys.stdout.buffer.write(bytes(b ^ {XOR_MASK} for b in data))
+sys.exit(0)
+"""
 
 
 @dataclass(frozen=True, slots=True)
@@ -26,6 +45,45 @@ class FakeWrapper:
 
     async def unwrap(self, blob: bytes) -> bytes:
         return bytes(b ^ XOR_MASK for b in blob)
+
+
+@pytest.fixture
+def fake_helper(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
+    binary = tmp_path / "cookiesync-keyhelper.app" / "Contents" / "MacOS" / "cookiesync-keyhelper"
+    binary.parent.mkdir(parents=True)
+    binary.write_text(FAKE_HELPER)
+    binary.chmod(binary.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+    monkeypatch.setattr(paths, "helper_binary", lambda: binary)
+    monkeypatch.setenv("FAKE_HELPER_STATE", str(tmp_path / "helper.log"))
+    return binary
+
+
+async def test_secure_enclave_wrapper_round_trips_via_the_signed_helper(fake_helper: Path, tmp_path: Path) -> None:
+    wrapper = await SecureEnclaveWrapper.open()
+
+    blob = await wrapper.wrap(KEY)
+    assert blob != KEY
+    assert await wrapper.unwrap(blob) == KEY
+
+    await wrapper.close()
+    log = (tmp_path / "helper.log").read_text().splitlines()
+    assert log[0] == f"cache-newkey {wrapper.label}"
+    assert log[-1] == f"cache-dropkey {wrapper.label}"
+
+
+async def test_secure_enclave_wrapper_fails_closed_when_helper_missing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(paths, "helper_binary", lambda: tmp_path / "absent" / "cookiesync-keyhelper")
+    with pytest.raises(HelperError, match="cookiesync install"):
+        await SecureEnclaveWrapper.open()
+
+
+async def test_key_cache_over_the_signed_helper_wrapper(fake_helper: Path) -> None:
+    cache_obj = KeyCache(await SecureEnclaveWrapper.open())
+    await cache_obj.put(ENDPOINT, KEY, ttl=30.0)
+    assert cache_obj.entries[ENDPOINT].blob != KEY
+    assert await cache_obj.get(ENDPOINT) == KEY
 
 
 class Clock:

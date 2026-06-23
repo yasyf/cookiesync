@@ -6,16 +6,16 @@ plaintext key lives in process memory for that window, but the AT-REST cache byt
 Secure-Enclave-wrapped: a leaked cache blob or a core dump is useless off-box, since
 only the live per-boot Enclave key can unwrap it.
 
-:class:`SecureEnclaveWrapper` drives ``keycache.swift`` (compiled and ad-hoc signed at
-runtime, mirroring ``keyvault.swift``). Tests inject a :class:`Wrapper` double and a
-clock, so the cache logic is exercised without any macOS API.
+:class:`SecureEnclaveWrapper` drives the installed, Developer-ID-signed
+``cookiesync-keyhelper.app`` (``cache-newkey`` / ``cache-wrap`` / ``cache-unwrap`` /
+``cache-dropkey``). An ad-hoc helper is refused the Enclave, so a missing helper fails
+closed — see :func:`cookiesync.paths.require_helper`. Tests inject a :class:`Wrapper`
+double and a clock, so the cache logic is exercised without any macOS API.
 """
 
 from __future__ import annotations
 
-import os
 import secrets
-import shutil
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -24,27 +24,7 @@ from typing import Protocol
 
 import anyio
 
-SWIFT_SRC = Path(__file__).parent / "vault" / "keycache.swift"
-
-
-def data_dir() -> Path:
-    """Persistent data dir for the compiled helper; cache fallback off-plugin."""
-    if base := os.environ.get("CLAUDE_PLUGIN_DATA"):
-        return Path(base)
-    return Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "cookiesync"
-
-
-async def compile_helper() -> Path:
-    """Compile (once) and ad-hoc sign the key-cache helper, cached by source mtime."""
-    bin_path = data_dir() / "bin" / "keycache"
-    if bin_path.is_file() and bin_path.stat().st_mtime >= SWIFT_SRC.stat().st_mtime:
-        return bin_path
-    bin_path.parent.mkdir(parents=True, exist_ok=True)
-    await anyio.run_process(
-        [shutil.which("swiftc"), str(SWIFT_SRC), "-framework", "Security", "-o", str(bin_path)],
-    )
-    await anyio.run_process([shutil.which("codesign"), "-s", "-", "-f", str(bin_path)])
-    return bin_path
+from cookiesync import paths
 
 
 class Wrapper(Protocol):
@@ -75,18 +55,18 @@ class SecureEnclaveWrapper:
 
     @classmethod
     async def open(cls) -> SecureEnclaveWrapper:
-        wrapper = cls(await compile_helper())
-        await anyio.run_process([str(wrapper.helper), "newkey", wrapper.label])
+        wrapper = cls(paths.require_helper())
+        await anyio.run_process([str(wrapper.helper), "cache-newkey", wrapper.label])
         return wrapper
 
     async def wrap(self, plaintext: bytes) -> bytes:
-        return (await anyio.run_process([str(self.helper), "wrap", self.label], stdin=plaintext)).stdout
+        return (await anyio.run_process([str(self.helper), "cache-wrap", self.label], input=plaintext)).stdout
 
     async def unwrap(self, blob: bytes) -> bytes:
-        return (await anyio.run_process([str(self.helper), "unwrap", self.label], stdin=blob)).stdout
+        return (await anyio.run_process([str(self.helper), "cache-unwrap", self.label], input=blob)).stdout
 
     async def close(self) -> None:
-        await anyio.run_process([str(self.helper), "dropkey", self.label])
+        await anyio.run_process([str(self.helper), "cache-dropkey", self.label])
 
 
 @dataclass(frozen=True, slots=True)
