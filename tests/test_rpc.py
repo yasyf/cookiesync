@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import socket
+import sys
 import tempfile
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -96,6 +97,7 @@ def test_response_round_trips() -> None:
         assert decode_response(encode_response(resp)) == resp
 
 
+@pytest.mark.skipif(sys.platform != "darwin", reason="LOCAL_PEERCRED is a macOS-only socket constant")
 def test_peer_uid_matches_current_uid() -> None:
     left, right = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
@@ -199,6 +201,7 @@ async def _pong() -> dict:
     return {"pong": True}
 
 
+@pytest.mark.skipif(sys.platform != "darwin", reason="LOCAL_PEERCRED is a macOS-only socket constant")
 def test_peer_uid_helper_uses_local_peercred() -> None:
     assert rpc.SOL_LOCAL == 0
     assert rpc.LOCAL_PEERCRED == socket.LOCAL_PEERCRED

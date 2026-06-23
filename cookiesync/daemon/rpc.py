@@ -41,7 +41,9 @@ DISPATCH_TIMEOUT = 600.0
 MAX_LINE = 16 * 1024 * 1024
 
 SOL_LOCAL = 0
-LOCAL_PEERCRED = socket.LOCAL_PEERCRED
+# macOS-only socket constant (value 0x001). This daemon runs only on macOS; the literal
+# fallback just keeps the package importable on other platforms (docs build, portable engine).
+LOCAL_PEERCRED = getattr(socket, "LOCAL_PEERCRED", 0x001)
 
 
 class RpcError(Exception):
