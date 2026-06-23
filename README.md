@@ -6,53 +6,41 @@
 [![Python](https://img.shields.io/pypi/pyversions/cookiesync-cli.svg)](https://pypi.org/project/cookiesync-cli/)
 [![License: PolyForm Noncommercial 1.0.0](https://img.shields.io/badge/License-PolyForm--Noncommercial--1.0.0-blue.svg)](https://github.com/yasyf/cookiesync/blob/main/LICENSE)
 
-Sync your browser cookies across machines.
+Sync your browser cookies across machines — land on a new laptop already logged in.
 
-cookiesync copies the cookies your browser already holds on one machine and
-replays them on another, so the sites you're signed into follow you between
-laptops. It reuses your existing browser session instead of asking for
-passwords again, so logins, 2FA, and SSO state carry over without you
-re-authenticating anywhere.
+cookiesync copies the cookies your browser already holds on one machine and replays
+them on another, reusing your live session instead of asking for passwords again — so
+logins, 2FA, and SSO state carry over without re-authenticating. It's browser-agnostic,
+and you pick which machines and which sites it touches. Automation can borrow a
+logged-in session too: hand a CI job or an agent the cookies it needs, never a password.
 
-> **macOS only.** cookiesync keeps your browser's Safe Storage key behind a
-> Touch ID prompt and a Secure Enclave–bound daemon, so decrypted cookies never
-> land on disk. The key helper is a Developer-ID-signed, notarized `.app`.
+> **macOS only.** cookiesync keeps your browser's Safe Storage key behind a Touch ID
+> prompt and a Secure Enclave–bound daemon, so decrypted cookies never land on disk.
+> The key helper is a Developer-ID-signed, notarized `.app`.
 
 ## Install
 
-cookiesync publishes on PyPI as `cookiesync-cli` and installs a `cookiesync`
-command. You'll reach for it often, so install it onto your PATH with
-[uv](https://docs.astral.sh/uv/):
-
-```bash
-uv tool install cookiesync-cli
-cookiesync --help
-```
-
-To add it to a project instead:
-
-```bash
-uv add cookiesync-cli
-```
+Run with [uvx](https://docs.astral.sh/uv/): `uvx cookiesync --help`.
 
 ## Quickstart
 
 ```bash
-# Fetch the signed key helper and start the sync daemon (one time)
-cookiesync install
-
-# Confirm the helper is installed and Developer-ID signed
-cookiesync doctor
+# Fetch the signed key helper and install the LaunchAgents (one time)
+$ cookiesync install
+Installing the signed key helper via Homebrew (brew install yasyf/tap/cookiesync-keyhelper)…
+Installed and verified key helper: /Applications/cookiesync-keyhelper.app
+Installed cookiesync agents.
 
 # Track a browser to sync between this Mac and another host
-cookiesync browser add other-host chrome
+$ cookiesync browser add other-host chrome
+Tracking other-host/chrome/Default
 
-# Hand a logged-in session to a script without giving it a password
-cookiesync cookies https://example.com --browser chrome
+# Hand a logged-in session to a script — no password
+$ cookiesync cookies https://example.com --browser chrome
 ```
 
-Once a browser is tracked, the resident daemon watches its cookie store and
-converges it across your hosts. Run `cookiesync reconcile` to force a full pass.
+Once a browser is tracked, the resident daemon watches its cookie store and converges
+it across your hosts. Run `cookiesync reconcile` to force a full pass.
 
 ## Commands
 
@@ -72,16 +60,14 @@ converges it across your hosts. Run `cookiesync reconcile` to force a full pass.
 
 Run `cookiesync --help`, or `cookiesync <command> --help`, for the full reference.
 
-## What problems does this solve?
+## How it works
 
-- A fresh machine means signing into every account again. cookiesync moves your
-  live browser session over, so you land already logged in.
-- 2FA and SSO re-prompt whenever you switch laptops. Carrying the existing
-  cookies over keeps those sessions valid instead of restarting them.
-- Built-in browser sync is all-or-nothing and locked to one vendor. cookiesync
-  is browser-agnostic, and you pick which machines and which sites it touches.
-- Automation needs a logged-in session but should never hold a password. Hand a
-  CI job or an agent the cookies it needs instead of a credential it can leak.
+`cookiesync install` fetches the notarized key helper and starts a resident daemon. The
+daemon watches each tracked browser's cookie store, and on a change it converges that
+group across your hosts over SSH — extracting and re-applying cookies through the same
+RPC the peers speak. Decryption needs the browser's Safe Storage key, which the helper
+releases only behind a Touch ID tap (`cookiesync auth`) and caches in the
+Secure-Enclave-bound daemon for a short window, never on disk.
 
 ## License
 
