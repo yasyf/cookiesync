@@ -5,7 +5,11 @@
 // conversion to Unix seconds happens only at serialize time.
 package cookie
 
-import "time"
+import (
+	"math"
+	"math/big"
+	"time"
+)
 
 // Host is a bare hostname: lowercase, no leading dot.
 type Host string
@@ -30,6 +34,39 @@ const windowsEpochOffset = 11_644_473_600
 // unixToChromeMicros converts a wall-clock time to a Chrome timestamp (µs since 1601).
 func unixToChromeMicros(t time.Time) ChromeMicros {
 	return ChromeMicros((t.Unix()+windowsEpochOffset)*1_000_000 + int64(t.Nanosecond())/1_000)
+}
+
+// unixSecondsToChromeMicros converts Unix seconds (as a float, e.g. from get-cookie)
+// to a Chrome timestamp, rounding half-to-even to match Python's round().
+func unixSecondsToChromeMicros(seconds float64) ChromeMicros {
+	return ChromeMicros(math.RoundToEven((seconds + windowsEpochOffset) * 1_000_000))
+}
+
+// chromeMicrosToUnix converts a Chrome timestamp to Unix seconds. A non-positive
+// timestamp is a session cookie (no expiry), reported via the session return.
+func chromeMicrosToUnix(micros ChromeMicros) (seconds float64, session bool) {
+	if micros <= 0 {
+		return 0, true
+	}
+	// Divide as an exact rational and round once: float64(micros)/1e6 would
+	// double-round (int64->float64 loses precision above 2^53 µs, i.e. every real
+	// expiry) and diverge from Python's exact-int division.
+	r := new(big.Rat).SetFrac(big.NewInt(int64(micros)), big.NewInt(1_000_000))
+	f, _ := r.Float64()
+	return f - windowsEpochOffset, false
+}
+
+// samesiteToPlaywright maps Chrome's samesite int to Playwright's string. Chrome's
+// unspecified (-1) and lax (1) both map to "Lax".
+func samesiteToPlaywright(samesite int) string {
+	switch samesite {
+	case 0:
+		return "None"
+	case 2:
+		return "Strict"
+	default:
+		return "Lax"
+	}
 }
 
 // Cookie is one decrypted cookie, carrying Chrome-native column values.
