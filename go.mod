@@ -5,6 +5,7 @@ go 1.26.4
 require (
 	github.com/spf13/cobra v1.10.2
 	github.com/yasyf/synckit v0.0.0
+	golang.org/x/crypto v0.24.0
 )
 
 replace github.com/yasyf/synckit => ../synckit
@@ -20,6 +21,6 @@ require (
 	golang.org/x/mod v0.18.0 // indirect
 	golang.org/x/net v0.26.0 // indirect
 	golang.org/x/sync v0.7.0 // indirect
-	golang.org/x/sys v0.37.0 // indirect
+	golang.org/x/sys v0.46.0 // indirect
 	golang.org/x/tools v0.22.0 // indirect
 )
