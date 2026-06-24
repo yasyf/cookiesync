@@ -81,7 +81,7 @@ jobs:
         run: |
           PREV=$(git describe --tags --abbrev=0 --match 'v[0-9]*' "${GITHUB_REF_NAME}^" 2>/dev/null || true)
           if [ -z "$PREV" ]; then echo "changed=true" >> "$GITHUB_OUTPUT";
-          elif git diff --quiet "$PREV" "${GITHUB_REF_NAME}" -- helper/; then echo "changed=false" >> "$GITHUB_OUTPUT";
+          elif git diff --quiet "$PREV" "${GITHUB_REF_NAME}" -- helper/ ':(exclude)helper/build/'; then echo "changed=false" >> "$GITHUB_OUTPUT";
           else echo "changed=true" >> "$GITHUB_OUTPUT"; fi
 
   # Builds, Developer-ID-signs, notarizes, and staples cookiesync-keyhelper.app,
