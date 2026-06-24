@@ -14,7 +14,10 @@ permissions:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    # cookiesync is macOS-only (Safe Storage, Touch ID, launchd, ioreg), so its
+    # tests must run on macOS — the install/service/session tests need a real
+    # launchd and refuse to run elsewhere.
+    runs-on: macos-latest
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-go@v6
