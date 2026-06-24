@@ -6,12 +6,12 @@ import (
 	"github.com/yasyf/cookiesync/internal/cookie"
 )
 
-// DigestRecorder is the in-memory anti-echo ledger: the last logical digest the sync
-// layer applied to each endpoint. The converge pass records the digest of a merged
-// set immediately before writing it, so a later fingerprint of the store (by the watch
-// loop, a future cycle) matches the recorded digest and the self-induced write is
-// recognized as the daemon's own echo rather than re-triggering a sync. It is safe for
-// concurrent use; the watch daemon holds one for the process lifetime.
+// DigestRecorder is a standalone in-memory cookie.Recorder: the last logical digest
+// the sync layer applied to each endpoint, with no watch engine behind it. The
+// resident daemon seeds the watch engine's own ledger instead (watch.EngineRecorder),
+// so this is the recorder for a converge with no resident watch loop to echo to — and
+// the simple double the converge-layer tests record through. It is safe for concurrent
+// use.
 type DigestRecorder struct {
 	mu      sync.Mutex
 	digests map[string]cookie.Digest

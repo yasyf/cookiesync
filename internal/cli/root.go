@@ -12,11 +12,6 @@ import (
 	"github.com/spf13/cobra"
 )
 
-// errNotImplemented marks a command whose subsystem (crypto, sqlite, merge,
-// swift-integration, driver, watch) lands in a later cycle. The scaffold pins
-// the command surface now; the handler fails loudly until it is filled in.
-var errNotImplemented = errors.New("not implemented yet (phase 3)")
-
 // statusError carries a process exit code out of a command so a remote command's
 // exit status can propagate to cookiesync's own exit code. Its message is empty
 // so Execute prints nothing extra when honoring the code.

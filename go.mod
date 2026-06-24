@@ -3,6 +3,7 @@ module github.com/yasyf/cookiesync
 go 1.26.4
 
 require (
+	github.com/fsnotify/fsnotify v1.10.1
 	github.com/spf13/cobra v1.10.2
 	github.com/yasyf/synckit v0.0.0
 	golang.org/x/crypto v0.48.0

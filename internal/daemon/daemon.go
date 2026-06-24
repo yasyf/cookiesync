@@ -35,6 +35,7 @@ import (
 	"github.com/yasyf/cookiesync/internal/helper"
 	"github.com/yasyf/cookiesync/internal/paths"
 	"github.com/yasyf/cookiesync/internal/state"
+	"github.com/yasyf/cookiesync/internal/watch"
 	synckit "github.com/yasyf/synckit/rpc"
 )
 
@@ -84,6 +85,11 @@ type Daemon struct {
 	runner  engine.SSHRunner
 	state   StateLoader
 
+	// watch is the anti-echo watch engine the daemon runs alongside the RPC server,
+	// converging on a local store change. It is nil in handler unit tests (which build
+	// the daemon through New and never run the loop); Build wires it for production.
+	watch *watch.Engine
+
 	// newNonce mints a fresh routed-consent nonce. It is a field so a test can pin
 	// the nonce and assert the echo binding; production uses the crypto/rand source.
 	newNonce func() (string, error)
@@ -96,7 +102,8 @@ type Daemon struct {
 func Build(ctx context.Context) (*Daemon, func(context.Context) error, error) {
 	store := state.New(paths.Config)
 	// Load once here to fail fast on a malformed state file; handlers re-read it live.
-	if _, err := store.Load(ctx); err != nil {
+	st, err := store.Load(ctx)
+	if err != nil {
 		return nil, nil, err
 	}
 
@@ -106,9 +113,18 @@ func Build(ctx context.Context) (*Daemon, func(context.Context) error, error) {
 	}
 	keyCache := cache.NewKeyCache(wrapper)
 	runner := engine.NewExecSSHRunner()
-	eng := engine.New(store, keyCache, runner, engine.NewDigestRecorder())
+
+	// Wire the watch engine first: its anti-echo ledger is the one the sync engine
+	// records applied digests through, so a converge's write is recognized as the
+	// daemon's own echo. The notifier's local converger is the sync engine, set after
+	// both exist — the cycle (watch engine -> recorder -> sync engine -> notifier ->
+	// watch engine) is broken by this two-step wiring.
+	watchEng := watch.NewEngine(store, st.SelfTarget, watch.NotifyHosts(st), st.Settings.WatchDebounce, runner)
+	eng := engine.New(store, keyCache, runner, watchEng.Recorder())
+	watchEng.SetConverger(eng)
 
 	d := New(cookie.TouchIDConsent{}, keyCache, eng, ProbeSession, runner, store)
+	d.watch = watchEng
 
 	closer := func(ctx context.Context) error {
 		keyCache.EvictAll()
@@ -183,7 +199,19 @@ func Serve(ctx context.Context) error {
 	}
 	defer func() { _ = ln.Close() }()
 
-	return synckit.Serve(ctx, ln, d.Dispatcher())
+	// Run the RPC server and the watch loop under one context: each settle of a local
+	// store converges this host and notifies peers, while the server answers the RPC
+	// set. The first to fail cancels the other so the daemon exits as a unit (launchd
+	// then relaunches it).
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	errc := make(chan error, 2)
+	go func() { errc <- synckit.Serve(ctx, ln, d.Dispatcher()) }()
+	go func() { errc <- d.watch.Run(ctx, d.state) }()
+	err = <-errc
+	cancel()
+	<-errc
+	return err
 }
 
 // endpointID is an endpoint's stable identity, host:browser:profile — the cache key
