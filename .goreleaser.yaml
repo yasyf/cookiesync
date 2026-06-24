@@ -1,0 +1,74 @@
+# goreleaser config — https://goreleaser.com
+version: 2
+
+project_name: cookiesync
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: cookiesync
+    env:
+      # modernc.org/sqlite is pure Go, so the darwin binaries cross-compile with no
+      # C toolchain — CGO stays off and arm64 builds from the amd64 runner cleanly.
+      - CGO_ENABLED=0
+    # macOS only: cookiesync drives Safe Storage, Touch ID, the Secure Enclave,
+    # launchd, and ioreg, none of which exist off darwin.
+    goos:
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w -X main.version={{ .Version }}
+
+archives:
+  - formats: [tar.gz]
+    name_template: "{{ .ProjectName }}_{{ .Os }}_{{ .Arch }}"
+
+# Developer-ID sign + notarize the darwin binaries so Gatekeeper clears the CLI on
+# first launch, gated on the MACOS_* secrets (no-op when unset). The Swift key
+# helper is signed separately in release.yml; this block covers the Go binary only.
+notarize:
+  macos:
+    - enabled: '{{ if envOrDefault "MACOS_SIGN_P12" "" }}true{{ else }}false{{ end }}'
+      ids:
+        - cookiesync
+      sign:
+        certificate: "{{ .Env.MACOS_SIGN_P12 }}"
+        password: "{{ .Env.MACOS_SIGN_PASSWORD }}"
+      notarize:
+        issuer_id: "{{ .Env.MACOS_NOTARY_ISSUER_ID }}"
+        key_id: "{{ .Env.MACOS_NOTARY_KEY_ID }}"
+        key: "{{ .Env.MACOS_NOTARY_KEY }}"
+        wait: true
+        timeout: 20m
+
+checksum:
+  name_template: checksums.txt
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"
+
+homebrew_casks:
+  - repository:
+      owner: yasyf
+      name: homebrew-tap
+      token: "{{ .Env.HOMEBREW_TAP_TOKEN }}"
+    homepage: https://github.com/yasyf/cookiesync
+    description: Sync your browser cookies across your Macs.
+    # The signed Secure-Enclave key helper ships as its own cask (published by
+    # release.yml). Installing cookiesync pulls it so the Touch ID-gated vault and
+    # the per-boot Enclave key cache are available before the first sync.
+    dependencies:
+      - cask: cookiesync-keyhelper
+    caveats: |
+      Wire up the watch daemon and reconcile tick, then track your first browser:
+
+        cookiesync install
