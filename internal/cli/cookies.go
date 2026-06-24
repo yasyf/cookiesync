@@ -1,6 +1,8 @@
 package cli
 
 import (
+	"fmt"
+
 	"github.com/spf13/cobra"
 
 	"github.com/yasyf/cookiesync/internal/cookie"
@@ -75,6 +77,11 @@ func newCookiesCmd() *cobra.Command {
 // them in the chosen format. It sends the dual url/urls wire so an older resident
 // daemon still serves the first host. Mirrors the Python run_cookies.
 func runCookies(cmd *cobra.Command, urls []string, browser, profile, format string) error {
+	switch cookie.OutputFormat(format) {
+	case cookie.FormatPlaywright, cookie.FormatNetscape, cookie.FormatHeader, cookie.FormatJSON:
+	default:
+		return fmt.Errorf("unknown format %q: want playwright, netscape, header, or json", format)
+	}
 	params := map[string]any{
 		"url":     urls[0],
 		"urls":    asAnySlice(urls),

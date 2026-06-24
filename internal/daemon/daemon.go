@@ -19,8 +19,8 @@
 // Every collaborator (consent gate, key cache, sync engine, session probe, ssh
 // runner, state store, and the clock) is injected behind a seam, so the whole
 // dispatcher runs in unit tests against fakes without a real macOS API, ssh, or
-// cookie store. The watch loop that drives the engine on local store changes is the
-// next cycle; Serve leaves a clean seam to add it alongside the RPC server.
+// cookie store. The watch loop that drives the engine on local store changes runs
+// alongside the RPC server under one context (see Serve).
 package daemon
 
 import (
@@ -168,7 +168,7 @@ func (d *Daemon) Dispatcher() *synckit.Dispatcher {
 // (the SE wrapper among them), binds the RPC socket, and answers the method set. On
 // shutdown it drops the per-boot Enclave key and evicts the cache, so a leaked wrapped
 // blob is unrecoverable off-box. The watch loop that converges on local store changes
-// is the next cycle and joins here alongside the RPC server.
+// runs alongside the RPC server under one cancel-on-first-failure context.
 func Serve(ctx context.Context) error {
 	d, closer, err := Build(ctx)
 	if err != nil {
