@@ -22,15 +22,22 @@ func (e *HelperError) Error() string {
 	return fmt.Sprintf("cookiesync key helper not found at %s; run 'cookiesync install' to fetch the signed helper", e.Path)
 }
 
-// caskAppDirs are the Homebrew cask appdirs an app stanza may install into,
-// most-specific first: /Applications by default, or ~/Applications when brew runs
-// without admin rights.
-func caskAppDirs() ([]string, error) {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return nil, fmt.Errorf("resolve home directory: %w", err)
+// helperEnvOverride points the resolver at a specific cookiesync-keyhelper.app
+// bundle, for development or a non-Homebrew install; it takes precedence over the
+// Caskroom lookup.
+const helperEnvOverride = "COOKIESYNC_HELPER"
+
+// helperCask is the Homebrew cask that stages the signed helper bundle.
+const helperCask = "cookiesync-keyhelper"
+
+// brewPrefixes returns the Homebrew prefixes whose Caskroom may hold the staged
+// helper bundle: $HOMEBREW_PREFIX first, then the Apple-silicon and Intel defaults.
+func brewPrefixes() []string {
+	prefixes := make([]string, 0, 3)
+	if p := os.Getenv("HOMEBREW_PREFIX"); p != "" {
+		prefixes = append(prefixes, p)
 	}
-	return []string{"/Applications", filepath.Join(home, "Applications")}, nil
+	return append(prefixes, "/opt/homebrew", "/usr/local")
 }
 
 // helperBinaryOverride, when non-empty, short-circuits HelperBinary/RequireHelper
@@ -48,21 +55,25 @@ func SetHelperBinaryForTest(path string) (restore func()) {
 	return func() { helperBinaryOverride = prev }
 }
 
-// HelperAppPath returns the cask-installed cookiesync-keyhelper.app bundle path:
-// the first appdir that holds the bundle, falling back to the default appdir so a
-// not-yet-installed helper still reports a stable path.
+// HelperAppPath returns the cookiesync-keyhelper.app bundle. The cask stages it
+// (stage_only) so the whole bundle lives intact in the Homebrew Caskroom — never
+// /Applications — keeping its bundle-relative provisioning profile alongside the
+// binary so the Secure Enclave keychain-access-group stays authorized.
+// $COOKIESYNC_HELPER overrides for development. A *HelperError reports a bundle
+// that is not staged.
 func HelperAppPath() (string, error) {
-	dirs, err := caskAppDirs()
-	if err != nil {
-		return "", err
+	if env := os.Getenv(helperEnvOverride); env != "" {
+		return env, nil
 	}
-	for _, dir := range dirs {
-		app := filepath.Join(dir, helperApp)
-		if info, statErr := os.Stat(app); statErr == nil && info.IsDir() {
-			return app, nil
+	for _, prefix := range brewPrefixes() {
+		matches, _ := filepath.Glob(filepath.Join(prefix, "Caskroom", helperCask, "*", helperApp))
+		for _, app := range matches {
+			if info, err := os.Stat(filepath.Join(app, "Contents", "MacOS", helperExecutable)); err == nil && info.Mode().IsRegular() {
+				return app, nil
+			}
 		}
 	}
-	return filepath.Join(dirs[0], helperApp), nil
+	return "", &HelperError{Path: filepath.Join(brewPrefixes()[0], "Caskroom", helperCask)}
 }
 
 // HelperBinary returns the signed helper's inner executable, e.g.
