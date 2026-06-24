@@ -5,6 +5,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/yasyf/cookiesync/internal/cookie"
 	"github.com/yasyf/cookiesync/internal/paths"
 )
 
@@ -41,8 +42,9 @@ func newRPCExtractCmd() *cobra.Command {
 		Use:   "extract",
 		Short: "Return this host's decrypted cookies for a browser as wire records (used by peers over ssh).",
 		Args:  cobra.NoArgs,
-		RunE: func(_ *cobra.Command, _ []string) error {
-			return rpcNotImplemented("extract")
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			_ = origin // forwarded by peers for symmetry; a direct extract has no echo to suppress.
+			return runRPCExtract(cmd.Context(), cookie.TouchIDConsent{}, browser, profile, cmd.OutOrStdout())
 		},
 	}
 	cmd.Flags().StringVar(&browser, "browser", "", "The browser to extract cookies from.")
@@ -58,8 +60,9 @@ func newRPCApplyCmd() *cobra.Command {
 		Use:   "apply",
 		Short: "Ingest a merged wire cookie array from stdin into this host's store (used by peers over ssh).",
 		Args:  cobra.NoArgs,
-		RunE: func(_ *cobra.Command, _ []string) error {
-			return rpcNotImplemented("apply")
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			_ = origin // forwarded by peers for symmetry; a direct apply has no echo to suppress.
+			return runRPCApply(cmd.Context(), cookie.TouchIDConsent{}, browser, profile, cmd.InOrStdin(), cmd.OutOrStdout())
 		},
 	}
 	cmd.Flags().StringVar(&browser, "browser", "", "The browser to apply cookies to.")
