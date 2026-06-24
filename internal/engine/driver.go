@@ -50,11 +50,25 @@ type Driver struct {
 
 	mu     sync.Mutex
 	merged cregistry.Registry[state.EndpointMeta]
+	counts map[string]int
 }
 
 // NewDriver builds the cookie Driver over store and the converge collaborators.
 func NewDriver(store registryStore, selfTarget string, deps ConvergeDeps) *Driver {
-	return &Driver{store: store, selfTarget: selfTarget, deps: deps}
+	return &Driver{store: store, selfTarget: selfTarget, deps: deps, counts: map[string]int{}}
+}
+
+// Counts returns a copy of the merged cookie count recorded for each endpoint this
+// Driver converged this pass, keyed by endpoint id. It is the per-group size the
+// daemon's sync/reconcile responses report; a skipped endpoint has no entry.
+func (d *Driver) Counts() map[string]int {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	out := make(map[string]int, len(d.counts))
+	for id, n := range d.counts {
+		out[id] = n
+	}
+	return out
 }
 
 // LoadRegistry reads the convergent endpoint registry — including tombstones — out of
@@ -120,8 +134,12 @@ func (d *Driver) Reconcile(
 	} else if !ok {
 		return OutcomeSkippedCold, nil
 	}
-	if _, err := Converge(ctx, endpoint, d.presentSiblings(id), origin, d.deps); err != nil {
+	merged, err := Converge(ctx, endpoint, d.presentSiblings(id), origin, d.deps)
+	if err != nil {
 		return "", err
 	}
+	d.mu.Lock()
+	d.counts[id] = len(merged)
+	d.mu.Unlock()
 	return OutcomeConverged, nil
 }

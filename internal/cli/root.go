@@ -63,6 +63,7 @@ func newRoot(version string) *cobra.Command {
 		newReconcileCmd(),
 		newRouteConsentCmd(),
 		newSelfCmd(),
+		newStateCmd(),
 		newRPCCmd(),
 		newWatchCmd(),
 		newInstallCmd(),

@@ -2,6 +2,8 @@ package cli
 
 import (
 	"github.com/spf13/cobra"
+
+	"github.com/yasyf/cookiesync/internal/daemon"
 )
 
 func newWatchCmd() *cobra.Command {
@@ -9,8 +11,8 @@ func newWatchCmd() *cobra.Command {
 		Use:   "watch",
 		Short: "Run the resident sync daemon: watch local stores and serve the RPC socket.",
 		Args:  cobra.NoArgs,
-		RunE: func(_ *cobra.Command, _ []string) error {
-			return errNotImplemented
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			return daemon.Serve(cmd.Context())
 		},
 	}
 	return cmd

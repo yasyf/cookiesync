@@ -37,23 +37,33 @@ func New(store Store, cache KeyCache, runner SSHRunner, recorder cookie.Recorder
 // daemon shares it with the watch loop.
 func (e *Engine) Recorder() cookie.Recorder { return e.recorder }
 
+// Result is one endpoint's reconcile outcome enriched with the merged cookie count of
+// its converged group. Cookies is the size of the union written this pass for a
+// converged endpoint, and 0 for a skipped one — the per-group size the daemon's
+// sync/reconcile responses report.
+type Result struct {
+	converge.ItemResult
+	Cookies int
+}
+
 // Sync runs one convergent-reconcile pass tagged with origin — the notifying peer's
 // target, skipped inside every union so a sync is never echoed straight back. It
-// returns one ItemResult per present endpoint.
-func (e *Engine) Sync(ctx context.Context, origin string) ([]converge.ItemResult, error) {
+// returns one Result per present endpoint, each carrying its merged cookie count.
+func (e *Engine) Sync(ctx context.Context, origin string) ([]Result, error) {
 	return e.run(ctx, origin)
 }
 
 // Reconcile runs the time-based backup: one convergent-reconcile pass over every
 // tracked endpoint with no origin, so every endpoint is reconciled.
-func (e *Engine) Reconcile(ctx context.Context) ([]converge.ItemResult, error) {
+func (e *Engine) Reconcile(ctx context.Context) ([]Result, error) {
 	return e.run(ctx, "")
 }
 
 // run loads the local registry to seed the self-target and peer mesh, then drives
 // synckit's pull-only converge.Reconcile under the state flock with the cookie Driver
-// and the ssh peer-registry Fetcher.
-func (e *Engine) run(ctx context.Context, origin string) ([]converge.ItemResult, error) {
+// and the ssh peer-registry Fetcher, zipping each present endpoint's ItemResult with
+// the merged cookie count the Driver recorded for it.
+func (e *Engine) run(ctx context.Context, origin string) ([]Result, error) {
 	st, err := e.store.Load(ctx)
 	if err != nil {
 		return nil, err
@@ -68,5 +78,14 @@ func (e *Engine) run(ctx context.Context, origin string) ([]converge.ItemResult,
 	driver := NewDriver(e.store, st.SelfTarget, deps)
 	fetcher := NewSSHFetcher(e.runner)
 	peers := PeerHosts(st.Browsers, st.SelfTarget)
-	return converge.Reconcile(ctx, e.store.WithLock, driver, fetcher, peers, origin)
+	items, err := converge.Reconcile(ctx, e.store.WithLock, driver, fetcher, peers, origin)
+	if err != nil {
+		return nil, err
+	}
+	counts := driver.Counts()
+	results := make([]Result, len(items))
+	for i, item := range items {
+		results[i] = Result{ItemResult: item, Cookies: counts[item.ID]}
+	}
+	return results, nil
 }
