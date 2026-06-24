@@ -15,28 +15,17 @@
 __pycache__/
 *.py[cod]
 
-# Python
-__pycache__/
-*.py[cod]
-*$py.class
-*.so
-build/
-dist/
-*.egg-info/
-.eggs/
+# Go build output
+/bin/
+/dist/
 
-# Virtualenv / uv
-.venv/
-venv/
+# Test / coverage
+*.test
+*.out
+coverage.txt
 
-# Tooling caches
-.pytest_cache/
-.ruff_cache/
-.mypy_cache/
-.coverage
-.coverage.*
-htmlcov/
-coverage.xml
+# go-task cache
+.task/
 
-# CI wheel smoke test
-.wheel-smoke/
+# bootstrap verify binary smoke test
+.go-smoke/

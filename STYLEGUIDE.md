@@ -1,348 +1,91 @@
 # cookiesync Style Guide
 
-The concrete style rules for `cookiesync/`. Target Python 3.13+.
+The concrete style rules for this repository.
 
 ## Core Principles
 
-1. **Functional over imperative.** Compose, chain, and return. Skip intermediate
-   variables when a pipeline reads well, and reach for the walrus (`:=`) and
-   comprehensions instead of loops.
-2. **Match for dispatch.** Pattern matching for type dispatch, destructuring, and
-   multi-factor decisions. Use `if/elif` only for meaningful boolean flags.
-3. **Type everything.** `from __future__ import annotations` in every module.
-   Never widen a typed slot to `Any` to quiet the checker.
-4. **Fail fast, fail loud.** No defensive coding: no fallbacks, shims, or
+1. **Fail fast, fail loud.** No defensive coding: no fallbacks, shims, or
    backwards-compat layers, and no guards against impossible states. No sentinel
    values, no silent defaults. If unused, delete it. Crash on the unexpected.
-5. **Make invalid states unrepresentable.** `NewType` for branded primitives,
-   frozen dataclasses for immutable data, required fields over optionals.
-6. **Minimal changes.** Stay within scope. Make the test pass, then stop. Improve
+2. **Make invalid states unrepresentable.** Branded/newtype primitives, immutable
+   data structures, required fields over optionals.
+3. **Minimal changes.** Stay within scope. Make the test pass, then stop. Improve
    only the code you touch.
-7. **Match surrounding code.** Follow this guide first, then the file you're in,
+4. **Match surrounding code.** Follow this guide first, then the file you're in,
    then the module. If surrounding code violates this guide, fix it.
-8. **Flat over nested.** Early returns and flat control flow. Nesting deeper than
-   three levels is a smell.
-9. **Async-native I/O.** Anything that touches I/O is `async def`, backed by a
-   library with a native async API (e.g. `aiosqlite`) — never a blocking call
-   wrapped in `asyncio.to_thread`. See § Async.
 
-## Functional Style
+## Go Rules
 
-Avoid intermediate variables. Chain operations or return directly.
+**Formatting is not a style choice.** `gofmt`/`goimports` own whitespace, import
+grouping, and alignment. Never hand-format; never review a diff for it.
 
-```python
-# Good
-def expand_tool_names(name: str) -> set[str]:
-    return (base := set(name.split("|"))) | {
-        alias for n in base for alias in (TOOL_ALIASES.get(n), TOOL_ALIASES_REVERSE.get(n)) if alias
-    }
+**Naming.** Short, lower-case package names with no underscores (`config`, not
+`config_loader`). Exported identifiers carry doc comments that start with the
+identifier; unexported helpers stay unexported. Don't stutter — `config.Load`, not
+`config.LoadConfig`.
 
-# Bad
-def expand_tool_names(name):
-    base = set(name.split("|"))
-    aliases = set()
-    for n in base:
-        ...
-    return base | aliases
+**Errors are values, returned not thrown.** Return `error` as the last value and
+wrap with context using `%w` so callers can `errors.Is`/`errors.As`. Never panic
+for an expected failure (a missing config, a cold key cache). `panic` is for
+truly impossible states only.
+
+```go
+// Good
+raw, err := os.ReadFile(path)
+if err != nil {
+    return fmt.Errorf("read config: %w", err)
+}
+
+// Bad — discards the cause and the call site
+raw, err := os.ReadFile(path)
+if err != nil {
+    return errors.New("could not read config")
+}
 ```
 
-Use the walrus operator to bind a value once and reuse it inside an expression.
+**Accept interfaces, return concrete types.** Keep interfaces small and define them
+where they're consumed, not where they're implemented.
 
-```python
-# Good
-if (match := WHEEL_CHECKSUM.search(body)):
-    return match.group(1)
+**Context first.** Functions that shell out or do I/O take `ctx context.Context` as
+their first parameter and honor it (`exec.CommandContext`, not `exec.Command`).
 
-# Good — walrus in a comprehension, single pass
-return [result for item in items if (result := process(item)) is not None]
+```go
+// Good
+func extract(ctx context.Context, browser string, args ...string) (string, error)
+
+// Bad — uncancellable
+func extract(browser string, args ...string) (string, error)
 ```
 
-Prefer the dict union operator over unpacking.
-
-```python
-config = defaults | user_config | overrides   # not {**defaults, **user_config, ...}
-```
-
-Use comprehensions instead of imperative accumulation.
-
-```python
-# Good
-return [item.transform() for item in items if item.is_valid()]
-
-# Bad
-result = []
-for item in items:
-    if item.is_valid():
-        result.append(item.transform())
-return result
-```
-
-## Type Annotations
-
-Always annotate. Use future annotations and guard expensive or cycle-prone imports
-with `TYPE_CHECKING`. Under PEP 563 annotations stay strings, so they need no quotes.
-
-```python
-from __future__ import annotations
-
-from typing import TYPE_CHECKING
-
-if TYPE_CHECKING:
-    from cookiesync.models import Record
-
-def process(self, record: Record) -> bool: ...
-```
-
-Lazy imports that break cycles or defer heavy modules go at the top of the function
-body, before any logic, and never inside an `if`, `for`, or `try`.
-
-```python
-# Good
-def model_version() -> str:
-    from cookiesync.state import RESOURCES
-
-    return RESOURCES.lookup()
-
-# Bad — import buried in a branch
-def model_version() -> str:
-    if cached:
-        from cookiesync.state import RESOURCES
-        ...
-```
-
-Don't widen to `Any` to quiet pyright. Use the real type, narrow with `isinstance`,
-or split the model. Trivial complaints such as `cached_property` shadowing
-`property` or descriptor-protocol nuances are noise; ignore them instead of reaching
-for `# type: ignore`. Wanting `hasattr` on a typed object means the type is wrong.
-Fix it or define a `Protocol`.
-
-## Pattern Matching
-
-Use `match` for type dispatch, destructuring, and decisions that turn on several
-factors at once.
-
-```python
-match decision:
-    case Keep():
-        return msg
-    case Compress(rate=rate):
-        return msg.filter(lambda c: c.type != "text").append(compress(text, rate))
-    case Summarize(content=content):
-        return msg.append(content)
-```
-
-For multi-factor decisions, name the state with a `NamedTuple` so each `case` maps
-one-to-one onto a requirement.
-
-```python
-match Status(is_fresh, scores.get(id(tc))):
-    case Status(score=None):           return tc
-    case Status(score=s) if s >= floor: return tc
-    case Status(is_fresh=True):        return tc.demote()
-    case Status(is_fresh=False):       return tc.exclude()
-```
-
-Use `if/elif` when the branches turn on meaningful boolean flags with their own
-names. Don't build a tuple just to pattern-match on it.
-
-## Functions & Methods
-
-Options and flags go keyword-only, after `*`.
-
-```python
-def run(self, jobs: Sequence[Job], *, timeout: int = 30, strict: bool = True) -> Result: ...
-```
-
-Use `@overload` when the return type depends on the argument shape.
-
-```python
-@overload
-def __getitem__(self, index: int) -> Task: ...
-@overload
-def __getitem__(self, index: slice) -> tuple[Task, ...]: ...
-def __getitem__(self, index: int | slice) -> Task | tuple[Task, ...]:
-    return self.tasks[index]
-```
-
-Mutable defaults are forbidden in function signatures too: take `list[T] | None = None`
-and normalize with `items = items or []` at the top of the body.
-
-Access typed attributes directly instead of routing through helpers that may return
-None; a helper that can fail forces every caller into a guard.
-
-```python
-# Good
-await tracker.update(self.request.id, stage)
-
-# Bad — helper that may return None forces a guard
-if rid := report_id():
-    await tracker.update(rid, stage)
-```
-
-## API Design
-
-Accept what callers naturally have. If callers must extract or transform data
-before calling, take the parent object and extract internally.
-
-```python
-# Good — caller passes what it holds
-def record_usage(request_id: RequestId, usage: Usage) -> None: ...
-
-# Bad — caller dismembers the object first
-def record_usage(request_id: str, total_tokens: int, total_cost: float) -> None: ...
-```
-
-Keep parameters minimal. No speculative flags; add a parameter when there is a
-demonstrated need, not just in case.
-
-Types reflect user concepts, not implementation internals. A public signature built
-from internal metadata types leaks the implementation; expose the objects users
-think in.
-
-## Async
-
-I/O is async from day 1. Anything that hits the network, filesystem, or a database is
-an `async def`, and the library doing it has a native async API. Reach for the
-async-native driver instead of wrapping a blocking one in `asyncio.to_thread` — the
-wrapper leaks a sync boundary into every caller and caps throughput at the thread pool.
-Keep `to_thread` / `run_in_executor` for libraries with no async equivalent. Run
-concurrent work through `anyio` `TaskGroup`s rather than juggling bare `asyncio.gather`.
-
-```python
-# Good — async-native driver
-import aiosqlite
-
-async def load(db_path: str, key: str) -> Row | None:
-    async with aiosqlite.connect(db_path) as db:
-        async with db.execute("select * from t where k = ?", (key,)) as cur:
-            return await cur.fetchone()
-
-# Bad — blocking driver shoved onto a thread
-import asyncio
-import sqlite3
-
-async def load(db_path: str, key: str) -> Row | None:
-    def _q() -> Row | None:
-        with sqlite3.connect(db_path) as db:
-            return db.execute("select * from t where k = ?", (key,)).fetchone()
-    return await asyncio.to_thread(_q)
-```
+**No naked returns** in anything longer than a few lines. **No `else` after a
+`return`** — prefer early returns and guard clauses over nested blocks.
 
 ## Error Handling
 
-Keep `try` blocks minimal. Only the line that can throw belongs inside.
-
-```python
-# Good
-try:
-    response = await client.fetch(url)
-except HTTPError:
-    return None
-data = response.json()
-return transform(data)
-```
-
-No broad `except Exception` that swallows everything. Use dedicated exception
-classes. Read required configuration with `os.environ["KEY"]` so a missing key
-raises at startup. No sentinel return values; raise, or return a typed result.
+Handle each error where it happens; only the call that can fail belongs in the
+`if err != nil` block. Wrap with `fmt.Errorf("...: %w", err)` to add context, and
+reserve named sentinel errors (`var ErrFoo = errors.New(...)`) for conditions a
+caller branches on. Validate required configuration at load time so a missing or
+malformed key fails before any work starts, not midway through a sync.
 
 ## Code Organization
 
-Module order runs imports, constants, type aliases, helpers, classes, then
-functions. Module-level `UPPER_SNAKE_CASE` constants sit immediately after imports,
-before any class or function.
-
-Within a class body, all assignments come before any methods. That covers
-constants, `ClassVar`s, and dataclass fields.
-
-```python
-@dataclass(frozen=True, slots=True)
-class JobSpec:
-    name: str
-    steps: tuple[Step, ...] = ()
-    retries: int = 0
-
-    def matches(self, job: Job) -> bool: ...
-```
-
-No leading underscores on classes, constants, or module-level helpers. Reserve a
-leading underscore for a private instance attribute.
-
-`__init__.py` exposes only the public API surface, re-exported with plain regular
-imports. No redundant `as` aliases, no `__all__`: name a symbol here to make it
-public, omit it to keep it internal. F401 stays active in every other module, so
-unused imports outside `__init__.py` are still deleted.
-
-```python
-# Good — public API, plain re-export
-from cookiesync.matcher import Matcher
-from cookiesync.runner import Runner
-
-# Bad — redundant-alias / __all__ ceremony
-from cookiesync.matcher import Matcher as Matcher
-__all__ = ["Matcher", "Runner"]
-```
-
-Frozen dataclasses for immutable and config data. Every mutable default needs a
-factory such as `field(default_factory=list)`; a bare `[]` or `{}` is a bug.
-
-Each persistence operation gets exactly one codepath; two call sites writing the
-same record will diverge. Side-effects such as tracking, logging, and metrics react
-to events in listeners instead of interleaving with business logic.
-
-```python
-# Bad — two codepaths write the same record, tracking inlined
-async def event_loop(self):
-    await self.tracker.update(self.id, stage)
-    await store.put(self.id, response)
-
-async def drain_queue(self):
-    await store.put(self.id, response)
-
-# Good — one write location; a listener reacts to the event
-async def persist(self, response):
-    await store.put(self.id, response)
-    self.emit(ResponsePersisted(self.id, response))
-```
+Order each file: package clause, imports, constants, then types, then their
+methods, then free functions. Constants sit immediately after the imports. Control
+visibility with capitalization — exported identifiers are part of the package's
+contract, so keep the unexported surface as large as it can be.
 
 ## Comments & Docstrings
 
 Code documents itself through names, types, and organization. No comments except
-TODOs, non-obvious workarounds, or disabled code.
-
-Docstrings are the one exception, scoped by surface. Public API surfaces and
-user-facing classes carry Google-style docstrings, so they earn their place.
-Internal helpers get none, and a docstring that restates the signature is
-clutter to delete.
-
-```python
-# Good — public class, documented
-@dataclass(frozen=True, slots=True)
-class Matcher:
-    """Matches a record against a regex pattern.
-
-    Example:
-        >>> Matcher("user_.*").matches(record)
-    """
-
-    pattern: str
-
-# Good — internal helper, no docstring
-def version_key(dirname: str) -> tuple[int, ...]:
-    return tuple(int(part) for part in dirname.removeprefix(f"{MODEL_NAME}-").split("."))
-```
+TODOs, non-obvious workarounds, or disabled code. Document the public API only;
+a doc comment that restates the signature is clutter to delete.
 
 ## Testing
 
-Tests live in `tests/`; run them with `uv run pytest`. Hook authors also write
-inline `tests = {...}` on each hook in `.claude/hooks/`, runnable with
-`uvx capt-hook test`.
-
 Write strict assertions against specific expected values; a test that can't fail
-uncovers nothing. Mock the boundaries your code talks to, such as the network,
-filesystem, and clock, and leave the function under test real. A database (or any
-stateful service — Mongo, Postgres, Redis) is **not** a mock boundary: when a test
-needs one, start a real ephemeral instance with `testcontainers`
-(add `testcontainers[<backend>]` to the dev extra) rather than mocking the driver or
-using an in-memory fake. Parameterize repeated test bodies, giving each case a
-descriptive `id` and its own expected values.
+uncovers nothing. Use table-driven tests with `t.Run` subtests for repeated bodies,
+giving each case a descriptive name and its own expected values. Prefer exercising
+the real boundary over a mock when it's cheap and deterministic: run actual cookie
+stores (a real SQLite file in `t.TempDir()`) rather than faking the driver, which
+catches schema and behavior mismatches a mock would hide.

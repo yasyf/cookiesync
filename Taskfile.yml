@@ -1,0 +1,42 @@
+version: '3'
+
+# cookiesync is a Go CLI; `build` compiles every package, `run -- <args>` runs it.
+
+tasks:
+  build:
+    desc: Compile every package
+    cmds:
+      - go build ./...
+
+  run:
+    desc: Run the CLI (pass args after --)
+    cmds:
+      - go run . {{.CLI_ARGS}}
+
+  test:
+    desc: Run the test suite with the race detector
+    cmds:
+      - go test -race -count=1 ./...
+
+  vet:
+    desc: Vet the module
+    cmds:
+      - go vet ./...
+
+  lint:
+    desc: Lint with golangci-lint
+    cmds:
+      - golangci-lint run
+
+  fmt:
+    desc: Format with gofumpt + goimports (via golangci-lint)
+    cmds:
+      - golangci-lint fmt
+
+  ci:
+    desc: Everything CI runs
+    cmds:
+      - task: vet
+      - task: lint
+      - task: test
+      - task: build

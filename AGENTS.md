@@ -1,17 +1,31 @@
 # cookiesync Development Guide
 
-Sync your browser cookies across machines. Published to PyPI as `cookiesync-cli` (the bare `cookiesync` is blocked by PyPI's name-similarity guard); the CLI is `cookiesync`, installed via `uv tool install cookiesync-cli`.
+Sync your browser cookies across your Macs. A macOS CLI (`cookiesync`) that
+streams cookies out of the local browser store behind one Touch ID tap, caches the
+Safe Storage key for a short window, and converges the union of every tracked
+browser profile across your hosts over ssh.
 
 ## Repository Structure
 
 ```
 cookiesync/
-├── cookiesync/      # The package — cli (Click entry point), with extract/store/sync modules to come
-├── tests/            # Pytest suite
-├── .github/          # GitHub Actions workflows
-├── AGENTS.md         # This file — shared conventions
-└── README.md         # Project overview
+├── main.go              # Entrypoint; injects the release version into the CLI
+├── internal/
+│   ├── cli/             # Cobra wiring: root, browser, auth, cookies, sync, reconcile, rpc, watch, install/uninstall, doctor, route-consent, self
+│   └── paths/           # Per-tool config dir + daemon RPC socket under ~/.config/cookiesync (forwards to synckit/hostregistry)
+├── helper/              # Signed Swift Secure-Enclave key helper (Developer-ID .app); fetched via Homebrew at install
+├── .github/workflows/   # ci.yml (vet/test/build, golangci-lint, govulncheck)
+├── docs/assets/         # Mascot logo, README banner, social-preview card
+├── AGENTS.md            # This file — shared conventions
+└── README.md            # Project overview
 ```
+
+The generic sync substrate (host registry, RPC over a unix socket, convergent
+registry, launchd service plumbing) lives in the shared
+`github.com/yasyf/synckit` module, vendored for development via a `replace` to
+`../synckit`. cookiesync drives it for its config dir, socket path, and peer
+registry; the cookie-specific subsystems (crypto, sqlite stores, merge, the Swift
+helper bridge, the watch daemon) live here.
 
 ## Ask Before Assuming
 
@@ -66,7 +80,7 @@ When you write a plan — in plan mode, or any "here's what I'll do" before you 
 `semble` is wired up via `.mcp.json` (project-scoped MCP server, runs via `uvx` — nothing to install). It's the default tool for any "find code by intent or symbol" question:
 
 1. **"How do we do X?" / "Where is the code that does Y?"** → `semble.search("...")`
-2. **"Where is `Foo` defined?"** → `semble.search("Foo")` (or `search("class Foo")` for a relevance boost)
+2. **"Where is `Foo` defined?"** → `semble.search("Foo")` (or `search("type Foo")` for a relevance boost)
 3. **"Show me other code like this"** → `semble.find_related` on a prior hit
 4. **Cross-repo lookup** → pass an `https://...git` URL as `repo`
 
@@ -77,17 +91,11 @@ Reach for your **LSP** when the answer must be *exhaustive* or *structural*:
 1. **"Who calls X?" / "find every reference"** → `findReferences` / `incomingCalls`
 2. **"Rename X → Y"** → `findReferences` first to enumerate every call site
 3. **"What's the type of X?"** → `hover`
-4. **"What implements Protocol P?"** → `goToImplementation`
+4. **"What implements interface I?"** → `goToImplementation`
 
-Reach for **`Grep`** only for material neither tool indexes: literal *content* of strings/comments/docstrings (error messages, hard-coded URLs, env-var names, TODOs) and non-source files (logs, JSON, YAML, fixtures). File-pattern questions ("all `*.json` under `src/`") go through `Glob`.
+Reach for **`Grep`** only for material neither tool indexes: literal *content* of strings/comments/docstrings (error messages, hard-coded URLs, env-var names, TODOs) and non-source files (logs, JSON, YAML, fixtures). File-pattern questions ("all `*.json` under `internal/`") go through `Glob`.
 
-## Python Style
-
-Target Python 3.13+. Run `uv sync --extra dev`, `uv run pytest`, and `uv build`.
-
-**Docstrings on the public API only.** User-facing surfaces carry Google-style docstrings. Internal helpers get none. No comments except TODOs, non-obvious workarounds, or disabled code.
-
-**Async-native from day 1.** Anything that touches I/O is `async def`, backed by a library with a native async API (e.g. `aiosqlite`) rather than a blocking call wrapped in `asyncio.to_thread`. Concurrency and tests run through `anyio`. See STYLEGUIDE.md § Async.
+## Style
 
 @STYLEGUIDE.md
 
@@ -99,9 +107,9 @@ Target Python 3.13+. Run `uv sync --extra dev`, `uv run pytest`, and `uv build`.
 
 **No defensive coding.** No fallbacks, shims, or backwards-compat layers; no guards against impossible states. If unused, delete it. Crash on the unexpected.
 
-**Search before writing.** Before creating a helper, query the codebase via `semble.search` (intent or symbol queries both work). Sibling modules and base classes win over re-implementation.
+**Search before writing.** Before creating a helper, query the codebase via `semble.search` (intent or symbol queries both work). Sibling modules and base packages win over re-implementation — check `github.com/yasyf/synckit` before re-implementing generic sync plumbing here.
 
-**Code stewardship.** When you touch a file, fix nearby bugs, style violations, and broken tests; don't wave them off as pre-existing or out of scope. Trivial type-checker noise is the exception (see § Python Style).
+**Code stewardship.** When you touch a file, fix nearby bugs, style violations, and broken tests; don't wave them off as pre-existing or out of scope.
 
 **Observe, don't infer.** Inspect actual data — read fixtures, dump objects, run the code — before reasoning from assumption.
 
@@ -115,16 +123,14 @@ Target Python 3.13+. Run `uv sync --extra dev`, `uv run pytest`, and `uv build`.
 
 **Get a second opinion on a plateau.** On a debugging plateau (2 failed attempts before a 3rd), a non-trivial architectural decision, or algorithmic/security-sensitive code, get an outside check (e.g. `/codex`) before committing to the approach.
 
-**Don't contort code to satisfy a checker.** The type checker and linter serve the code, not the other way around. Don't reshape a data model, widen a type, or bolt on a `cast(...)` / narrowing-only `assert isinstance(...)` / blanket ignore just to silence a diagnostic. If a clean fix isn't obvious, leave the diagnostic — a visible diagnostic is preferable to scar tissue. (Most checker noise isn't worth acting on at all; act only when it flags a real bug.)
+**Don't contort code to satisfy a checker.** The type checker and linter serve the code, not the other way around. Don't reshape a data model, widen a type, or bolt on a narrowing-only type assertion / blanket lint ignore just to silence a diagnostic. If a clean fix isn't obvious, leave the diagnostic — a visible diagnostic is preferable to scar tissue. (Most checker noise isn't worth acting on at all; act only when it flags a real bug.)
 
-**Mechanical linting.** The pre-commit hooks (prek: ruff + ty) auto-format, fix import order, and print whole-project type warnings on every `git commit` (ty never blocks a commit) — run `uvx prek install` once to activate them. Leave `ruff` to the hook and fix only what needs human judgment; clean everything up-front with `uvx prek run --all-files` if you want. When reviewing code, don't flag mechanical lint violations (line length, whitespace, import order, trailing commas).
+**Mechanical linting.** CI and hooks handle formatting and import order; fix only what needs human judgment. When reviewing code, don't flag mechanical lint violations (line length, whitespace, import order, trailing commas).
 
-**Testing.** The suite lives in `tests/`; run it with `uv run pytest`. Use strict assertions and mock external dependencies while leaving the code under test real. Databases and other stateful services are not mock boundaries — when a test needs one, run a real ephemeral instance via `testcontainers` instead of mocking the driver.
+**Testing.** Tests live beside the code they cover as `*_test.go` files. Run the whole suite with `go test ./...` (CI runs it with `-race`). Cookie-store tests run against a real ephemeral SQLite file in `t.TempDir()` rather than mocking the driver.
 
 **Writing docs.** When writing or revising docs, a README, a tutorial, a how-to, or reference, use the `writing-docs` skill (Diataxis modes, voice rules, and runnable code-sample rules) and run `slop-cop check <file> --lang=markdown` before you finish.
 
-**Version control.** This repo is a colocated `jj` repo over git — prefer `jj` (`jj describe` / `jj commit`, `jj git push`) over raw `git` for day-to-day work. Commits stay atomic and scoped: one logical change each. A dirty tree is just the working-copy commit `@` — to land work on an updated remote, `jj git fetch` then `jj rebase` (your in-flight `@` rides along untouched); never `git stash` or a worktree + cherry-pick dance.
+**Version control.** This repo is a colocated `jj` repo over git — prefer `jj` (`jj describe` / `jj commit`, `jj git push`) over raw `git` for day-to-day work. Commits stay atomic and scoped: one logical change each.
 
 **Watch CI after every push.** A push that kicks off CI isn't done until the run is green. After `jj git push` (or `git push`), watch the run to completion before you stop — `gh run watch "$(gh run list -L1 --json databaseId -q '.[0].databaseId')" --exit-status` — and never walk away from a red run: fix it or report it. (`--exit-status` exits non-zero when the run fails; give the run a moment to register before watching.)
-
-**Releases.** Tagging `v*` triggers `.github/workflows/release-pypi.yml`, which builds, publishes to PyPI via trusted publishing, and cuts a GitHub release. The version comes from the tag. The release refuses to run unless the tagged commit is on `main` — tag a merged commit (e.g. `git tag vX.Y.Z origin/main`), not a feature branch.
