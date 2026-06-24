@@ -5,6 +5,8 @@
 // conversion to Unix seconds happens only at serialize time.
 package cookie
 
+import "time"
+
 // Host is a bare hostname: lowercase, no leading dot.
 type Host string
 
@@ -20,6 +22,15 @@ type AesKey []byte
 
 // ChromeMicros is a Chrome timestamp: microseconds since the Windows epoch (1601).
 type ChromeMicros int64
+
+// windowsEpochOffset is the seconds between the Windows epoch (1601-01-01) and the
+// Unix epoch (1970-01-01); Chrome stores cookie timestamps as µs since 1601.
+const windowsEpochOffset = 11_644_473_600
+
+// unixToChromeMicros converts a wall-clock time to a Chrome timestamp (µs since 1601).
+func unixToChromeMicros(t time.Time) ChromeMicros {
+	return ChromeMicros((t.Unix()+windowsEpochOffset)*1_000_000 + int64(t.Nanosecond())/1_000)
+}
 
 // Cookie is one decrypted cookie, carrying Chrome-native column values.
 type Cookie struct {
