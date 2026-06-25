@@ -8,33 +8,36 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-
-	"github.com/yasyf/cookiesync/internal/mesh"
 )
 
-// seedRegistry points the shared mesh seam at a fake reposync that prints a host
-// registry with this self target and peers, so browser add's host validation passes
-// for a known host (cookiesync rides reposync's mesh).
+// seedRegistry seeds the shared synckit host registry with this self target and peers,
+// so browser add's host validation passes for a known host (cookiesync rides the shared
+// mesh). hostregistry.Mesh keys off XDG_CONFIG_HOME, so it writes into the test's XDG
+// root — the same one the cookiesync state store uses.
 func seedRegistry(t *testing.T, self string, hosts ...string) {
 	t.Helper()
 	if hosts == nil {
 		hosts = []string{}
 	}
+	xdg := os.Getenv("XDG_CONFIG_HOME")
+	if xdg == "" {
+		xdg = t.TempDir()
+		t.Setenv("XDG_CONFIG_HOME", xdg)
+	}
+	dir := filepath.Join(xdg, "synckit")
+	if err := os.MkdirAll(dir, 0o700); err != nil { //nolint:gosec // G703: dir is under this test's own XDG_CONFIG_HOME temp root, not user-supplied.
+		t.Fatalf("mkdir synckit: %v", err)
+	}
 	payload, err := json.Marshal(struct {
-		Version int      `json:"version"`
-		Self    string   `json:"self"`
-		Hosts   []string `json:"hosts"`
-	}{1, self, hosts})
+		Self  string   `json:"self"`
+		Hosts []string `json:"hosts"`
+	}{self, hosts})
 	if err != nil {
 		t.Fatalf("marshal registry: %v", err)
 	}
-	script := filepath.Join(t.TempDir(), "reposync")
-	if err := os.WriteFile(script, []byte("#!/bin/sh\ncat <<'JSON'\n"+string(payload)+"\nJSON\n"), 0o755); err != nil { //nolint:gosec // the fake reposync must be executable.
-		t.Fatalf("write fake reposync: %v", err)
+	if err := os.WriteFile(filepath.Join(dir, "state.json"), payload, 0o600); err != nil { //nolint:gosec // G703: path is under this test's own XDG_CONFIG_HOME temp root, not user-supplied.
+		t.Fatalf("write mesh state: %v", err)
 	}
-	prev := mesh.Bin
-	mesh.Bin = script
-	t.Cleanup(func() { mesh.Bin = prev })
 }
 
 // runBrowserCmd runs `browser <sub> <args...>` on a fresh root and returns stdout.

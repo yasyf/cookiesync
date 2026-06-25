@@ -5,6 +5,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/yasyf/cookiesync/internal/mesh"
 	"github.com/yasyf/cookiesync/internal/paths"
 	"github.com/yasyf/cookiesync/internal/rpc"
 	"github.com/yasyf/cookiesync/internal/state"
@@ -26,14 +27,20 @@ func printDaemonJSON(cmd *cobra.Command, method string, params map[string]any) e
 }
 
 func newSyncCmd() *cobra.Command {
+	var origin string
 	cmd := &cobra.Command{
 		Use:   "sync",
-		Short: "Ask the daemon to converge the union of every tracked endpoint across this host and its peers.",
+		Short: "Ask the resident helper to converge the union of every tracked endpoint across this host and its peers.",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			return printDaemonJSON(cmd, "sync", map[string]any{})
+			params := map[string]any{}
+			if origin != "" {
+				params["origin"] = origin
+			}
+			return printDaemonJSON(cmd, "sync", params)
 		},
 	}
+	cmd.Flags().StringVar(&origin, "origin", "", "The notifying peer to suppress inside every union, so a sync is never echoed straight back.")
 	return cmd
 }
 
@@ -69,14 +76,14 @@ func newRouteConsentCmd() *cobra.Command {
 func newSelfCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "self",
-		Short: "Print this host's own SSH target, as the host registry reports it.",
+		Short: "Print this host's own SSH target, as the synckit host mesh reports it.",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			reg, err := paths.Config.Load()
+			self, _, err := mesh.Resolve(cmd.Context())
 			if err != nil {
 				return err
 			}
-			cmd.Println(reg.Self)
+			cmd.Println(self)
 			return nil
 		},
 	}

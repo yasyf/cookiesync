@@ -82,11 +82,11 @@ func (d *Daemon) handleExtract(ctx context.Context, params map[string]any) (any,
 		return nil, err
 	}
 	profile := optionalString(params, "profile", defaultProfile)
-	st, err := d.state.Load(ctx)
+	self, err := meshSelf(ctx)
 	if err != nil {
 		return nil, err
 	}
-	id := endpointID(st.SelfTarget, browser, profile)
+	id := endpointID(self, browser, profile)
 	if _, ok, err := d.cache.Get(ctx, id); err != nil {
 		return nil, err
 	} else if !ok {
@@ -94,7 +94,7 @@ func (d *Daemon) handleExtract(ctx context.Context, params map[string]any) (any,
 			return nil, err
 		}
 	}
-	extracted, err := engine.NewCachedKeySource(d.cache, st.SelfTarget).Extract(ctx, browser, profile)
+	extracted, err := engine.NewCachedKeySource(d.cache, self).Extract(ctx, browser, profile)
 	if err != nil {
 		return nil, err
 	}
@@ -114,12 +114,12 @@ func (d *Daemon) handleApply(ctx context.Context, params map[string]any) (any, e
 	if err != nil {
 		return nil, err
 	}
-	st, err := d.state.Load(ctx)
+	self, err := meshSelf(ctx)
 	if err != nil {
 		return nil, err
 	}
-	d.engine.Recorder().RecordApplied(endpointID(st.SelfTarget, browser, profile), cookie.LogicalDigest(cookies))
-	applied, err := engine.NewCachedKeySource(d.cache, st.SelfTarget).Apply(ctx, browser, profile, cookies)
+	d.engine.Recorder().RecordApplied(endpointID(self, browser, profile), cookie.LogicalDigest(cookies))
+	applied, err := engine.NewCachedKeySource(d.cache, self).Apply(ctx, browser, profile, cookies)
 	if err != nil {
 		return nil, err
 	}
@@ -145,11 +145,11 @@ func (d *Daemon) handlePrimeAuth(ctx context.Context, params map[string]any) (an
 	if _, err := d.primeAuth(ctx, browser, profile, reason); err != nil {
 		return nil, err
 	}
-	st, err := d.state.Load(ctx)
+	self, err := meshSelf(ctx)
 	if err != nil {
 		return nil, err
 	}
-	return map[string]any{"primed": true, "endpoint": endpointID(st.SelfTarget, browser, profile)}, nil
+	return map[string]any{"primed": true, "endpoint": endpointID(self, browser, profile)}, nil
 }
 
 // handleAuthStatus reports whether the endpoint's key is warm in the cache, the frozen
@@ -160,11 +160,11 @@ func (d *Daemon) handleAuthStatus(ctx context.Context, params map[string]any) (a
 		return nil, err
 	}
 	profile := optionalString(params, "profile", defaultProfile)
-	st, err := d.state.Load(ctx)
+	self, err := meshSelf(ctx)
 	if err != nil {
 		return nil, err
 	}
-	id := endpointID(st.SelfTarget, browser, profile)
+	id := endpointID(self, browser, profile)
 	_, ok, err := d.cache.Get(ctx, id)
 	if err != nil {
 		return nil, err
@@ -187,11 +187,11 @@ func (d *Daemon) handleGetCookies(ctx context.Context, params map[string]any) (a
 	if err != nil {
 		return nil, err
 	}
-	st, err := d.state.Load(ctx)
+	self, err := meshSelf(ctx)
 	if err != nil {
 		return nil, err
 	}
-	id := endpointID(st.SelfTarget, browser, profile)
+	id := endpointID(self, browser, profile)
 	key, ok, err := d.cache.Get(ctx, id)
 	if err != nil {
 		return nil, err
@@ -243,7 +243,11 @@ func (d *Daemon) primeAuth(ctx context.Context, browser, profile, reason string)
 	if err != nil {
 		return nil, err
 	}
-	id := endpointID(st.SelfTarget, browser, profile)
+	self, err := meshSelf(ctx)
+	if err != nil {
+		return nil, err
+	}
+	id := endpointID(self, browser, profile)
 	if err := d.cache.Put(ctx, id, []byte(key), st.Settings.AuthTTL); err != nil {
 		return nil, err
 	}

@@ -7,11 +7,11 @@ import (
 )
 
 // DigestRecorder is a standalone in-memory cookie.Recorder: the last logical digest
-// the sync layer applied to each endpoint, with no watch engine behind it. The
-// resident daemon seeds the watch engine's own ledger instead (watch.EngineRecorder),
-// so this is the recorder for a converge with no resident watch loop to echo to — and
-// the simple double the converge-layer tests record through. It is safe for concurrent
-// use.
+// the sync layer applied to each endpoint. With the watch loop now living in synckitd
+// (which dedups a converge's own write by re-deriving the apply-stable fingerprint via
+// `cookiesync list --json`), the resident helper has no in-process loop to echo to, so
+// this is the recorder the engine records through — and the simple double the
+// converge-layer tests record through. It is safe for concurrent use.
 type DigestRecorder struct {
 	mu      sync.Mutex
 	digests map[string]cookie.Digest

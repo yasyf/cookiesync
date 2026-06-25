@@ -9,7 +9,6 @@ import (
 	"time"
 
 	"github.com/yasyf/cookiesync/internal/cookie"
-	"github.com/yasyf/cookiesync/internal/mesh"
 	"github.com/yasyf/cookiesync/internal/state"
 	"github.com/yasyf/synckit/converge"
 	"github.com/yasyf/synckit/cregistry"
@@ -28,29 +27,42 @@ func newStore(t *testing.T) *state.Store {
 	})
 }
 
-// fakeMesh points the shared mesh seam at a fake reposync that reports this self target
-// and peers, so the engine resolves its host mesh from reposync — not this host's own
-// (possibly empty) state — without a real reposync install.
+// fakeMesh seeds the shared synckit host registry with this self target and peers, so
+// the engine resolves its host mesh from the registry — not this host's own (possibly
+// empty) state — without a real registration. It writes into the test's XDG_CONFIG_HOME
+// (which newStore sets), so the mesh and the cookiesync store share one temp root.
 func fakeMesh(t *testing.T, self string, peers ...string) {
 	t.Helper()
-	if peers == nil {
-		peers = []string{}
+	writeMeshState(t, self, peers...)
+}
+
+// writeMeshState writes the shared synckit mesh state.json under XDG_CONFIG_HOME,
+// creating a fresh XDG root when the caller has not set one. hostregistry.Mesh keys off
+// XDG_CONFIG_HOME, so this seams the mesh for a test.
+func writeMeshState(t *testing.T, self string, hosts ...string) {
+	t.Helper()
+	if hosts == nil {
+		hosts = []string{}
+	}
+	xdg := os.Getenv("XDG_CONFIG_HOME")
+	if xdg == "" {
+		xdg = t.TempDir()
+		t.Setenv("XDG_CONFIG_HOME", xdg)
+	}
+	dir := filepath.Join(xdg, "synckit")
+	if err := os.MkdirAll(dir, 0o700); err != nil { //nolint:gosec // G703: dir is under this test's own XDG_CONFIG_HOME temp root, not user-supplied.
+		t.Fatalf("mkdir synckit: %v", err)
 	}
 	payload, err := json.Marshal(struct {
-		Version int      `json:"version"`
-		Self    string   `json:"self"`
-		Hosts   []string `json:"hosts"`
-	}{1, self, peers})
+		Self  string   `json:"self"`
+		Hosts []string `json:"hosts"`
+	}{self, hosts})
 	if err != nil {
 		t.Fatalf("marshal mesh: %v", err)
 	}
-	script := filepath.Join(t.TempDir(), "reposync")
-	if err := os.WriteFile(script, []byte("#!/bin/sh\ncat <<'JSON'\n"+string(payload)+"\nJSON\n"), 0o755); err != nil { //nolint:gosec // the fake reposync must be executable.
-		t.Fatalf("write fake reposync: %v", err)
+	if err := os.WriteFile(filepath.Join(dir, "state.json"), payload, 0o600); err != nil { //nolint:gosec // G703: path is under this test's own XDG_CONFIG_HOME temp root, not user-supplied.
+		t.Fatalf("write mesh state: %v", err)
 	}
-	prev := mesh.Bin
-	mesh.Bin = script
-	t.Cleanup(func() { mesh.Bin = prev })
 }
 
 // fakeFetcher serves a fixed per-peer registry and records every Fetch. It has NO

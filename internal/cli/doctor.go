@@ -5,15 +5,14 @@ import (
 	"fmt"
 	"net"
 	"os"
-	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
 
 	"github.com/yasyf/cookiesync/internal/helper"
+	"github.com/yasyf/cookiesync/internal/mesh"
 	"github.com/yasyf/cookiesync/internal/paths"
-	"github.com/yasyf/cookiesync/internal/service"
 	"github.com/yasyf/cookiesync/internal/state"
 )
 
@@ -31,14 +30,15 @@ type check struct {
 
 // doctorEnv is the set of probes the doctor runs, each returning one check. It is the
 // seam tests inject a fake environment through so doctor runs without a signed helper,
-// a live daemon, or real LaunchAgents. The zero value is not usable; build it with
+// a live helper, or a registered mesh. The zero value is not usable; build it with
 // realDoctorEnv.
 type doctorEnv struct {
-	helper  func(ctx context.Context) check
-	socket  func(ctx context.Context) check
-	state   func(ctx context.Context) check
-	tracked func(ctx context.Context) check
-	agents  func(ctx context.Context) check
+	helper   func(ctx context.Context) check
+	socket   func(ctx context.Context) check
+	mesh     func(ctx context.Context) check
+	manifest func(ctx context.Context) check
+	state    func(ctx context.Context) check
+	tracked  func(ctx context.Context) check
 }
 
 // checks runs every probe in a fixed order so the report is deterministic.
@@ -46,16 +46,17 @@ func (e doctorEnv) checks(ctx context.Context) []check {
 	return []check{
 		e.helper(ctx),
 		e.socket(ctx),
+		e.mesh(ctx),
+		e.manifest(ctx),
 		e.state(ctx),
 		e.tracked(ctx),
-		e.agents(ctx),
 	}
 }
 
 func newDoctorCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "doctor",
-		Short: "Check the signed key helper, the resident daemon, the state, and the installed agents.",
+		Short: "Check the signed key helper, the resident helper, the synckit mesh and manifest, and the state.",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			return runDoctor(cmd, realDoctorEnv())
@@ -87,11 +88,12 @@ func runDoctor(cmd *cobra.Command, env doctorEnv) error {
 // realDoctorEnv wires the production health checks.
 func realDoctorEnv() doctorEnv {
 	return doctorEnv{
-		helper:  checkHelper,
-		socket:  checkSocket,
-		state:   checkState,
-		tracked: checkTracked,
-		agents:  checkAgents,
+		helper:   checkHelper,
+		socket:   checkSocket,
+		mesh:     checkMesh,
+		manifest: checkManifest,
+		state:    checkState,
+		tracked:  checkTracked,
 	}
 }
 
@@ -115,22 +117,47 @@ func checkHelper(ctx context.Context) check {
 	return check{label: "key helper", ok: true, detail: fmt.Sprintf("%s (Developer ID signed, key-helper contract supported)", binary)}
 }
 
-// checkSocket confirms the resident daemon's RPC socket is bound and accepting — the
-// "is the daemon running?" check. A dial that connects means the watch daemon is up.
+// checkSocket confirms the resident helper's RPC socket is bound and accepting — the
+// "is the helper running?" check. A dial that connects means the resident helper
+// (cookiesync helper-serve) is up.
 func checkSocket(ctx context.Context) check {
 	sock, err := paths.SockPath()
 	if err != nil {
-		return check{label: "daemon socket", detail: err.Error()}
+		return check{label: "helper socket", detail: err.Error()}
 	}
 	var d net.Dialer
 	dialCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
 	conn, err := d.DialContext(dialCtx, "unix", sock)
 	if err != nil {
-		return check{label: "daemon socket", detail: fmt.Sprintf("not reachable at %s; run 'cookiesync install' to start the watch daemon", sock)}
+		return check{label: "helper socket", detail: fmt.Sprintf("not reachable at %s; run 'synckitd install' to start the resident helper (cookiesync helper-serve)", sock)}
 	}
 	_ = conn.Close()
-	return check{label: "daemon socket", ok: true, detail: sock}
+	return check{label: "helper socket", ok: true, detail: sock}
+}
+
+// checkMesh confirms this host has joined the synckit host mesh — that the shared
+// registry reports a self target. cookiesync keys every endpoint and converges across
+// the mesh, so an unjoined host syncs nothing.
+func checkMesh(ctx context.Context) check {
+	self, _, err := mesh.Resolve(ctx)
+	if err != nil {
+		return check{label: "mesh", detail: err.Error()}
+	}
+	return check{label: "mesh", ok: true, detail: fmt.Sprintf("self %s", self)}
+}
+
+// checkManifest confirms cookiesync's synckit manifest is registered, so synckitd
+// discovers and drives it. A missing manifest means 'cookiesync install' never ran.
+func checkManifest(_ context.Context) check {
+	path, err := manifestPath()
+	if err != nil {
+		return check{label: "manifest", detail: err.Error()}
+	}
+	if info, statErr := os.Stat(path); statErr != nil || info.IsDir() {
+		return check{label: "manifest", detail: fmt.Sprintf("not registered at %s; run 'cookiesync install'", path)}
+	}
+	return check{label: "manifest", ok: true, detail: path}
 }
 
 // checkState confirms cookiesync's state.json parses, so a malformed file is caught
@@ -156,45 +183,14 @@ func checkTracked(ctx context.Context) check {
 	return check{label: "browsers", ok: true, detail: fmt.Sprintf("%d tracked", n)}
 }
 
-// checkAgents confirms both LaunchAgent plists are installed, the proxy for the agents
-// being loaded. A missing plist means install never ran (or was undone). It checks the
-// files rather than shelling launchctl so the check is deterministic and side-effect
-// free.
-func checkAgents(_ context.Context) check {
-	dir, err := launchAgentsDir()
-	if err != nil {
-		return check{label: "agents", detail: err.Error()}
-	}
-	var missing []string
-	for _, label := range []string{service.TickLabel, service.WatchLabel} {
-		plist := filepath.Join(dir, label+".plist")
-		if info, statErr := os.Stat(plist); statErr != nil || info.IsDir() {
-			missing = append(missing, label)
-		}
-	}
-	if len(missing) > 0 {
-		return check{label: "agents", detail: fmt.Sprintf("not installed: %s; run 'cookiesync install'", strings.Join(missing, ", "))}
-	}
-	return check{label: "agents", ok: true, detail: "reconcile tick and watch daemon installed"}
-}
-
 // noteHelper prints a one-line note on the signed key helper before install proceeds,
 // mirroring the Python ensure_helper's status line. It never fetches or blocks: a
-// missing helper is reported, and the agents install anyway (they fail closed at
-// runtime without it).
+// missing helper is reported, and the manifest registers anyway (the helper fails closed
+// at runtime without it).
 func noteHelper(cmd *cobra.Command) {
 	if binary, err := paths.RequireHelper(); err == nil {
 		cmd.Printf("Key helper present: %s\n", binary)
 		return
 	}
 	cmd.PrintErrln("Key helper not installed; install it via Homebrew: brew install yasyf/tap/cookiesync-keyhelper")
-}
-
-// launchAgentsDir is the user's LaunchAgents directory, where the plists are written.
-func launchAgentsDir() (string, error) {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return "", fmt.Errorf("resolve home dir: %w", err)
-	}
-	return filepath.Join(home, "Library", "LaunchAgents"), nil
 }

@@ -88,6 +88,7 @@ func TestGetCookiesMergesURLsFromCachedKey(t *testing.T) {
 
 	cache := newFakeCache()
 	st := stateWith("me@laptop", "")
+	fakeMesh(t, "me@laptop")
 	d := New(&fakeConsent{}, cache, nil, staticProbe(SessionSnapshot{}), &recordingRunner{}, fixedState{st: st})
 	_ = cache.Put(ctx, endpointID("me@laptop", "chrome", "Default"), []byte(key), 0)
 
@@ -121,6 +122,7 @@ func TestGetCookiesHostFilters(t *testing.T) {
 		t.Fatalf("seed apply: %v", err)
 	}
 	cache := newFakeCache()
+	fakeMesh(t, "me@laptop")
 	d := New(&fakeConsent{}, cache, nil, staticProbe(SessionSnapshot{}), &recordingRunner{}, fixedState{st: stateWith("me@laptop", "")})
 	_ = cache.Put(ctx, endpointID("me@laptop", "chrome", "Default"), []byte(key), 0)
 
@@ -148,6 +150,7 @@ func TestExtractApplyRoundTripWireContract(t *testing.T) {
 	cache := newFakeCache()
 	_ = cache.Put(ctx, endpointID("me@laptop", "chrome", "Default"), []byte(key), 0)
 	st := stateWith("me@laptop", "")
+	fakeMesh(t, "me@laptop")
 	d := New(&fakeConsent{key: key}, cache, newRealEngine(t, cache), staticProbe(liveSession(currentUser(t))), &recordingRunner{}, fixedState{st: st})
 
 	// Apply two cookies via the frozen wire array.

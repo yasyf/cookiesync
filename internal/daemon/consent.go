@@ -45,7 +45,11 @@ func (d *Daemon) routedRelease(ctx context.Context, browser cookie.Browser, brow
 	if err != nil {
 		return nil, err
 	}
-	endpoint := endpointID(st.SelfTarget, browserID, profile)
+	self, err := meshSelf(ctx)
+	if err != nil {
+		return nil, err
+	}
+	endpoint := endpointID(self, browserID, profile)
 	cmd := fmt.Sprintf(
 		"cookiesync rpc request_consent --browser %s --profile %s --nonce %s --endpoint %s",
 		hostregistry.ShellQuote(browserID), hostregistry.ShellQuote(profile),

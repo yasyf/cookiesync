@@ -19,8 +19,10 @@
 // Every collaborator (consent gate, key cache, sync engine, session probe, ssh
 // runner, state store, and the clock) is injected behind a seam, so the whole
 // dispatcher runs in unit tests against fakes without a real macOS API, ssh, or
-// cookie store. The watch loop that drives the engine on local store changes runs
-// alongside the RPC server under one context (see Serve).
+// cookie store. The watch loop, reconcile tick, and host mesh now live in synckitd,
+// which shells `cookiesync sync|reconcile`; those CLIs dial this resident helper
+// over the RPC socket (see Serve), keeping the SE key cache and Touch ID consent
+// gate — the two things a fresh subprocess cannot hold — resident.
 package daemon
 
 import (
@@ -36,7 +38,6 @@ import (
 	"github.com/yasyf/cookiesync/internal/mesh"
 	"github.com/yasyf/cookiesync/internal/paths"
 	"github.com/yasyf/cookiesync/internal/state"
-	"github.com/yasyf/cookiesync/internal/watch"
 	synckit "github.com/yasyf/synckit/rpc"
 )
 
@@ -86,11 +87,6 @@ type Daemon struct {
 	runner  engine.SSHRunner
 	state   StateLoader
 
-	// watch is the anti-echo watch engine the daemon runs alongside the RPC server,
-	// converging on a local store change. It is nil in handler unit tests (which build
-	// the daemon through New and never run the loop); Build wires it for production.
-	watch *watch.Engine
-
 	// newNonce mints a fresh routed-consent nonce. It is a field so a test can pin
 	// the nonce and assert the echo binding; production uses the crypto/rand source.
 	newNonce func() (string, error)
@@ -103,8 +99,7 @@ type Daemon struct {
 func Build(ctx context.Context) (*Daemon, func(context.Context) error, error) {
 	store := state.New(paths.Config)
 	// Load once here to fail fast on a malformed state file; handlers re-read it live.
-	st, err := store.Load(ctx)
-	if err != nil {
+	if _, err := store.Load(ctx); err != nil {
 		return nil, nil, err
 	}
 
@@ -115,28 +110,13 @@ func Build(ctx context.Context) (*Daemon, func(context.Context) error, error) {
 	keyCache := cache.NewKeyCache(wrapper)
 	runner := engine.NewExecSSHRunner()
 
-	// The self target and peer fan-out come from reposync's host mesh, not this host's
-	// own state, so a freshly-installed host still converges and notifies its peers.
-	self, _, err := mesh.Resolve(ctx)
-	if err != nil {
-		return nil, nil, err
-	}
-	hosts, err := watch.NotifyHosts(ctx)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	// Wire the watch engine first: its anti-echo ledger is the one the sync engine
-	// records applied digests through, so a converge's write is recognized as the
-	// daemon's own echo. The notifier's local converger is the sync engine, set after
-	// both exist — the cycle (watch engine -> recorder -> sync engine -> notifier ->
-	// watch engine) is broken by this two-step wiring.
-	watchEng := watch.NewEngine(store, self, hosts, st.Settings.WatchDebounce, runner)
-	eng := engine.New(store, keyCache, runner, watchEng.Recorder())
-	watchEng.SetConverger(eng)
+	// synckitd owns the watch loop and reconcile tick now, so this helper runs no
+	// local watch engine to echo to: the engine records applied digests through a
+	// standalone recorder. The fingerprint that dedups a converge's own write is
+	// re-derived by `cookiesync list --json`, which synckitd shells.
+	eng := engine.New(store, keyCache, runner, engine.NewDigestRecorder())
 
 	d := New(cookie.TouchIDConsent{}, keyCache, eng, ProbeSession, runner, store)
-	d.watch = watchEng
 
 	closer := func(ctx context.Context) error {
 		keyCache.EvictAll()
@@ -176,11 +156,11 @@ func (d *Daemon) Dispatcher() *synckit.Dispatcher {
 	return dispatcher
 }
 
-// Serve runs the daemon until ctx is canceled: it opens the resident collaborators
-// (the SE wrapper among them), binds the RPC socket, and answers the method set. On
-// shutdown it drops the per-boot Enclave key and evicts the cache, so a leaked wrapped
-// blob is unrecoverable off-box. The watch loop that converges on local store changes
-// runs alongside the RPC server under one cancel-on-first-failure context.
+// Serve runs the resident helper until ctx is canceled: it opens the resident
+// collaborators (the SE wrapper among them), binds the RPC socket, and answers the
+// method set. On shutdown it drops the per-boot Enclave key and evicts the cache, so a
+// leaked wrapped blob is unrecoverable off-box. synckitd drives convergence by shelling
+// the cookiesync CLI, which dials this socket — the helper itself runs no watch loop.
 func Serve(ctx context.Context) error {
 	d, closer, err := Build(ctx)
 	if err != nil {
@@ -211,19 +191,7 @@ func Serve(ctx context.Context) error {
 	}
 	defer func() { _ = ln.Close() }()
 
-	// Run the RPC server and the watch loop under one context: each settle of a local
-	// store converges this host and notifies peers, while the server answers the RPC
-	// set. The first to fail cancels the other so the daemon exits as a unit (launchd
-	// then relaunches it).
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-	errc := make(chan error, 2)
-	go func() { errc <- synckit.Serve(ctx, ln, d.Dispatcher()) }()
-	go func() { errc <- d.watch.Run(ctx, d.state) }()
-	err = <-errc
-	cancel()
-	<-errc
-	return err
+	return synckit.Serve(ctx, ln, d.Dispatcher())
 }
 
 // endpointID is an endpoint's stable identity, host:browser:profile — the cache key
@@ -231,6 +199,18 @@ func Serve(ctx context.Context) error {
 // free function so the handlers read uniformly.
 func endpointID(host, browser, profile string) string {
 	return string(state.Endpoint{Host: host, Browser: browser, Profile: profile}.ID())
+}
+
+// meshSelf resolves this host's ssh target from the shared synckit mesh. Every cache
+// key and consent-endpoint binding keys on it, never on this host's written-through
+// self_target mirror, so self is consistent on a freshly-joined host whose state has
+// not yet been stamped. The peer fan-out is the same mesh, read in consent.go.
+func meshSelf(ctx context.Context) (string, error) {
+	self, _, err := mesh.Resolve(ctx)
+	if err != nil {
+		return "", err
+	}
+	return self, nil
 }
 
 // stringParam reads a required string param, erroring when absent or the wrong type so

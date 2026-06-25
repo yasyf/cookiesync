@@ -140,6 +140,102 @@ func TestForeignKeyPreserve(t *testing.T) {
 	}
 }
 
+// TestMergeRegistryPreservesLocalAndOtherKeys proves apply-json's merge is never
+// destructive and never clobbers a foreign key: a local-only endpoint survives, a
+// peer-only endpoint is admitted, a peer tombstone retires a shared endpoint by stamp,
+// and self_target, settings, consent_route_to, and the host registry's own keys are all
+// preserved across the merge.
+func TestMergeRegistryPreservesLocalAndOtherKeys(t *testing.T) {
+	ctx := context.Background()
+	now := time.Unix(1_700_000_000, 0)
+	store, path := newTestStore(t, now)
+
+	// Seed the host registry's own slice (a foreign key the merge must not touch).
+	cfg := hostregistry.Config{Name: "cookiesync"}
+	if _, err := cfg.Update(ctx, func(g *hostregistry.Registry) error {
+		g.Self = "me@laptop"
+		g.UpsertHost("you@desktop")
+		return nil
+	}); err != nil {
+		t.Fatalf("seed host registry: %v", err)
+	}
+
+	// Seed local cookiesync state: self_target + a non-default auth TTL + a consent route
+	// + a local-only endpoint and a shared endpoint.
+	if err := store.SetAuthTTL(ctx, 42*time.Minute); err != nil {
+		t.Fatalf("SetAuthTTL: %v", err)
+	}
+	if err := store.SetConsentRoute(ctx, "routed@host"); err != nil {
+		t.Fatalf("SetConsentRoute: %v", err)
+	}
+	localOnly := Endpoint{Host: "me@laptop", Browser: "chrome", Profile: "Default"}
+	shared := Endpoint{Host: "you@desktop", Browser: "arc", Profile: "Default"}
+	if err := store.AddBrowser(ctx, "me@laptop", localOnly); err != nil {
+		t.Fatalf("add localOnly: %v", err)
+	}
+	if err := store.AddBrowser(ctx, "me@laptop", shared); err != nil {
+		t.Fatalf("add shared: %v", err)
+	}
+
+	// The incoming (peer) registry: a peer-only endpoint added, and the shared endpoint
+	// tombstoned at a strictly later stamp than the local add (now.UnixMicro()).
+	incoming := cregistry.New[EndpointMeta]()
+	peerOnly := Endpoint{Host: "you@desktop", Browser: "chrome", Profile: "Work"}
+	incoming.Add(string(peerOnly.ID()), peerOnly.Meta(), cregistry.UnixMicros(now.Add(time.Hour)))
+	incoming.Remove(string(shared.ID()), cregistry.UnixMicros(now.Add(time.Hour)))
+
+	merged, err := store.MergeRegistry(ctx, incoming)
+	if err != nil {
+		t.Fatalf("MergeRegistry: %v", err)
+	}
+
+	// The merge result: local-only present, peer-only admitted, shared retired.
+	if !merged[string(localOnly.ID())].Present() {
+		t.Fatalf("local-only endpoint dropped by merge")
+	}
+	if !merged[string(peerOnly.ID())].Present() {
+		t.Fatalf("peer-only endpoint not admitted by merge")
+	}
+	if merged[string(shared.ID())].Present() {
+		t.Fatalf("peer tombstone did not retire the shared endpoint")
+	}
+	if got := len(merged.Present()); got != 2 {
+		t.Fatalf("merged present count = %d, want 2 (local-only + peer-only)", got)
+	}
+
+	// Reload proves the merge persisted and left every other cookiesync key intact.
+	st, err := store.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load after merge: %v", err)
+	}
+	if st.SelfTarget != "me@laptop" {
+		t.Fatalf("self_target = %q, want me@laptop (clobbered by merge)", st.SelfTarget)
+	}
+	if st.Settings.AuthTTL != 42*time.Minute {
+		t.Fatalf("auth TTL = %v, want 42m (clobbered by merge)", st.Settings.AuthTTL)
+	}
+	if st.ConsentRouteTo != "routed@host" {
+		t.Fatalf("consent_route_to = %q, want routed@host (clobbered by merge)", st.ConsentRouteTo)
+	}
+
+	// The host registry's own keys survive byte-for-byte.
+	raw := readStateFile(t, path)
+	var hosts []string
+	if err := json.Unmarshal(raw["hosts"], &hosts); err != nil {
+		t.Fatalf("parse hosts after merge: %v", err)
+	}
+	if len(hosts) != 1 || hosts[0] != "you@desktop" {
+		t.Fatalf("hosts = %+v after merge, want [you@desktop]", hosts)
+	}
+	var self string
+	if err := json.Unmarshal(raw["self"], &self); err != nil {
+		t.Fatalf("parse self after merge: %v", err)
+	}
+	if self != "me@laptop" {
+		t.Fatalf("registry self = %q after merge, want me@laptop", self)
+	}
+}
+
 // TestSaveRegistryUnlockedNoSelfDeadlock proves the *Unlocked save path can be called
 // from INSIDE a held WithLock without self-deadlocking on the non-reentrant flock —
 // the exact path the converge orchestration uses. A naive SaveRegistry (which

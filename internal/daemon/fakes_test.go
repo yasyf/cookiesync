@@ -11,34 +11,38 @@ import (
 	"time"
 
 	"github.com/yasyf/cookiesync/internal/cookie"
-	"github.com/yasyf/cookiesync/internal/mesh"
 	"github.com/yasyf/cookiesync/internal/state"
 	"github.com/yasyf/synckit/cregistry"
 )
 
-// fakeMesh points the shared mesh seam at a fake reposync that reports this self target
-// and peers, so the consent scan probes reposync's peers — not this host's tracked
-// endpoints — without a real reposync install.
+// fakeMesh seeds the shared synckit host registry with this self target and peers, so
+// the handlers key on the mesh self and the consent scan probes the mesh's peers — not
+// this host's tracked endpoints — without a real registration. hostregistry.Mesh keys
+// off XDG_CONFIG_HOME, so writing under a temp XDG isolates each test's mesh.
 func fakeMesh(t *testing.T, self string, peers ...string) {
 	t.Helper()
 	if peers == nil {
 		peers = []string{}
 	}
+	xdg := os.Getenv("XDG_CONFIG_HOME")
+	if xdg == "" {
+		xdg = t.TempDir()
+		t.Setenv("XDG_CONFIG_HOME", xdg)
+	}
+	dir := filepath.Join(xdg, "synckit")
+	if err := os.MkdirAll(dir, 0o700); err != nil { //nolint:gosec // G703: dir is under this test's own XDG_CONFIG_HOME temp root, not user-supplied.
+		t.Fatalf("mkdir synckit: %v", err)
+	}
 	payload, err := json.Marshal(struct {
-		Version int      `json:"version"`
-		Self    string   `json:"self"`
-		Hosts   []string `json:"hosts"`
-	}{1, self, peers})
+		Self  string   `json:"self"`
+		Hosts []string `json:"hosts"`
+	}{self, peers})
 	if err != nil {
 		t.Fatalf("marshal mesh: %v", err)
 	}
-	script := filepath.Join(t.TempDir(), "reposync")
-	if err := os.WriteFile(script, []byte("#!/bin/sh\ncat <<'JSON'\n"+string(payload)+"\nJSON\n"), 0o755); err != nil { //nolint:gosec // the fake reposync must be executable.
-		t.Fatalf("write fake reposync: %v", err)
+	if err := os.WriteFile(filepath.Join(dir, "state.json"), payload, 0o600); err != nil { //nolint:gosec // G703: path is under this test's own XDG_CONFIG_HOME temp root, not user-supplied.
+		t.Fatalf("write mesh state: %v", err)
 	}
-	prev := mesh.Bin
-	mesh.Bin = script
-	t.Cleanup(func() { mesh.Bin = prev })
 }
 
 // fakeConsent records its calls and returns a canned key (or a canned error from

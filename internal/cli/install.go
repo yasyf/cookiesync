@@ -1,21 +1,29 @@
 package cli
 
 import (
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+	"time"
+
 	"github.com/spf13/cobra"
 
 	"github.com/yasyf/cookiesync/internal/daemon"
-	"github.com/yasyf/cookiesync/internal/service"
+	"github.com/yasyf/synckit/codec"
+	"github.com/yasyf/synckit/hostregistry"
+	"github.com/yasyf/synckit/manifest"
 )
 
-// newLauncher builds the launchctl boundary install/uninstall drive. It is a package
-// var so a test can swap in a fake launcher and assert the rendered plists without
-// loading a real LaunchAgent on the live system; production uses launchctl.
-var newLauncher = service.NewLauncher
+// watchDebounce is the settle window synckitd holds a local store's write burst for
+// before converging cookiesync — long enough for a Cookies DB and its -wal/-shm
+// sidecars to land as one change.
+const watchDebounce = 3 * time.Second
 
-func newWatchCmd() *cobra.Command {
+func newHelperServeCmd() *cobra.Command {
 	cmd := &cobra.Command{
-		Use:   "watch",
-		Short: "Run the resident sync daemon: watch local stores and serve the RPC socket.",
+		Use:   "helper-serve",
+		Short: "Run the resident cookiesync helper: serve the SE key cache and Touch ID consent over the RPC socket.",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			return daemon.Serve(cmd.Context())
@@ -25,47 +33,111 @@ func newWatchCmd() *cobra.Command {
 }
 
 func newInstallCmd() *cobra.Command {
-	var tickOnly bool
 	cmd := &cobra.Command{
 		Use:   "install",
-		Short: "Fetch the signed key helper, then install the cookiesync LaunchAgents (watch daemon and reconcile tick).",
+		Short: "Note the signed key helper, then register cookiesync's synckit manifest.",
 		Args:  cobra.NoArgs,
-		RunE: func(cmd *cobra.Command, _ []string) error {
-			return runInstall(cmd, tickOnly)
-		},
+		RunE:  runInstall,
 	}
-	cmd.Flags().BoolVar(&tickOnly, "tick-only", false, "Install only the periodic reconcile tick, not the watch daemon.")
 	return cmd
 }
 
-// runInstall notes the signed key helper's presence, installs the LaunchAgents, and
-// reports the frozen line. The helper is fetched via Homebrew at install
-// (brew install yasyf/tap/cookiesync-keyhelper) and is what the daemon's Secure-Enclave
-// key vault runs inside; a missing helper is surfaced here (run doctor to recheck) but
-// does not block the agents, which fail closed at runtime if the helper is absent.
-func runInstall(cmd *cobra.Command, tickOnly bool) error {
+// cookiesyncManifest is the synckit manifest synckitd reads to drive cookiesync: how to
+// list watch items, how to converge, and the resident helper to keep alive. The action
+// templates are argv-only — synckitd prepends the cookiesync binary and renders the
+// template vars (the notifying host's own target into {{.Origin}}, so the notified peer
+// skips it in the union and the converge is never echoed straight back).
+func cookiesyncManifest() manifest.Manifest {
+	return manifest.Manifest{
+		Name:   "cookiesync",
+		Binary: "cookiesync",
+		Brew:   "yasyf/tap/cookiesync",
+		Watch: manifest.WatchSpec{
+			Backend:  "fsnotify",
+			Debounce: codec.Duration(watchDebounce),
+			ListCmd:  "list --json",
+		},
+		Actions: manifest.ActionSpec{
+			Reconcile: "reconcile",
+			Sync:      "sync --origin {{.Origin}}",
+			Fetch:     "state get-json",
+			Apply:     "state apply-json",
+		},
+		Launchd: &manifest.LaunchdSpec{SessionType: "Aqua"},
+		Helper: &manifest.HelperSpec{
+			Command:     "helper-serve",
+			SessionType: "Aqua",
+			Label:       "helper",
+		},
+	}
+}
+
+// manifestPath is the file synckitd discovers cookiesync's manifest at,
+// ~/.config/synckit/manifests/cookiesync.json.
+func manifestPath() (string, error) {
+	dir, err := hostregistry.Mesh.Dir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, "manifests", "cookiesync.json"), nil
+}
+
+// runInstall notes the signed key helper's presence, then writes cookiesync's synckit
+// manifest. The helper is fetched via Homebrew (brew install yasyf/tap/cookiesync) and
+// is what the helper's Secure-Enclave key vault runs inside; a missing helper is
+// surfaced here (run doctor to recheck) but does not block the manifest. Convergence is
+// driven by synckitd, which the user installs separately.
+func runInstall(cmd *cobra.Command, _ []string) error {
 	noteHelper(cmd)
-	if err := service.Install(cmd.Context(), newLauncher(), tickOnly); err != nil {
+	if err := writeManifest(cookiesyncManifest()); err != nil {
 		return err
 	}
-	if tickOnly {
-		cmd.Println("Installed the cookiesync reconcile tick.")
-		return nil
+	path, err := manifestPath()
+	if err != nil {
+		return err
 	}
-	cmd.Println("Installed cookiesync agents.")
+	cmd.Printf("Registered cookiesync manifest at %s.\n", path)
+	cmd.Println("Run 'synckitd install' to start the host mesh, watch supervisor, and reconcile tick.")
+	return nil
+}
+
+// writeManifest validates and writes the manifest to its synckit discovery path with
+// 0o600 perms, creating the manifests dir.
+func writeManifest(m manifest.Manifest) error {
+	if err := m.Validate(); err != nil {
+		return fmt.Errorf("build cookiesync manifest: %w", err)
+	}
+	path, err := manifestPath()
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return fmt.Errorf("create manifests dir: %w", err)
+	}
+	data, err := json.MarshalIndent(m, "", "  ")
+	if err != nil {
+		return fmt.Errorf("encode cookiesync manifest: %w", err)
+	}
+	if err := os.WriteFile(path, append(data, '\n'), 0o600); err != nil {
+		return fmt.Errorf("write cookiesync manifest %s: %w", path, err)
+	}
 	return nil
 }
 
 func newUninstallCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "uninstall",
-		Short: "Remove the cookiesync LaunchAgents.",
+		Short: "Remove cookiesync's synckit manifest.",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			if err := service.Uninstall(cmd.Context(), newLauncher()); err != nil {
+			path, err := manifestPath()
+			if err != nil {
 				return err
 			}
-			cmd.Println("Uninstalled cookiesync agents.")
+			if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+				return fmt.Errorf("remove cookiesync manifest %s: %w", path, err)
+			}
+			cmd.Println("Removed cookiesync manifest. Run 'synckitd' to stop driving it.")
 			return nil
 		},
 	}

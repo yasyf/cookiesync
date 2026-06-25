@@ -3,12 +3,14 @@ package cli
 import (
 	"bytes"
 	"context"
+	"encoding/json"
+	"os"
 	"strings"
 	"testing"
 
 	"github.com/spf13/cobra"
 
-	"github.com/yasyf/cookiesync/internal/service"
+	"github.com/yasyf/synckit/manifest"
 )
 
 // passing is a doctorEnv where every check succeeds, for the all-green path.
@@ -17,11 +19,12 @@ func passing() doctorEnv {
 		return func(context.Context) check { return check{label: label, ok: true, detail: "ok"} }
 	}
 	return doctorEnv{
-		helper:  ok("key helper"),
-		socket:  ok("daemon socket"),
-		state:   ok("state"),
-		tracked: ok("browsers"),
-		agents:  ok("agents"),
+		helper:   ok("key helper"),
+		socket:   ok("helper socket"),
+		mesh:     ok("mesh"),
+		manifest: ok("manifest"),
+		state:    ok("state"),
+		tracked:  ok("browsers"),
 	}
 }
 
@@ -35,7 +38,7 @@ func TestDoctorAllGreenExitsZero(t *testing.T) {
 		t.Fatalf("runDoctor all-green = %v, want nil", err)
 	}
 	got := out.String()
-	for _, label := range []string{"key helper", "daemon socket", "state", "browsers", "agents"} {
+	for _, label := range []string{"key helper", "helper socket", "mesh", "manifest", "state", "browsers"} {
 		if !strings.Contains(got, "OK   "+label) {
 			t.Errorf("doctor output missing OK line for %q:\n%s", label, got)
 		}
@@ -52,8 +55,8 @@ func TestDoctorFailingCheckExitsNonZero(t *testing.T) {
 	env.helper = func(context.Context) check {
 		return check{label: "key helper", detail: "not installed at /Applications/cookiesync-keyhelper.app"}
 	}
-	env.agents = func(context.Context) check {
-		return check{label: "agents", detail: "not installed: com.github.yasyf.cookiesync.watch"}
+	env.manifest = func(context.Context) check {
+		return check{label: "manifest", detail: "not registered at ~/.config/synckit/manifests/cookiesync.json"}
 	}
 
 	var out bytes.Buffer
@@ -63,15 +66,15 @@ func TestDoctorFailingCheckExitsNonZero(t *testing.T) {
 	if err == nil {
 		t.Fatal("runDoctor with two failing checks = nil error, want non-nil")
 	}
-	if !strings.Contains(err.Error(), "2 of 5 checks failed") {
-		t.Fatalf("doctor error = %v, want \"2 of 5 checks failed\"", err)
+	if !strings.Contains(err.Error(), "2 of 6 checks failed") {
+		t.Fatalf("doctor error = %v, want \"2 of 6 checks failed\"", err)
 	}
 	got := out.String()
 	if !strings.Contains(got, "FAIL key helper: not installed") {
 		t.Errorf("doctor missing helper FAIL detail:\n%s", got)
 	}
-	if !strings.Contains(got, "FAIL agents: not installed") {
-		t.Errorf("doctor missing agents FAIL detail:\n%s", got)
+	if !strings.Contains(got, "FAIL manifest: not registered") {
+		t.Errorf("doctor missing manifest FAIL detail:\n%s", got)
 	}
 	// The passing checks still report OK.
 	if !strings.Contains(got, "OK   state") {
@@ -79,48 +82,83 @@ func TestDoctorFailingCheckExitsNonZero(t *testing.T) {
 	}
 }
 
-// fakeLauncher records bootstrap/bootout so the install CLI path runs without loading a
-// real agent.
-type fakeLauncher struct {
-	bootstrapped int
-	bootedOut    int
-}
-
-func (f *fakeLauncher) Bootstrap(context.Context, string) error { f.bootstrapped++; return nil }
-func (f *fakeLauncher) Bootout(context.Context, string) error   { f.bootedOut++; return nil }
-
-// TestInstallUninstallCLIOutput proves the install/uninstall commands emit the frozen
-// lines and drive the launcher, against a temp HOME and a fake launcher — no real agent
-// is loaded.
-func TestInstallUninstallCLIOutput(t *testing.T) {
+// TestInstallWritesManifest proves install emits the frozen lines and writes a valid
+// synckit manifest with the cookiesync action contract, against a temp config home.
+func TestInstallWritesManifest(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 
-	launcher := &fakeLauncher{}
-	prev := newLauncher
-	newLauncher = func() service.Launcher { return launcher }
-	t.Cleanup(func() { newLauncher = prev })
-
-	// install (full)
-	if got := runRootCmd(t, "install"); !strings.Contains(got, "Installed cookiesync agents.") {
-		t.Fatalf("install output = %q, want it to contain \"Installed cookiesync agents.\"", got)
+	out := runRootCmd(t, "install")
+	if !strings.Contains(out, "Registered cookiesync manifest") {
+		t.Fatalf("install output = %q, want it to contain \"Registered cookiesync manifest\"", out)
 	}
-	if launcher.bootstrapped != 2 {
-		t.Errorf("install bootstrapped %d agents, want 2", launcher.bootstrapped)
+	if !strings.Contains(out, "synckitd install") {
+		t.Fatalf("install output = %q, want it to point the user at 'synckitd install'", out)
 	}
 
-	// install --tick-only
-	launcher.bootstrapped = 0
-	if got := runRootCmd(t, "install", "--tick-only"); !strings.Contains(got, "Installed the cookiesync reconcile tick.") {
-		t.Fatalf("install --tick-only output = %q, want the tick line", got)
+	path, err := manifestPath()
+	if err != nil {
+		t.Fatalf("manifestPath: %v", err)
 	}
-	if launcher.bootstrapped != 1 {
-		t.Errorf("install --tick-only bootstrapped %d agents, want 1", launcher.bootstrapped)
+	data, err := os.ReadFile(path) //nolint:gosec // path is the test-controlled manifest under a temp config home.
+	if err != nil {
+		t.Fatalf("read manifest: %v", err)
+	}
+	var m manifest.Manifest
+	if err := json.Unmarshal(data, &m); err != nil {
+		t.Fatalf("manifest is not valid JSON: %v\n%s", err, data)
+	}
+	if err := m.Validate(); err != nil {
+		t.Fatalf("written manifest does not validate: %v", err)
+	}
+	if m.Name != "cookiesync" || m.Binary != "cookiesync" {
+		t.Fatalf("manifest name/binary = %q/%q, want cookiesync/cookiesync", m.Name, m.Binary)
+	}
+	if m.Watch.Backend != "fsnotify" || m.Watch.ListCmd != "list --json" {
+		t.Fatalf("manifest watch = %+v, want fsnotify + 'list --json'", m.Watch)
+	}
+	if m.Actions.Sync != "sync --origin {{.Origin}}" {
+		t.Fatalf("manifest sync = %q, want 'sync --origin {{.Origin}}'", m.Actions.Sync)
+	}
+	if m.Actions.Reconcile != "reconcile" || m.Actions.Fetch != "state get-json" || m.Actions.Apply != "state apply-json" {
+		t.Fatalf("manifest actions = %+v, want reconcile/state get-json/state apply-json", m.Actions)
+	}
+	if m.Helper == nil || m.Helper.Command != "helper-serve" {
+		t.Fatalf("manifest helper = %+v, want command helper-serve", m.Helper)
 	}
 
-	// uninstall
-	if got := runRootCmd(t, "uninstall"); !strings.Contains(got, "Uninstalled cookiesync agents.") {
-		t.Fatalf("uninstall output = %q, want \"Uninstalled cookiesync agents.\"", got)
+	// The rendered sync action argv-splits and templates the origin (the notifier's own
+	// target), never building a shell string — the contract synckitd renders when it
+	// notifies a peer (ActionVars.Origin = the notifying host's self).
+	argv, err := manifest.Render(m.Actions.Sync, manifest.ActionVars{Origin: "you@desktop"})
+	if err != nil {
+		t.Fatalf("render sync action: %v", err)
+	}
+	if len(argv) != 3 || argv[0] != "sync" || argv[1] != "--origin" || argv[2] != "you@desktop" {
+		t.Fatalf("rendered sync argv = %v, want [sync --origin you@desktop]", argv)
+	}
+}
+
+// TestUninstallRemovesManifest proves uninstall removes the registered manifest and emits
+// the frozen line, and is a no-op (not an error) when no manifest is registered.
+func TestUninstallRemovesManifest(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+
+	runRootCmd(t, "install")
+	if got := runRootCmd(t, "uninstall"); !strings.Contains(got, "Removed cookiesync manifest") {
+		t.Fatalf("uninstall output = %q, want \"Removed cookiesync manifest\"", got)
+	}
+	path, err := manifestPath()
+	if err != nil {
+		t.Fatalf("manifestPath: %v", err)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("manifest still present after uninstall: %v", err)
+	}
+	// A second uninstall is a no-op, not an error.
+	if got := runRootCmd(t, "uninstall"); !strings.Contains(got, "Removed cookiesync manifest") {
+		t.Fatalf("repeat uninstall output = %q, want the frozen line", got)
 	}
 }
 
