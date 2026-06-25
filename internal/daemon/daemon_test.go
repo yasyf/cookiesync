@@ -56,6 +56,7 @@ func TestBuildOpensAndDropsTheEnclaveKey(t *testing.T) {
 	binary, logPath := writeFakeCacheHelper(t)
 	restore := paths.SetHelperBinaryForTest(binary)
 	t.Cleanup(restore)
+	fakeMesh(t, "me@laptop")
 	ctx := context.Background()
 
 	d, closer, err := Build(ctx)
