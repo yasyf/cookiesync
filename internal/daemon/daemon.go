@@ -33,6 +33,7 @@ import (
 	"github.com/yasyf/cookiesync/internal/cookie"
 	"github.com/yasyf/cookiesync/internal/engine"
 	"github.com/yasyf/cookiesync/internal/helper"
+	"github.com/yasyf/cookiesync/internal/mesh"
 	"github.com/yasyf/cookiesync/internal/paths"
 	"github.com/yasyf/cookiesync/internal/state"
 	"github.com/yasyf/cookiesync/internal/watch"
@@ -114,12 +115,23 @@ func Build(ctx context.Context) (*Daemon, func(context.Context) error, error) {
 	keyCache := cache.NewKeyCache(wrapper)
 	runner := engine.NewExecSSHRunner()
 
+	// The self target and peer fan-out come from reposync's host mesh, not this host's
+	// own state, so a freshly-installed host still converges and notifies its peers.
+	self, _, err := mesh.Resolve(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	hosts, err := watch.NotifyHosts(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+
 	// Wire the watch engine first: its anti-echo ledger is the one the sync engine
 	// records applied digests through, so a converge's write is recognized as the
 	// daemon's own echo. The notifier's local converger is the sync engine, set after
 	// both exist — the cycle (watch engine -> recorder -> sync engine -> notifier ->
 	// watch engine) is broken by this two-step wiring.
-	watchEng := watch.NewEngine(store, st.SelfTarget, watch.NotifyHosts(st), st.Settings.WatchDebounce, runner)
+	watchEng := watch.NewEngine(store, self, hosts, st.Settings.WatchDebounce, runner)
 	eng := engine.New(store, keyCache, runner, watchEng.Recorder())
 	watchEng.SetConverger(eng)
 

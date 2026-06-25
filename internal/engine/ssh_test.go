@@ -128,21 +128,3 @@ func TestSSHFetcherRoundTrip(t *testing.T) {
 		t.Fatalf("registry read must not pipe stdin")
 	}
 }
-
-// TestPeerHostsExcludesSelfAndDedups proves the peer mesh derived from a registry omits
-// the self host and collapses duplicate hosts (two browsers on one peer -> one host).
-func TestPeerHostsExcludesSelfAndDedups(t *testing.T) {
-	self := "me@laptop"
-	reg := cregistry.New[state.EndpointMeta]()
-	for _, ep := range []state.Endpoint{
-		{Host: self, Browser: "chrome", Profile: "Default"},
-		{Host: "you@desktop", Browser: "chrome", Profile: "Default"},
-		{Host: "you@desktop", Browser: "arc", Profile: "Default"},
-	} {
-		reg.Add(string(ep.ID()), ep.Meta(), 1)
-	}
-	peers := PeerHosts(reg, self)
-	if len(peers) != 1 || peers[0] != "you@desktop" {
-		t.Fatalf("PeerHosts = %+v, want [you@desktop]", peers)
-	}
-}

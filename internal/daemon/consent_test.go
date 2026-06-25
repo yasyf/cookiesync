@@ -42,6 +42,7 @@ func TestRoutedReleaseApprovedReleasesUnpromptedKey(t *testing.T) {
 	endpoint := endpointID(self, "chrome", "Default")
 	nonce := "fixed-nonce-abc"
 
+	fakeMesh(t, self, peer)
 	consent := &fakeConsent{key: cookie.DeriveKey(cookie.SafeStorageKey("peanuts"))}
 	runner := &recordingRunner{
 		replies:  map[string]string{"cookiesync rpc whoami": liveWhoami},
@@ -85,6 +86,7 @@ func TestRoutedReleaseNonceMismatchIsAuthRequired(t *testing.T) {
 	peer := "you@desktop"
 	endpoint := endpointID(self, "chrome", "Default")
 
+	fakeMesh(t, self, peer)
 	consent := &fakeConsent{key: cookie.DeriveKey(cookie.SafeStorageKey("peanuts"))}
 	runner := &recordingRunner{
 		replies:  map[string]string{"cookiesync rpc whoami": liveWhoami},
@@ -113,6 +115,7 @@ func TestRoutedReleaseEndpointMismatchIsAuthRequired(t *testing.T) {
 	peer := "you@desktop"
 	nonce := "n1"
 
+	fakeMesh(t, self, peer)
 	consent := &fakeConsent{key: cookie.DeriveKey(cookie.SafeStorageKey("peanuts"))}
 	runner := &recordingRunner{
 		replies:  map[string]string{"cookiesync rpc whoami": liveWhoami},
@@ -140,6 +143,7 @@ func TestActivePeerRouteToShortCircuits(t *testing.T) {
 	routed := "router@box"
 	other := "other@box"
 
+	fakeMesh(t, self, routed, other)
 	runner := &recordingRunner{replies: map[string]string{"cookiesync rpc whoami": liveWhoami}}
 	st := stateWith(self, routed, stateEndpoint(routed, "chrome", "Default"), stateEndpoint(other, "chrome", "Default"))
 	d := New(&fakeConsent{}, newFakeCache(), nil, staticProbe(SessionSnapshot{}), runner, fixedState{st: st})
@@ -167,6 +171,7 @@ func TestActivePeerRouteToOfflineFallsBackToScan(t *testing.T) {
 	routed := "router@box"
 	live := "live@box"
 
+	fakeMesh(t, self, routed, live)
 	runner := &recordingRunner{replies: map[string]string{}}
 	// The routed target is locked; the other peer is live.
 	runner.byMethod = map[string]string{}
@@ -190,6 +195,7 @@ func TestActivePeerNoLiveSessionIsAuthRequired(t *testing.T) {
 	self := "me@laptop"
 	peer := "you@desktop"
 
+	fakeMesh(t, self, peer)
 	runner := &recordingRunner{replies: map[string]string{"cookiesync rpc whoami": deadWhoami}}
 	st := stateWith(self, "", stateEndpoint(peer, "chrome", "Default"))
 	d := New(&fakeConsent{}, newFakeCache(), nil, staticProbe(SessionSnapshot{}), runner, fixedState{st: st})

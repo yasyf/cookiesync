@@ -33,8 +33,13 @@ func TestEngineSyncDrivesConvergePass(t *testing.T) {
 	self := "me@laptop"
 	peerHost := "you@desktop"
 
-	// This host tracks a remote endpoint (added via browser add), so the peer is in the
-	// mesh and gets pull-merged — but there is no local endpoint to converge.
+	// The host mesh comes from reposync: this host plus the peer. The peer is pull-merged
+	// even though this host has no local endpoint to converge — the bootstrap the mesh
+	// bridge fixes.
+	fakeMesh(t, self, peerHost)
+
+	// This host tracks a remote endpoint (added via browser add), recorded in the
+	// convergent registry the merge unions against.
 	remoteEP := state.Endpoint{Host: peerHost, Browser: "chrome", Profile: "Default"}
 	if err := store.AddBrowser(ctx, self, remoteEP); err != nil {
 		t.Fatalf("AddBrowser: %v", err)
@@ -94,6 +99,7 @@ func TestEngineSyncDrivesConvergePass(t *testing.T) {
 func TestEngineReconcileRunsWithNoOrigin(t *testing.T) {
 	ctx := context.Background()
 	store := newStore(t)
+	fakeMesh(t, "me@laptop", "you@desktop")
 	if err := store.AddBrowser(ctx, "me@laptop", state.Endpoint{Host: "you@desktop", Browser: "chrome", Profile: "Default"}); err != nil {
 		t.Fatalf("AddBrowser: %v", err)
 	}

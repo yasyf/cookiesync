@@ -3,16 +3,44 @@ package watch
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
 	_ "modernc.org/sqlite" // register the sqlite driver for the test store
 
 	"github.com/yasyf/cookiesync/internal/cookie"
+	"github.com/yasyf/cookiesync/internal/mesh"
 	"github.com/yasyf/cookiesync/internal/state"
 	"github.com/yasyf/synckit/cregistry"
 )
+
+// fakeMesh points the shared mesh seam at a fake reposync that reports this self target
+// and peers, so the notify fan-out resolves its hosts from reposync without a real
+// reposync install.
+func fakeMesh(t *testing.T, self string, peers ...string) {
+	t.Helper()
+	if peers == nil {
+		peers = []string{}
+	}
+	payload, err := json.Marshal(struct {
+		Version int      `json:"version"`
+		Self    string   `json:"self"`
+		Hosts   []string `json:"hosts"`
+	}{1, self, peers})
+	if err != nil {
+		t.Fatalf("marshal mesh: %v", err)
+	}
+	script := filepath.Join(t.TempDir(), "reposync")
+	if err := os.WriteFile(script, []byte("#!/bin/sh\ncat <<'JSON'\n"+string(payload)+"\nJSON\n"), 0o755); err != nil { //nolint:gosec // the fake reposync must be executable.
+		t.Fatalf("write fake reposync: %v", err)
+	}
+	prev := mesh.Bin
+	mesh.Bin = script
+	t.Cleanup(func() { mesh.Bin = prev })
+}
 
 // fixedStore is an EndpointLookup returning a fixed state snapshot, so the resolver
 // and the loop run against a synthetic registry without touching disk.

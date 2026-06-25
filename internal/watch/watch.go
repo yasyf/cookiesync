@@ -9,19 +9,24 @@ import (
 	"github.com/fsnotify/fsnotify"
 
 	"github.com/yasyf/cookiesync/internal/cookie"
-	"github.com/yasyf/cookiesync/internal/engine"
+	"github.com/yasyf/cookiesync/internal/mesh"
 	"github.com/yasyf/cookiesync/internal/state"
 )
 
 // NotifyHosts is the engine's fan-out list on a real change: this host first (the
-// in-process local converge) then every distinct peer (an ssh-driven peer converge).
-// Mirrors the Python notify_peers, which runs a local sync then a peer sync per host.
-func NotifyHosts(st *state.State) []string {
-	peers := engine.PeerHosts(st.Browsers, st.SelfTarget)
+// in-process local converge) then every peer (an ssh-driven peer converge). The set
+// comes from reposync's host registry, not this host's own state, so a freshly-installed
+// host still notifies its peers. Mirrors the Python notify_peers, which runs a local sync
+// then a peer sync per host.
+func NotifyHosts(ctx context.Context) ([]string, error) {
+	self, peers, err := mesh.Resolve(ctx)
+	if err != nil {
+		return nil, err
+	}
 	hosts := make([]string, 0, len(peers)+1)
-	hosts = append(hosts, st.SelfTarget)
+	hosts = append(hosts, self)
 	hosts = append(hosts, peers...)
-	return hosts
+	return hosts, nil
 }
 
 // OnEvent feeds one filesystem event for the endpoint id into the engine's debounce.

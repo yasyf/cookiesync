@@ -9,6 +9,7 @@ import (
 	"fmt"
 
 	"github.com/yasyf/cookiesync/internal/cookie"
+	"github.com/yasyf/cookiesync/internal/mesh"
 	"github.com/yasyf/cookiesync/internal/state"
 	"github.com/yasyf/synckit/hostregistry"
 )
@@ -69,9 +70,11 @@ func (d *Daemon) routedRelease(ctx context.Context, browser cookie.Browser, brow
 }
 
 // activePeer finds the peer whose live, unlocked session can approve consent. A set
-// consent_route_to that is live short-circuits the scan; otherwise every other host in
-// the mesh is probed and the first live one wins. No live peer is AuthRequired. Mirrors
-// the Python active_peer.
+// consent_route_to that is live short-circuits the scan; otherwise every peer in
+// reposync's host mesh is probed and the first live one wins. The candidate peers come
+// from reposync, not this host's tracked endpoints, so a freshly-installed host with no
+// peer endpoints can still route consent to a live peer. No live peer is AuthRequired.
+// Mirrors the Python active_peer.
 func (d *Daemon) activePeer(ctx context.Context, st *state.State) (string, error) {
 	if st.ConsentRouteTo != "" {
 		live, err := d.peerIsLive(ctx, st.ConsentRouteTo)
@@ -82,7 +85,11 @@ func (d *Daemon) activePeer(ctx context.Context, st *state.State) (string, error
 			return st.ConsentRouteTo, nil
 		}
 	}
-	for _, peer := range peerHosts(st) {
+	_, peers, err := mesh.Resolve(ctx)
+	if err != nil {
+		return "", err
+	}
+	for _, peer := range peers {
 		live, err := d.peerIsLive(ctx, peer)
 		if err != nil {
 			return "", err
@@ -148,23 +155,6 @@ func (d *Daemon) handleRequestConsent(ctx context.Context, params map[string]any
 		return nil, err
 	}
 	return map[string]any{"status": "approved", "nonce": nonce, "endpoint": endpoint}, nil
-}
-
-// peerHosts returns the distinct peer ssh targets in the mesh, excluding this host.
-func peerHosts(st *state.State) []string {
-	seen := map[string]struct{}{}
-	var peers []string
-	for _, ep := range st.Endpoints() {
-		if ep.Host == st.SelfTarget {
-			continue
-		}
-		if _, done := seen[ep.Host]; done {
-			continue
-		}
-		seen[ep.Host] = struct{}{}
-		peers = append(peers, ep.Host)
-	}
-	return peers
 }
 
 // statusOrUnavailable echoes the peer's reported status, defaulting to "unavailable"

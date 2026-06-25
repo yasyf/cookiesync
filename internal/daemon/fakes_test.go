@@ -2,14 +2,44 @@ package daemon
 
 import (
 	"context"
+	"encoding/json"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
+	"testing"
 	"time"
 
 	"github.com/yasyf/cookiesync/internal/cookie"
+	"github.com/yasyf/cookiesync/internal/mesh"
 	"github.com/yasyf/cookiesync/internal/state"
 	"github.com/yasyf/synckit/cregistry"
 )
+
+// fakeMesh points the shared mesh seam at a fake reposync that reports this self target
+// and peers, so the consent scan probes reposync's peers — not this host's tracked
+// endpoints — without a real reposync install.
+func fakeMesh(t *testing.T, self string, peers ...string) {
+	t.Helper()
+	if peers == nil {
+		peers = []string{}
+	}
+	payload, err := json.Marshal(struct {
+		Version int      `json:"version"`
+		Self    string   `json:"self"`
+		Hosts   []string `json:"hosts"`
+	}{1, self, peers})
+	if err != nil {
+		t.Fatalf("marshal mesh: %v", err)
+	}
+	script := filepath.Join(t.TempDir(), "reposync")
+	if err := os.WriteFile(script, []byte("#!/bin/sh\ncat <<'JSON'\n"+string(payload)+"\nJSON\n"), 0o755); err != nil { //nolint:gosec // the fake reposync must be executable.
+		t.Fatalf("write fake reposync: %v", err)
+	}
+	prev := mesh.Bin
+	mesh.Bin = script
+	t.Cleanup(func() { mesh.Bin = prev })
+}
 
 // fakeConsent records its calls and returns a canned key (or a canned error from
 // ObtainKey to simulate a declined prompt), so the consent path runs without Touch ID

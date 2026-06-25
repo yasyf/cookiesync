@@ -261,3 +261,24 @@ func TestResolverMissingEndpointErrors(t *testing.T) {
 		t.Fatal("Resolve of an untracked endpoint = nil error, want a not-tracked error")
 	}
 }
+
+// TestNotifyHostsBridgesReposyncMesh proves the notify fan-out is self first then every
+// reposync peer — sourced from reposync's host registry, not this host's own state — so
+// a freshly-installed host still notifies its peers.
+func TestNotifyHostsBridgesReposyncMesh(t *testing.T) {
+	fakeMesh(t, "me@laptop", "you@desktop", "她@air")
+
+	hosts, err := NotifyHosts(context.Background())
+	if err != nil {
+		t.Fatalf("NotifyHosts: %v", err)
+	}
+	want := []string{"me@laptop", "you@desktop", "她@air"}
+	if len(hosts) != len(want) {
+		t.Fatalf("NotifyHosts = %v, want %v", hosts, want)
+	}
+	for i, h := range want {
+		if hosts[i] != h {
+			t.Fatalf("NotifyHosts[%d] = %q, want %q (self first, then peers)", i, hosts[i], h)
+		}
+	}
+}

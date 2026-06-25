@@ -8,9 +8,11 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/yasyf/cookiesync/internal/mesh"
 )
 
-// seedRegistry points the reposync-bridge seam at a fake reposync that prints a host
+// seedRegistry points the shared mesh seam at a fake reposync that prints a host
 // registry with this self target and peers, so browser add's host validation passes
 // for a known host (cookiesync rides reposync's mesh).
 func seedRegistry(t *testing.T, self string, hosts ...string) {
@@ -30,9 +32,9 @@ func seedRegistry(t *testing.T, self string, hosts ...string) {
 	if err := os.WriteFile(script, []byte("#!/bin/sh\ncat <<'JSON'\n"+string(payload)+"\nJSON\n"), 0o755); err != nil { //nolint:gosec // the fake reposync must be executable.
 		t.Fatalf("write fake reposync: %v", err)
 	}
-	prev := reposyncBin
-	reposyncBin = script
-	t.Cleanup(func() { reposyncBin = prev })
+	prev := mesh.Bin
+	mesh.Bin = script
+	t.Cleanup(func() { mesh.Bin = prev })
 }
 
 // runBrowserCmd runs `browser <sub> <args...>` on a fresh root and returns stdout.

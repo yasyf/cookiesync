@@ -1,16 +1,15 @@
 package cli
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
-	"os/exec"
 	"sort"
 	"strings"
 
 	"github.com/spf13/cobra"
 
 	"github.com/yasyf/cookiesync/internal/cookie"
+	"github.com/yasyf/cookiesync/internal/mesh"
 	"github.com/yasyf/cookiesync/internal/paths"
 	"github.com/yasyf/cookiesync/internal/state"
 )
@@ -74,12 +73,12 @@ func runBrowserAdd(cmd *cobra.Command, host, browserName, profile string) error 
 	if err := validateBrowser(browserName); err != nil {
 		return err
 	}
-	self, hosts, err := registryHosts(cmd.Context())
+	self, peers, err := mesh.Resolve(cmd.Context())
 	if err != nil {
 		return err
 	}
-	if host != self && !contains(hosts, host) {
-		return fmt.Errorf("unknown host %q; choose from %s", host, strings.Join(append([]string{self}, hosts...), ", "))
+	if host != self && !contains(peers, host) {
+		return fmt.Errorf("unknown host %q; choose from %s", host, strings.Join(append([]string{self}, peers...), ", "))
 	}
 	endpoint := state.Endpoint{Host: host, Browser: browserName, Profile: profile}
 	if err := state.New(paths.Config).AddBrowser(cmd.Context(), self, endpoint); err != nil {
@@ -158,28 +157,6 @@ func validateBrowser(name string) error {
 	}
 	sort.Strings(known)
 	return fmt.Errorf("unknown browser %q; choose from %s", name, strings.Join(known, ", "))
-}
-
-// reposyncBin is the reposync CLI cookiesync rides for its host mesh. It is a var so
-// tests can point it at a fake that prints a known host registry.
-var reposyncBin = "reposync"
-
-// registryHosts reads cookiesync's host mesh from reposync: cookiesync rides
-// reposync's host registry, so the hosts it can track a browser on are exactly the
-// hosts reposync knows (self plus peers). Mirrors the Python reposync_registry bridge.
-func registryHosts(ctx context.Context) (self string, hosts []string, err error) {
-	out, err := exec.CommandContext(ctx, reposyncBin, "host", "ls", "--json").Output()
-	if err != nil {
-		return "", nil, fmt.Errorf("read reposync host registry (is reposync installed?): %w", err)
-	}
-	var reg struct {
-		Self  string   `json:"self"`
-		Hosts []string `json:"hosts"`
-	}
-	if err := json.Unmarshal(out, &reg); err != nil {
-		return "", nil, fmt.Errorf("parse reposync host ls: %w", err)
-	}
-	return reg.Self, reg.Hosts, nil
 }
 
 // sortedEndpoints returns endpoints ordered by id, so ls output is stable across the

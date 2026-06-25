@@ -41,25 +41,6 @@ func (f SSHFetcher) Fetch(ctx context.Context, peer string) (cregistry.Registry[
 	return reg, nil
 }
 
-// PeerHosts returns the distinct peer ssh targets across a registry's present
-// endpoints, excluding selfTarget — the mesh a converge pull-merges against.
-func PeerHosts(reg cregistry.Registry[state.EndpointMeta], selfTarget string) []string {
-	seen := map[string]struct{}{}
-	var peers []string
-	for _, entry := range reg.Present() {
-		host := entry.Value.Host
-		if host == selfTarget {
-			continue
-		}
-		if _, done := seen[host]; done {
-			continue
-		}
-		seen[host] = struct{}{}
-		peers = append(peers, host)
-	}
-	return peers
-}
-
 // MarshalRegistry encodes a convergent endpoint registry as the JSON the peer
 // registryReadCmd emits — the byte shape the Fetcher round-trips.
 func MarshalRegistry(reg cregistry.Registry[state.EndpointMeta]) ([]byte, error) {
