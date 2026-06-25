@@ -4,26 +4,35 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
-
-	"github.com/yasyf/cookiesync/internal/paths"
-	"github.com/yasyf/synckit/hostregistry"
 )
 
-// seedRegistry writes the self target and peer hosts into the shared host registry, so
-// browser add's host validation passes for a known host.
+// seedRegistry points the reposync-bridge seam at a fake reposync that prints a host
+// registry with this self target and peers, so browser add's host validation passes
+// for a known host (cookiesync rides reposync's mesh).
 func seedRegistry(t *testing.T, self string, hosts ...string) {
 	t.Helper()
-	if _, err := paths.Config.Update(context.Background(), func(g *hostregistry.Registry) error {
-		g.Self = self
-		for _, h := range hosts {
-			g.UpsertHost(h)
-		}
-		return nil
-	}); err != nil {
-		t.Fatalf("seed registry: %v", err)
+	if hosts == nil {
+		hosts = []string{}
 	}
+	payload, err := json.Marshal(struct {
+		Version int      `json:"version"`
+		Self    string   `json:"self"`
+		Hosts   []string `json:"hosts"`
+	}{1, self, hosts})
+	if err != nil {
+		t.Fatalf("marshal registry: %v", err)
+	}
+	script := filepath.Join(t.TempDir(), "reposync")
+	if err := os.WriteFile(script, []byte("#!/bin/sh\ncat <<'JSON'\n"+string(payload)+"\nJSON\n"), 0o755); err != nil { //nolint:gosec // the fake reposync must be executable.
+		t.Fatalf("write fake reposync: %v", err)
+	}
+	prev := reposyncBin
+	reposyncBin = script
+	t.Cleanup(func() { reposyncBin = prev })
 }
 
 // runBrowserCmd runs `browser <sub> <args...>` on a fresh root and returns stdout.

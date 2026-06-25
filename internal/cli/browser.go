@@ -1,8 +1,10 @@
 package cli
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"os/exec"
 	"sort"
 	"strings"
 
@@ -72,7 +74,7 @@ func runBrowserAdd(cmd *cobra.Command, host, browserName, profile string) error 
 	if err := validateBrowser(browserName); err != nil {
 		return err
 	}
-	self, hosts, err := registryHosts()
+	self, hosts, err := registryHosts(cmd.Context())
 	if err != nil {
 		return err
 	}
@@ -158,13 +160,24 @@ func validateBrowser(name string) error {
 	return fmt.Errorf("unknown browser %q; choose from %s", name, strings.Join(known, ", "))
 }
 
-// registryHosts reads this host's self target and registered peers from the shared
-// host registry — the source browser add validates a host against, so cookiesync only
-// tracks hosts the registry knows. Mirrors the Python reposync_registry.
-func registryHosts() (self string, hosts []string, err error) {
-	reg, err := paths.Config.Load()
+// reposyncBin is the reposync CLI cookiesync rides for its host mesh. It is a var so
+// tests can point it at a fake that prints a known host registry.
+var reposyncBin = "reposync"
+
+// registryHosts reads cookiesync's host mesh from reposync: cookiesync rides
+// reposync's host registry, so the hosts it can track a browser on are exactly the
+// hosts reposync knows (self plus peers). Mirrors the Python reposync_registry bridge.
+func registryHosts(ctx context.Context) (self string, hosts []string, err error) {
+	out, err := exec.CommandContext(ctx, reposyncBin, "host", "ls", "--json").Output()
 	if err != nil {
-		return "", nil, err
+		return "", nil, fmt.Errorf("read reposync host registry (is reposync installed?): %w", err)
+	}
+	var reg struct {
+		Self  string   `json:"self"`
+		Hosts []string `json:"hosts"`
+	}
+	if err := json.Unmarshal(out, &reg); err != nil {
+		return "", nil, fmt.Errorf("parse reposync host ls: %w", err)
 	}
 	return reg.Self, reg.Hosts, nil
 }
