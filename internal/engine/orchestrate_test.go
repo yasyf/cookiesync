@@ -6,12 +6,13 @@ import (
 
 	"github.com/yasyf/cookiesync/internal/cookie"
 	"github.com/yasyf/cookiesync/internal/state"
+	"github.com/yasyf/synckit/converge"
 	"github.com/yasyf/synckit/cregistry"
 )
 
-// fixedRunner serves a canned reply for the peer registry read (and any other ssh
-// call), recording every command so a test can assert the orchestration only ever
-// reads peers — never writes them.
+// fixedRunner serves a canned reply for any ssh call, recording every command so a test
+// can assert which value-union (extract/apply) commands the orchestration issued — the
+// peer registry read no longer goes through the runner, it goes through the typed fetcher.
 type fixedRunner struct {
 	reply string
 	calls []string
@@ -22,11 +23,34 @@ func (r *fixedRunner) Run(_ context.Context, _, remoteCmd string, _ []byte) (str
 	return r.reply, nil
 }
 
-// TestEngineSyncDrivesConvergePass proves the Engine wires the cookie Driver, the ssh
+// recordingFetcher serves a canned peer registry and records each peer it read, so a
+// test asserts the converge pass pulled the peer. It has NO write method — the structural
+// loop guard: a fetcher cannot mutate a peer.
+type recordingFetcher struct {
+	reg   cregistry.Registry[state.EndpointMeta]
+	peers []string
+}
+
+func (f *recordingFetcher) Fetch(_ context.Context, peer string) (cregistry.Registry[state.EndpointMeta], error) {
+	f.peers = append(f.peers, peer)
+	return f.reg, nil
+}
+
+// withFetcher swaps the package fetcher seam for the duration of a test, restoring it on
+// cleanup, so a converge pass reads a fake peer registry instead of spawning ssh.
+func withFetcher(t *testing.T, f converge.Fetcher[state.EndpointMeta]) {
+	t.Helper()
+	prev := newFetcher
+	newFetcher = func() converge.Fetcher[state.EndpointMeta] { return f }
+	t.Cleanup(func() { newFetcher = prev })
+}
+
+// TestEngineSyncDrivesConvergePass proves the Engine wires the cookie Driver, the typed
 // peer-registry Fetcher, the state flock, and the peer mesh into synckit's pull-only
 // converge.Reconcile: a Sync merges the peer's advertised registry, persists it, reports
-// the remote endpoint skipped-remote, and only ever READS the peer (the loop guard).
-// The local store is never touched because this host tracks only a remote endpoint.
+// the remote endpoint skipped-remote, and only ever READS the peer (the structural loop
+// guard — the fetcher has no write method). The local store is never touched because this
+// host tracks only a remote endpoint, so the value-union runner issues no commands.
 func TestEngineSyncDrivesConvergePass(t *testing.T) {
 	ctx := context.Background()
 	store := newStore(t)
@@ -45,16 +69,14 @@ func TestEngineSyncDrivesConvergePass(t *testing.T) {
 		t.Fatalf("AddBrowser: %v", err)
 	}
 
-	// The peer advertises a second endpoint via its registry read, which the merge
+	// The peer advertises a second endpoint via its typed svc.get_state, which the merge
 	// learns and persists locally.
 	peerExtra := state.Endpoint{Host: peerHost, Browser: "arc", Profile: "Work"}
 	peerReg := cregistry.New[state.EndpointMeta]()
 	peerReg.Add(string(peerExtra.ID()), peerExtra.Meta(), 500)
-	body, err := MarshalRegistry(peerReg)
-	if err != nil {
-		t.Fatalf("MarshalRegistry: %v", err)
-	}
-	runner := &fixedRunner{reply: string(body)}
+	fetcher := &recordingFetcher{reg: peerReg}
+	withFetcher(t, fetcher)
+	runner := &fixedRunner{}
 
 	eng := New(store, warmCache{}, runner, NewDigestRecorder())
 	results, err := eng.Sync(ctx, "")
@@ -82,14 +104,14 @@ func TestEngineSyncDrivesConvergePass(t *testing.T) {
 		}
 	}
 
-	// The orchestration only ever read the peer registry — never a write command.
-	for _, cmd := range runner.calls {
-		if cmd != registryReadCmd {
-			t.Fatalf("orchestration issued non-read ssh command %q; loop guard violated", cmd)
-		}
+	// The peer registry was pulled exactly once, and the value-union runner issued no
+	// command at all — both endpoints are remote, so nothing extracts or applies here, and
+	// the fetcher (no write method) is the only peer contact.
+	if len(fetcher.peers) != 1 || fetcher.peers[0] != peerHost {
+		t.Fatalf("fetcher read peers %v, want [%s]", fetcher.peers, peerHost)
 	}
-	if len(runner.calls) == 0 {
-		t.Fatalf("expected the peer registry to be fetched")
+	if len(runner.calls) != 0 {
+		t.Fatalf("value-union runner issued commands %v for an all-remote pass; want none", runner.calls)
 	}
 }
 
@@ -104,7 +126,8 @@ func TestEngineReconcileRunsWithNoOrigin(t *testing.T) {
 		t.Fatalf("AddBrowser: %v", err)
 	}
 	rec := NewDigestRecorder()
-	eng := New(store, warmCache{}, &fixedRunner{reply: "{}"}, rec)
+	withFetcher(t, &recordingFetcher{reg: cregistry.New[state.EndpointMeta]()})
+	eng := New(store, warmCache{}, &fixedRunner{}, rec)
 
 	results, err := eng.Reconcile(ctx)
 	if err != nil {

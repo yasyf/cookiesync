@@ -3,7 +3,6 @@ package cli
 import (
 	"context"
 	"fmt"
-	"net"
 	"os"
 	"strings"
 	"time"
@@ -14,6 +13,8 @@ import (
 	"github.com/yasyf/cookiesync/internal/mesh"
 	"github.com/yasyf/cookiesync/internal/paths"
 	"github.com/yasyf/cookiesync/internal/state"
+	"github.com/yasyf/synckit/manifest"
+	"github.com/yasyf/synckit/syncservice"
 )
 
 // vaultName is the Secure-Enclave vault item the contract probe checks for; the helper
@@ -117,23 +118,25 @@ func checkHelper(ctx context.Context) check {
 	return check{label: "key helper", ok: true, detail: fmt.Sprintf("%s (Developer ID signed, key-helper contract supported)", binary)}
 }
 
-// checkSocket confirms the resident helper's RPC socket is bound and accepting — the
-// "is the helper running?" check. A dial that connects means the resident helper
-// (cookiesync helper-serve) is up.
+// checkSocket confirms the resident helper's RPC socket is bound AND speaks the typed
+// sync contract synckitd drives — the "is the helper up and serving svc.*?" check. It
+// dials the socket and round-trips svc.capabilities, the lightest typed call (no cookie
+// store read, no SE key), so a green line proves the contract is live end to end through
+// the same socket synckitd's rpc-serve bridge forwards to.
 func checkSocket(ctx context.Context) check {
 	sock, err := paths.SockPath()
 	if err != nil {
 		return check{label: "helper socket", detail: err.Error()}
 	}
-	var d net.Dialer
-	dialCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	probeCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
-	conn, err := d.DialContext(dialCtx, "unix", sock)
+	client := syncservice.NewClient(syncservice.Socket(sock))
+	defer func() { _ = client.Close() }()
+	caps, err := client.Capabilities(probeCtx)
 	if err != nil {
-		return check{label: "helper socket", detail: fmt.Sprintf("not reachable at %s; run 'synckitd install' to start the resident helper (cookiesync helper-serve)", sock)}
+		return check{label: "helper socket", detail: fmt.Sprintf("not serving the typed contract at %s; run 'synckitd install' to start the resident helper (cookiesync helper-serve): %v", sock, err)}
 	}
-	_ = conn.Close()
-	return check{label: "helper socket", ok: true, detail: sock}
+	return check{label: "helper socket", ok: true, detail: fmt.Sprintf("%s (svc protocol v%d)", sock, caps.ProtocolVersion)}
 }
 
 // checkMesh confirms this host has joined the synckit host mesh — that the shared
@@ -147,8 +150,11 @@ func checkMesh(ctx context.Context) check {
 	return check{label: "mesh", ok: true, detail: fmt.Sprintf("self %s", self)}
 }
 
-// checkManifest confirms cookiesync's synckit manifest is registered, so synckitd
-// discovers and drives it. A missing manifest means 'cookiesync install' never ran.
+// checkManifest confirms cookiesync's synckit manifest is registered AND validates
+// against the current schema — the typed service block synckitd drives, not the old
+// action templates — so a stale manifest from a prior install is caught. A missing
+// manifest means 'cookiesync install' never ran; a manifest that no longer validates
+// means 're-run cookiesync install'. manifest.Load both decodes and validates.
 func checkManifest(_ context.Context) check {
 	path, err := manifestPath()
 	if err != nil {
@@ -156,6 +162,13 @@ func checkManifest(_ context.Context) check {
 	}
 	if info, statErr := os.Stat(path); statErr != nil || info.IsDir() {
 		return check{label: "manifest", detail: fmt.Sprintf("not registered at %s; run 'cookiesync install'", path)}
+	}
+	m, err := manifest.Load(path)
+	if err != nil {
+		return check{label: "manifest", detail: fmt.Sprintf("registered at %s but does not validate (stale schema); re-run 'cookiesync install': %v", path, err)}
+	}
+	if m.Service.Transport != "socket" {
+		return check{label: "manifest", detail: fmt.Sprintf("service transport = %q at %s, want socket; re-run 'cookiesync install'", m.Service.Transport, path)}
 	}
 	return check{label: "manifest", ok: true, detail: path}
 }

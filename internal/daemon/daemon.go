@@ -39,6 +39,7 @@ import (
 	"github.com/yasyf/cookiesync/internal/paths"
 	"github.com/yasyf/cookiesync/internal/state"
 	synckit "github.com/yasyf/synckit/rpc"
+	"github.com/yasyf/synckit/syncservice"
 )
 
 // consentReason is the default Touch ID prompt reason for a prime_auth with no
@@ -80,12 +81,13 @@ type StateLoader interface {
 // gate, the Enclave-backed cache, the sync engine, the ioreg session probe, and the
 // ssh runner.
 type Daemon struct {
-	consent cookie.Consent
-	cache   Cache
-	engine  *engine.Engine
-	probe   Probe
-	runner  engine.SSHRunner
-	state   StateLoader
+	consent  cookie.Consent
+	cache    Cache
+	engine   *engine.Engine
+	probe    Probe
+	runner   engine.SSHRunner
+	state    StateLoader
+	registry RegistryLoader
 
 	// newNonce mints a fresh routed-consent nonce. It is a field so a test can pin
 	// the nonce and assert the echo binding; production uses the crypto/rand source.
@@ -116,7 +118,7 @@ func Build(ctx context.Context) (*Daemon, func(context.Context) error, error) {
 	// re-derived by `cookiesync list --json`, which synckitd shells.
 	eng := engine.New(store, keyCache, runner, engine.NewDigestRecorder())
 
-	d := New(cookie.TouchIDConsent{}, keyCache, eng, ProbeSession, runner, store)
+	d := New(cookie.TouchIDConsent{}, keyCache, eng, ProbeSession, runner, store, store)
 
 	closer := func(ctx context.Context) error {
 		keyCache.EvictAll()
@@ -127,7 +129,7 @@ func Build(ctx context.Context) (*Daemon, func(context.Context) error, error) {
 
 // New builds a daemon over injected collaborators, for tests and for Build. The nonce
 // source defaults to crypto/rand; override the field after construction to pin it.
-func New(consent cookie.Consent, c Cache, eng *engine.Engine, probe Probe, runner engine.SSHRunner, st StateLoader) *Daemon {
+func New(consent cookie.Consent, c Cache, eng *engine.Engine, probe Probe, runner engine.SSHRunner, st StateLoader, reg RegistryLoader) *Daemon {
 	return &Daemon{
 		consent:  consent,
 		cache:    c,
@@ -135,6 +137,7 @@ func New(consent cookie.Consent, c Cache, eng *engine.Engine, probe Probe, runne
 		probe:    probe,
 		runner:   runner,
 		state:    st,
+		registry: reg,
 		newNonce: newNonce,
 	}
 }
@@ -144,6 +147,14 @@ func New(consent cookie.Consent, c Cache, eng *engine.Engine, probe Probe, runne
 // shared cache or the cross-process state flock.
 func (d *Daemon) Dispatcher() *synckit.Dispatcher {
 	dispatcher := synckit.NewDispatcher()
+	// The typed sync contract synckitd drives: svc.capabilities/list/reconcile/sync/
+	// get_state, served IN this warm-key resident helper so a cross-host svc.sync reuses
+	// the already-primed Secure-Enclave key rather than re-priming in a fresh subprocess.
+	syncservice.RegisterConsumer(dispatcher, newSyncConsumer(d.engine, d.state, d.registry))
+	// The bare fleet/local methods: extract/apply (the cookie value-union pull/push the
+	// peer SSHBackend drives), whoami, prime_auth, get_cookies, auth_status,
+	// request_consent. sync and reconcile stay too — the `cookiesync rpc sync|reconcile`
+	// fleet CLI still reaches them.
 	dispatcher.Register("sync", d.handleSync)
 	dispatcher.Register("reconcile", d.handleReconcile)
 	dispatcher.Register("extract", d.handleExtract)

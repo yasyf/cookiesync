@@ -56,7 +56,7 @@ func TestHandleWhoamiWireShape(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			d := New(&fakeConsent{}, newFakeCache(), nil, staticProbe(tc.snap), &recordingRunner{}, fixedState{})
+			d := New(&fakeConsent{}, newFakeCache(), nil, staticProbe(tc.snap), &recordingRunner{}, fixedState{}, fixedState{})
 			got, err := d.handleWhoami(context.Background(), map[string]any{})
 			if err != nil {
 				t.Fatalf("handleWhoami: %v", err)
@@ -75,7 +75,7 @@ func TestHandleAuthStatusWireShape(t *testing.T) {
 	cache := newFakeCache()
 	st := stateWith("me@laptop", "")
 	fakeMesh(t, "me@laptop")
-	d := New(&fakeConsent{}, cache, nil, staticProbe(SessionSnapshot{}), &recordingRunner{}, fixedState{st: st})
+	d := New(&fakeConsent{}, cache, nil, staticProbe(SessionSnapshot{}), &recordingRunner{}, fixedState{st: st}, fixedState{st: st})
 	id := endpointID("me@laptop", "chrome", "Default")
 
 	cold, err := d.handleAuthStatus(context.Background(), map[string]any{"browser": "chrome"})
@@ -105,7 +105,7 @@ func TestHandlePrimeAuthLiveSession(t *testing.T) {
 	cache := newFakeCache()
 	st := stateWith("me@laptop", "")
 	fakeMesh(t, "me@laptop")
-	d := New(consent, cache, nil, staticProbe(liveSession(me)), &recordingRunner{}, fixedState{st: st})
+	d := New(consent, cache, nil, staticProbe(liveSession(me)), &recordingRunner{}, fixedState{st: st}, fixedState{st: st})
 
 	got, err := d.handlePrimeAuth(context.Background(), map[string]any{"browser": "chrome", "reason": "post a tweet"})
 	if err != nil {
@@ -132,7 +132,7 @@ func TestHandlePrimeAuthDefaultReason(t *testing.T) {
 	me := currentUser(t)
 	consent := &fakeConsent{key: cookie.DeriveKey(cookie.SafeStorageKey("peanuts"))}
 	fakeMesh(t, "me@laptop")
-	d := New(consent, newFakeCache(), nil, staticProbe(liveSession(me)), &recordingRunner{}, fixedState{st: stateWith("me@laptop", "")})
+	d := New(consent, newFakeCache(), nil, staticProbe(liveSession(me)), &recordingRunner{}, fixedState{st: stateWith("me@laptop", "")}, fixedState{st: stateWith("me@laptop", "")})
 
 	if _, err := d.handlePrimeAuth(context.Background(), map[string]any{"browser": "chrome"}); err != nil {
 		t.Fatalf("handlePrimeAuth: %v", err)
@@ -146,7 +146,7 @@ func TestHandlePrimeAuthDefaultReason(t *testing.T) {
 // AuthRequired when no key is cached, rather than prompting or returning an empty set.
 func TestHandleGetCookiesColdCacheFailsClosed(t *testing.T) {
 	fakeMesh(t, "me@laptop")
-	d := New(&fakeConsent{}, newFakeCache(), nil, staticProbe(SessionSnapshot{}), &recordingRunner{}, fixedState{st: stateWith("me@laptop", "")})
+	d := New(&fakeConsent{}, newFakeCache(), nil, staticProbe(SessionSnapshot{}), &recordingRunner{}, fixedState{st: stateWith("me@laptop", "")}, fixedState{st: stateWith("me@laptop", "")})
 
 	_, err := d.handleGetCookies(context.Background(), map[string]any{"browser": "chrome", "url": "https://x.com"})
 	var authErr *AuthRequired

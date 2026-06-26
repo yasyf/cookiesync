@@ -95,13 +95,22 @@ func (c *fakeCache) Put(_ context.Context, id string, key []byte, _ time.Duratio
 	return nil
 }
 
-// fixedState is a StateLoader returning a fixed snapshot.
+// fixedState is a StateLoader and RegistryLoader returning a fixed snapshot. Its
+// LoadRegistry returns the snapshot's browsers registry (empty when unset), enough for
+// the svc.get_state routing the dispatcher tests exercise.
 type fixedState struct {
 	st *state.State
 }
 
 func (s fixedState) Load(_ context.Context) (*state.State, error) {
 	return s.st, nil
+}
+
+func (s fixedState) LoadRegistry(_ context.Context) (cregistry.Registry[state.EndpointMeta], error) {
+	if s.st == nil {
+		return cregistry.New[state.EndpointMeta](), nil
+	}
+	return s.st.Browsers, nil
 }
 
 // recordingRunner serves a canned ssh reply, matched first by target (perTarget),

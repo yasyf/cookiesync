@@ -8,6 +8,7 @@ import (
 	"github.com/yasyf/cookiesync/internal/cookie"
 	"github.com/yasyf/cookiesync/internal/state"
 	"github.com/yasyf/synckit/cregistry"
+	"github.com/yasyf/synckit/syncservice"
 )
 
 // recordingRunner captures each ssh call and returns a canned stdout, so the backend's
@@ -99,8 +100,26 @@ func TestSSHBackendApplyPipesWireArray(t *testing.T) {
 	}
 }
 
-// TestSSHFetcherRoundTrip proves the fetcher parses the registry JSON the peer
-// registry-read command emits back into a convergent registry.
+// fakeStateGetter serves a canned svc.get_state reply and records its Close, so the
+// fetcher's parse and its Close-on-defer contract are asserted without spawning ssh. It
+// has NO write method — that absence is the structural loop guard: the fetcher cannot
+// mutate the peer because its only collaborator exposes a read and a close.
+type fakeStateGetter struct {
+	raw    syncservice.RawRegistry
+	closed bool
+}
+
+func (g *fakeStateGetter) GetState(context.Context) (syncservice.RawRegistry, error) {
+	return g.raw, nil
+}
+
+func (g *fakeStateGetter) Close() error {
+	g.closed = true
+	return nil
+}
+
+// TestSSHFetcherRoundTrip proves the fetcher parses the registry JSON svc.get_state
+// emits back into a convergent registry, and closes the client when done.
 func TestSSHFetcherRoundTrip(t *testing.T) {
 	reg := cregistry.New[state.EndpointMeta]()
 	ep := state.Endpoint{Host: "you@desktop", Browser: "chrome", Profile: "Default"}
@@ -110,8 +129,8 @@ func TestSSHFetcherRoundTrip(t *testing.T) {
 		t.Fatalf("MarshalRegistry: %v", err)
 	}
 
-	runner := &recordingRunner{reply: string(body)}
-	fetcher := NewSSHFetcher(runner)
+	getter := &fakeStateGetter{raw: syncservice.RawRegistry(body)}
+	fetcher := newSSHFetcher(func(string) stateGetter { return getter })
 	got, err := fetcher.Fetch(context.Background(), "you@desktop")
 	if err != nil {
 		t.Fatalf("Fetch: %v", err)
@@ -120,11 +139,7 @@ func TestSSHFetcherRoundTrip(t *testing.T) {
 	if !ok || entry.Value != ep.Meta() {
 		t.Fatalf("fetched registry = %+v, want endpoint %s", got, ep.ID())
 	}
-	// The fetcher only ever issued the read command — never a write.
-	if runner.calls[0].cmd != registryReadCmd {
-		t.Fatalf("fetcher ran %q, want the read-only %q", runner.calls[0].cmd, registryReadCmd)
-	}
-	if runner.calls[0].stdin != nil {
-		t.Fatalf("registry read must not pipe stdin")
+	if !getter.closed {
+		t.Fatalf("fetcher did not close the typed client")
 	}
 }

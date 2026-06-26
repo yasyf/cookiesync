@@ -20,7 +20,7 @@ func TestDispatcherRoutesEveryMethod(t *testing.T) {
 	me := currentUser(t)
 	consent := &fakeConsent{}
 	st := stateWith("me@laptop", "")
-	d := New(consent, newFakeCache(), nil, staticProbe(liveSession(me)), &recordingRunner{}, fixedState{st: st})
+	d := New(consent, newFakeCache(), nil, staticProbe(liveSession(me)), &recordingRunner{}, fixedState{st: st}, fixedState{st: st})
 	dispatcher := d.Dispatcher()
 
 	// Every frozen method must route to a handler. Some reach the nil engine, the
@@ -30,6 +30,8 @@ func TestDispatcherRoutesEveryMethod(t *testing.T) {
 	methods := []string{
 		"whoami", "auth_status", "request_consent",
 		"extract", "apply", "sync", "reconcile", "prime_auth", "get_cookies",
+		// The typed sync contract synckitd drives over the resident socket.
+		"svc.capabilities", "svc.list", "svc.reconcile", "svc.sync", "svc.get_state",
 	}
 	for _, method := range methods {
 		t.Run(method, func(t *testing.T) {

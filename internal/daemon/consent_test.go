@@ -49,7 +49,7 @@ func TestRoutedReleaseApprovedReleasesUnpromptedKey(t *testing.T) {
 		byMethod: map[string]string{"request_consent": approvedReply(t, nonce, endpoint)},
 	}
 	st := stateWith(self, "", stateEndpoint(peer, "chrome", "Default"))
-	d := New(consent, newFakeCache(), nil, staticProbe(SessionSnapshot{}), runner, fixedState{st: st})
+	d := New(consent, newFakeCache(), nil, staticProbe(SessionSnapshot{}), runner, fixedState{st: st}, fixedState{st: st})
 	pinnedNonce(d, nonce)
 
 	browser, err := cookie.Lookup("chrome")
@@ -93,7 +93,7 @@ func TestRoutedReleaseNonceMismatchIsAuthRequired(t *testing.T) {
 		byMethod: map[string]string{"request_consent": approvedReply(t, "WRONG-nonce", endpoint)},
 	}
 	st := stateWith(self, "", stateEndpoint(peer, "chrome", "Default"))
-	d := New(consent, newFakeCache(), nil, staticProbe(SessionSnapshot{}), runner, fixedState{st: st})
+	d := New(consent, newFakeCache(), nil, staticProbe(SessionSnapshot{}), runner, fixedState{st: st}, fixedState{st: st})
 	pinnedNonce(d, "the-real-nonce")
 
 	browser, _ := cookie.Lookup("chrome")
@@ -122,7 +122,7 @@ func TestRoutedReleaseEndpointMismatchIsAuthRequired(t *testing.T) {
 		byMethod: map[string]string{"request_consent": approvedReply(t, nonce, "someone-else@host:chrome:Default")},
 	}
 	st := stateWith(self, "", stateEndpoint(peer, "chrome", "Default"))
-	d := New(consent, newFakeCache(), nil, staticProbe(SessionSnapshot{}), runner, fixedState{st: st})
+	d := New(consent, newFakeCache(), nil, staticProbe(SessionSnapshot{}), runner, fixedState{st: st}, fixedState{st: st})
 	pinnedNonce(d, nonce)
 
 	browser, _ := cookie.Lookup("chrome")
@@ -146,7 +146,7 @@ func TestActivePeerRouteToShortCircuits(t *testing.T) {
 	fakeMesh(t, self, routed, other)
 	runner := &recordingRunner{replies: map[string]string{"cookiesync rpc whoami": liveWhoami}}
 	st := stateWith(self, routed, stateEndpoint(routed, "chrome", "Default"), stateEndpoint(other, "chrome", "Default"))
-	d := New(&fakeConsent{}, newFakeCache(), nil, staticProbe(SessionSnapshot{}), runner, fixedState{st: st})
+	d := New(&fakeConsent{}, newFakeCache(), nil, staticProbe(SessionSnapshot{}), runner, fixedState{st: st}, fixedState{st: st})
 
 	peer, err := d.activePeer(context.Background(), st)
 	if err != nil {
@@ -178,7 +178,7 @@ func TestActivePeerRouteToOfflineFallsBackToScan(t *testing.T) {
 	runner.replies = map[string]string{}
 	runner.perTarget = map[string]string{routed: deadWhoami, live: liveWhoami}
 	st := stateWith(self, routed, stateEndpoint(routed, "chrome", "Default"), stateEndpoint(live, "chrome", "Default"))
-	d := New(&fakeConsent{}, newFakeCache(), nil, staticProbe(SessionSnapshot{}), runner, fixedState{st: st})
+	d := New(&fakeConsent{}, newFakeCache(), nil, staticProbe(SessionSnapshot{}), runner, fixedState{st: st}, fixedState{st: st})
 
 	peer, err := d.activePeer(context.Background(), st)
 	if err != nil {
@@ -198,7 +198,7 @@ func TestActivePeerNoLiveSessionIsAuthRequired(t *testing.T) {
 	fakeMesh(t, self, peer)
 	runner := &recordingRunner{replies: map[string]string{"cookiesync rpc whoami": deadWhoami}}
 	st := stateWith(self, "", stateEndpoint(peer, "chrome", "Default"))
-	d := New(&fakeConsent{}, newFakeCache(), nil, staticProbe(SessionSnapshot{}), runner, fixedState{st: st})
+	d := New(&fakeConsent{}, newFakeCache(), nil, staticProbe(SessionSnapshot{}), runner, fixedState{st: st}, fixedState{st: st})
 
 	_, err := d.activePeer(context.Background(), st)
 	var authErr *AuthRequired
@@ -212,7 +212,7 @@ func TestActivePeerNoLiveSessionIsAuthRequired(t *testing.T) {
 // touches the consent gate.
 func TestHandleRequestConsentUnavailableWithoutSession(t *testing.T) {
 	consent := &fakeConsent{}
-	d := New(consent, newFakeCache(), nil, staticProbe(SessionSnapshot{OnConsole: false}), &recordingRunner{}, fixedState{})
+	d := New(consent, newFakeCache(), nil, staticProbe(SessionSnapshot{OnConsole: false}), &recordingRunner{}, fixedState{}, fixedState{})
 
 	got, err := d.handleRequestConsent(context.Background(), map[string]any{
 		"browser": "chrome", "nonce": "n", "endpoint": "e",
@@ -233,7 +233,7 @@ func TestHandleRequestConsentUnavailableWithoutSession(t *testing.T) {
 func TestHandleRequestConsentDeniedOnDecline(t *testing.T) {
 	me := currentUser(t)
 	consent := &fakeConsent{obtainErr: &cookie.ConsentError{Msg: "Touch ID authentication was cancelled or denied"}}
-	d := New(consent, newFakeCache(), nil, staticProbe(liveSession(me)), &recordingRunner{}, fixedState{})
+	d := New(consent, newFakeCache(), nil, staticProbe(liveSession(me)), &recordingRunner{}, fixedState{}, fixedState{})
 
 	got, err := d.handleRequestConsent(context.Background(), map[string]any{
 		"browser": "chrome", "nonce": "n", "endpoint": "e",
@@ -251,7 +251,7 @@ func TestHandleRequestConsentDeniedOnDecline(t *testing.T) {
 func TestHandleRequestConsentApprovedEchoesExactly(t *testing.T) {
 	me := currentUser(t)
 	consent := &fakeConsent{key: cookie.DeriveKey(cookie.SafeStorageKey("peanuts"))}
-	d := New(consent, newFakeCache(), nil, staticProbe(liveSession(me)), &recordingRunner{}, fixedState{})
+	d := New(consent, newFakeCache(), nil, staticProbe(liveSession(me)), &recordingRunner{}, fixedState{}, fixedState{})
 
 	nonce := "nonce-xyz-123"
 	endpoint := "them@host:chrome:Work"

@@ -10,6 +10,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/yasyf/cookiesync/internal/paths"
 	"github.com/yasyf/synckit/manifest"
 )
 
@@ -114,28 +115,26 @@ func TestInstallWritesManifest(t *testing.T) {
 	if m.Name != "cookiesync" || m.Binary != "cookiesync" {
 		t.Fatalf("manifest name/binary = %q/%q, want cookiesync/cookiesync", m.Name, m.Binary)
 	}
-	if m.Watch.Backend != "fsnotify" || m.Watch.ListCmd != "list --json" {
-		t.Fatalf("manifest watch = %+v, want fsnotify + 'list --json'", m.Watch)
+	if m.Watch.Backend != "fsnotify" {
+		t.Fatalf("manifest watch backend = %q, want fsnotify", m.Watch.Backend)
 	}
-	if m.Actions.Sync != "sync --origin {{.Origin}}" {
-		t.Fatalf("manifest sync = %q, want 'sync --origin {{.Origin}}'", m.Actions.Sync)
+	// The typed service block: synckitd starts `cookiesync rpc-serve` and bridges the
+	// svc.* contract to the resident socket, dialing the socket directly.
+	if m.Service.Transport != "socket" {
+		t.Fatalf("manifest service transport = %q, want socket", m.Service.Transport)
 	}
-	if m.Actions.Reconcile != "reconcile" || m.Actions.Fetch != "state get-json" || m.Actions.Apply != "state apply-json" {
-		t.Fatalf("manifest actions = %+v, want reconcile/state get-json/state apply-json", m.Actions)
+	if len(m.Service.ServeArgs) != 1 || m.Service.ServeArgs[0] != "rpc-serve" {
+		t.Fatalf("manifest service serve_args = %v, want [rpc-serve]", m.Service.ServeArgs)
+	}
+	sock, err := paths.SockPath()
+	if err != nil {
+		t.Fatalf("SockPath: %v", err)
+	}
+	if m.Service.Sock != sock {
+		t.Fatalf("manifest service sock = %q, want %q (the resident socket)", m.Service.Sock, sock)
 	}
 	if m.Helper == nil || m.Helper.Command != "helper-serve" {
 		t.Fatalf("manifest helper = %+v, want command helper-serve", m.Helper)
-	}
-
-	// The rendered sync action argv-splits and templates the origin (the notifier's own
-	// target), never building a shell string — the contract synckitd renders when it
-	// notifies a peer (ActionVars.Origin = the notifying host's self).
-	argv, err := manifest.Render(m.Actions.Sync, manifest.ActionVars{Origin: "you@desktop"})
-	if err != nil {
-		t.Fatalf("render sync action: %v", err)
-	}
-	if len(argv) != 3 || argv[0] != "sync" || argv[1] != "--origin" || argv[2] != "you@desktop" {
-		t.Fatalf("rendered sync argv = %v, want [sync --origin you@desktop]", argv)
 	}
 }
 

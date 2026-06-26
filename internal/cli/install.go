@@ -10,9 +10,11 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/yasyf/cookiesync/internal/daemon"
+	"github.com/yasyf/cookiesync/internal/paths"
 	"github.com/yasyf/synckit/codec"
 	"github.com/yasyf/synckit/hostregistry"
 	"github.com/yasyf/synckit/manifest"
+	"github.com/yasyf/synckit/rpc"
 )
 
 // watchDebounce is the settle window synckitd holds a local store's write burst for
@@ -32,6 +34,29 @@ func newHelperServeCmd() *cobra.Command {
 	return cmd
 }
 
+// newRPCServeCmd builds the stdin/stdout bridge synckitd starts as cookiesync's typed
+// sync service: it forwards each rpc frame on stdin to the resident helper's unix socket
+// and writes the response frame back on stdout, byte-exact (it never decodes the payload,
+// so a get_state response's int64 CRDT stamps survive). It is NOT a fresh daemon — it
+// never primes a Secure-Enclave key nor prompts Touch ID; it bridges to the warm resident
+// helper, so a cross-host svc.sync/svc.get_state reuses that peer's already-primed key.
+// stdout is the framing channel, so nothing may log there on this path.
+func newRPCServeCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "rpc-serve",
+		Short: "Bridge typed sync RPC frames from stdin/stdout to the resident helper's socket (used by synckitd).",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			sock, err := paths.SockPath()
+			if err != nil {
+				return err
+			}
+			return rpc.Proxy(cmd.Context(), os.Stdin, os.Stdout, sock)
+		},
+	}
+	return cmd
+}
+
 func newInstallCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "install",
@@ -42,12 +67,16 @@ func newInstallCmd() *cobra.Command {
 	return cmd
 }
 
-// cookiesyncManifest is the synckit manifest synckitd reads to drive cookiesync: how to
-// list watch items, how to converge, and the resident helper to keep alive. The action
-// templates are argv-only — synckitd prepends the cookiesync binary and renders the
-// template vars (the notifying host's own target into {{.Origin}}, so the notified peer
-// skips it in the union and the converge is never echoed straight back).
-func cookiesyncManifest() manifest.Manifest {
+// cookiesyncManifest is the synckit manifest synckitd reads to drive cookiesync: the
+// watch backend that fingerprints local stores, the typed service block synckitd drives
+// reconcile/sync/state over (the rpc-serve bridge to the resident socket), and the
+// resident helper to keep alive. synckitd dials the service socket directly and speaks
+// the typed svc.* contract — no shell, no argv templating.
+func cookiesyncManifest() (manifest.Manifest, error) {
+	sock, err := paths.SockPath()
+	if err != nil {
+		return manifest.Manifest{}, err
+	}
 	return manifest.Manifest{
 		Name:   "cookiesync",
 		Binary: "cookiesync",
@@ -55,13 +84,11 @@ func cookiesyncManifest() manifest.Manifest {
 		Watch: manifest.WatchSpec{
 			Backend:  "fsnotify",
 			Debounce: codec.Duration(watchDebounce),
-			ListCmd:  "list --json",
 		},
-		Actions: manifest.ActionSpec{
-			Reconcile: "reconcile",
-			Sync:      "sync --origin {{.Origin}}",
-			Fetch:     "state get-json",
-			Apply:     "state apply-json",
+		Service: manifest.ServiceSpec{
+			Transport: "socket",
+			ServeArgs: []string{"rpc-serve"},
+			Sock:      sock,
 		},
 		Launchd: &manifest.LaunchdSpec{SessionType: "Aqua"},
 		Helper: &manifest.HelperSpec{
@@ -69,7 +96,7 @@ func cookiesyncManifest() manifest.Manifest {
 			SessionType: "Aqua",
 			Label:       "helper",
 		},
-	}
+	}, nil
 }
 
 // manifestPath is the file synckitd discovers cookiesync's manifest at,
@@ -89,7 +116,11 @@ func manifestPath() (string, error) {
 // driven by synckitd, which the user installs separately.
 func runInstall(cmd *cobra.Command, _ []string) error {
 	noteHelper(cmd)
-	if err := writeManifest(cookiesyncManifest()); err != nil {
+	m, err := cookiesyncManifest()
+	if err != nil {
+		return err
+	}
+	if err := writeManifest(m); err != nil {
 		return err
 	}
 	path, err := manifestPath()

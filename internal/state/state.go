@@ -134,29 +134,6 @@ func (s *Store) SaveRegistry(ctx context.Context, reg cregistry.Registry[Endpoin
 	})
 }
 
-// MergeRegistry lattice-joins incoming into the local browsers registry and persists
-// the result, under the shared flock and through the foreign-key-preserving writer, so
-// the merge is never destructive: a local-only endpoint survives, a peer-only endpoint
-// is admitted, a tombstone wins by stamp, and every other cookiesync and host-registry
-// key in state.json is preserved byte-for-byte. The whole load-merge-save runs inside
-// one locked read-modify-write so a concurrent writer cannot lose an update. It returns
-// the merged registry so the caller can report the present count.
-func (s *Store) MergeRegistry(ctx context.Context, incoming cregistry.Registry[EndpointMeta]) (cregistry.Registry[EndpointMeta], error) {
-	var merged cregistry.Registry[EndpointMeta]
-	err := s.cfg.UpdateRaw(ctx, func(raw map[string]json.RawMessage) error {
-		local, err := browsersFromRaw(raw)
-		if err != nil {
-			return err
-		}
-		merged = cregistry.Merge(local, incoming)
-		return putBrowsers(raw, merged)
-	})
-	if err != nil {
-		return nil, err
-	}
-	return merged, nil
-}
-
 // AddBrowser admits endpoint into the convergent registry, stamping the add at the
 // store's clock so the mutation propagates and wins over an older view, then sets
 // self_target. A re-add of a previously removed endpoint is admitted because the new
