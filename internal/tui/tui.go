@@ -14,10 +14,11 @@ import (
 // canceled. It mounts the Browsers content screen and lets the shared synckit TUI
 // append the Hosts tab. A ctx-driven teardown (ctrl-c, SIGTERM) is a clean exit.
 func Run(ctx context.Context, version string) error {
+	runner := hostregistry.NewExecRunner()
 	return stui.Run(ctx, stui.Options{
 		Brand:   "cookiesync",
 		Version: version,
-		Screens: []stui.Screen{newBrowsersModel()},
-		Runner:  hostregistry.NewExecRunner(),
+		Screens: []stui.Screen{newBrowsersModel(runner)},
+		Runner:  runner,
 	})
 }

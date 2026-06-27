@@ -6,6 +6,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.2] - 2026-06-27
+
+### Added
+- `cookiesync browser profiles <browser> [--json]` — list a browser's on-disk profiles (dir, display
+  name, account email) on the host it runs on.
+
+### Fixed
+- The TUI's browser-add flow now lists the *selected host's* profiles. When the host is a peer it
+  enumerates that host's profiles over ssh (`cookiesync browser profiles --json`, bounded timeout)
+  instead of showing the local machine's. The tracked endpoint still stores the on-disk profile
+  directory.
+- The Hosts tab seeds the registered mesh instantly and revalidates in place (via synckit v0.4.2).
+
 ## [0.6.1] - 2026-06-27
 
 ### Fixed
@@ -59,7 +72,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `synckitd install` now owns the agents. The host mesh is read from the shared
   `~/.config/synckit`.
 
-[Unreleased]: https://github.com/yasyf/cookiesync/compare/v0.6.1...HEAD
+[Unreleased]: https://github.com/yasyf/cookiesync/compare/v0.6.2...HEAD
+[0.6.2]: https://github.com/yasyf/cookiesync/releases/tag/v0.6.2
 [0.6.1]: https://github.com/yasyf/cookiesync/releases/tag/v0.6.1
 [0.6.0]: https://github.com/yasyf/cookiesync/releases/tag/v0.6.0
 [0.5.0]: https://github.com/yasyf/cookiesync/releases/tag/v0.5.0

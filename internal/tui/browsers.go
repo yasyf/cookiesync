@@ -2,9 +2,11 @@ package tui
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"sort"
+	"time"
 
 	"github.com/charmbracelet/bubbles/key"
 	"github.com/charmbracelet/bubbles/list"
@@ -16,8 +18,13 @@ import (
 	"github.com/yasyf/cookiesync/internal/mesh"
 	"github.com/yasyf/cookiesync/internal/paths"
 	"github.com/yasyf/cookiesync/internal/state"
+	"github.com/yasyf/synckit/hostregistry"
 	stui "github.com/yasyf/synckit/tui"
 )
+
+// remoteProfilesTimeout bounds the ssh enumeration of a peer's profiles so a dead
+// or slow host surfaces an error in the picker instead of hanging the add flow.
+const remoteProfilesTimeout = 15 * time.Second
 
 // pickStep is which stage of the staged add picker is open, or pickNone when the
 // screen is showing its endpoint list.
@@ -41,12 +48,16 @@ type confirmState struct {
 }
 
 // pickState accumulates the staged add picker's choices as the user descends
-// host → browser → profile.
+// host → browser → profile. When the chosen host is a remote peer, the profile
+// step enumerates over ssh: loading is set while that call is in flight and
+// loadErr holds an ssh or parse failure to surface in the picker.
 type pickState struct {
 	step    pickStep
 	list    list.Model
 	host    string
 	browser string
+	loading bool
+	loadErr error
 }
 
 type browsersModel struct {
@@ -61,6 +72,7 @@ type browsersModel struct {
 	confirm  *confirmState
 	status   string
 	keys     browsersKeyMap
+	runner   hostregistry.Runner
 
 	mdListW      int
 	mdDetailW    int
@@ -68,7 +80,10 @@ type browsersModel struct {
 	mdShowDetail bool
 }
 
-func newBrowsersModel() *browsersModel {
+// newBrowsersModel builds the Browsers screen. runner enumerates a remote peer's
+// profiles over ssh during the add flow; the local path never touches it. Tests
+// inject a fake runner.
+func newBrowsersModel(runner hostregistry.Runner) *browsersModel {
 	sp := spinner.New(spinner.WithSpinner(spinner.Dot))
 	l := list.New(nil, browserDelegate{}, 0, 0)
 	l.SetShowTitle(false)
@@ -76,7 +91,7 @@ func newBrowsersModel() *browsersModel {
 	l.SetShowHelp(false)
 	l.SetFilteringEnabled(false)
 	l.DisableQuitKeybindings()
-	return &browsersModel{list: l, filter: stui.NewFilterBar(), loading: true, spin: sp, keys: newBrowsersKeyMap()}
+	return &browsersModel{list: l, filter: stui.NewFilterBar(), loading: true, spin: sp, keys: newBrowsersKeyMap(), runner: runner}
 }
 
 func (m *browsersModel) Title() string { return "Browsers" }
@@ -135,9 +150,21 @@ func (m *browsersModel) Update(msg tea.Msg) (stui.Screen, tea.Cmd) {
 	case spinner.TickMsg:
 		var cmd tea.Cmd
 		m.spin, cmd = m.spin.Update(msg)
-		if m.loading {
+		if m.loading || (m.pick != nil && m.pick.loading) {
 			return m, cmd
 		}
+		return m, nil
+
+	case profilesLoadedMsg:
+		if m.pick == nil || m.pick.step != pickProfile {
+			return m, nil
+		}
+		m.pick.loading = false
+		if msg.err != nil {
+			m.pick.loadErr = msg.err
+			return m, nil
+		}
+		m.pick.list = newPickList(profileItems(msg.profiles), m.mdListW, m.mdHeight)
 		return m, nil
 
 	case tea.KeyMsg:
@@ -274,13 +301,19 @@ func (m *browsersModel) advancePick() (stui.Screen, tea.Cmd) {
 		return m, nil
 	case pickBrowser:
 		m.pick.browser = it.value
-		profiles, err := browserProfiles(it.value)
+		m.pick.step = pickProfile
+		if m.pick.host != m.self {
+			m.pick.loading = true
+			m.pick.loadErr = nil
+			m.pick.list = newPickList(nil, m.mdListW, m.mdHeight)
+			return m, tea.Batch(m.spin.Tick, remoteProfilesCmd(m.runner, m.pick.host, m.pick.browser))
+		}
+		profiles, err := browserProfiles(m.pick.browser)
 		if err != nil {
 			m.pick = nil
 			m.status = stui.StatusErr.Render(err.Error())
 			return m, nil
 		}
-		m.pick.step = pickProfile
 		m.pick.list = newPickList(profileItems(profiles), m.mdListW, m.mdHeight)
 		return m, nil
 	case pickProfile:
@@ -315,8 +348,10 @@ func (m *browsersModel) View() string {
 	return body
 }
 
-// pickView renders the active staged-picker step, or a guidance line when the
-// scan turned up no choices to make.
+// pickView renders the active staged-picker step. The profile step has three
+// transient states when it enumerates a peer over ssh — loading, an ssh or parse
+// error, and an empty result — each rendered with a guidance line in place of the
+// list.
 func (m *browsersModel) pickView() string {
 	var head, hint string
 	switch m.pick.step {
@@ -329,9 +364,17 @@ func (m *browsersModel) pickView() string {
 	case pickProfile:
 		head = "Add browser · pick a " + m.pick.browser + " profile"
 		hint = "enter to pick · esc to cancel"
+		if m.pick.loading {
+			line := m.spin.View() + " loading " + m.pick.browser + " profiles from " + m.pick.host + "…"
+			return lipgloss.JoinVertical(lipgloss.Left, stui.DetailTitle.Render(head), line, stui.Dim.Render("esc to cancel"))
+		}
+		if m.pick.loadErr != nil {
+			fail := stui.StatusErr.Render(m.pick.loadErr.Error())
+			return lipgloss.JoinVertical(lipgloss.Left, stui.DetailTitle.Render(head), fail, stui.Dim.Render("esc to cancel"))
+		}
 	}
 	if len(m.pick.list.Items()) == 0 {
-		empty := stui.Dim.Render("No " + m.pick.browser + " profiles with a cookie store found on this host.")
+		empty := stui.Dim.Render("No " + m.pick.browser + " profiles with a cookie store found on " + m.pick.host + ".")
 		return lipgloss.JoinVertical(lipgloss.Left, stui.DetailTitle.Render(head), empty, stui.Dim.Render("esc to cancel"))
 	}
 	box := stui.MasterDetail(m.pick.list.View(), "", m.mdListW, 0, m.mdHeight, false)
@@ -388,13 +431,41 @@ func browserNames() ([]string, error) {
 
 // browserProfiles scans the named browser's local data root for profiles that
 // hold a cookie store, enriched with display name and email, the choices the add
-// picker's profile step offers.
+// picker's profile step offers on the self host.
 func browserProfiles(name string) ([]cookie.Profile, error) {
 	browser, err := cookie.Lookup(cookie.BrowserName(name))
 	if err != nil {
 		return nil, err
 	}
 	return browser.Profiles()
+}
+
+// profilesLoadedMsg delivers the result of enumerating a peer's profiles over ssh
+// back to the profile step.
+type profilesLoadedMsg struct {
+	profiles []cookie.Profile
+	err      error
+}
+
+// remoteProfilesCmd enumerates a peer's profiles for one browser by running
+// `cookiesync browser profiles <browser> --json` on that host over ssh, then
+// parsing the JSON the CLI command emits. The remote command is a plain argv, safe
+// under the peer's login shell, and the same binary-on-PATH assumption synckit's
+// host verify makes. A bounded context fails a dead host instead of hanging.
+func remoteProfilesCmd(runner hostregistry.Runner, host, browser string) tea.Cmd {
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), remoteProfilesTimeout)
+		defer cancel()
+		out, err := runner.SSH(ctx, host, "cookiesync browser profiles "+browser+" --json")
+		if err != nil {
+			return profilesLoadedMsg{err: fmt.Errorf("enumerate %s profiles on %s: %w", browser, host, err)}
+		}
+		var profiles []cookie.Profile
+		if err := json.Unmarshal([]byte(out), &profiles); err != nil {
+			return profilesLoadedMsg{err: fmt.Errorf("parse %s profiles from %s: %w", browser, host, err)}
+		}
+		return profilesLoadedMsg{profiles: profiles}
+	}
 }
 
 // loadBrowsersCmd resolves the mesh and the tracked endpoints, stamping each with

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"text/tabwriter"
 
 	"github.com/spf13/cobra"
 
@@ -19,7 +20,7 @@ func newBrowserCmd() *cobra.Command {
 		Use:   "browser",
 		Short: "Track the browser profiles cookiesync syncs across hosts.",
 	}
-	cmd.AddCommand(newBrowserAddCmd(), newBrowserLsCmd(), newBrowserRmCmd())
+	cmd.AddCommand(newBrowserAddCmd(), newBrowserLsCmd(), newBrowserRmCmd(), newBrowserProfilesCmd())
 	return cmd
 }
 
@@ -62,6 +63,20 @@ func newBrowserRmCmd() *cobra.Command {
 		},
 	}
 	cmd.Flags().StringVar(&profile, "profile", "Default", "Profile directory name.")
+	return cmd
+}
+
+func newBrowserProfilesCmd() *cobra.Command {
+	var asJSON bool
+	cmd := &cobra.Command{
+		Use:   "profiles <browser>",
+		Short: "List this host's profiles for BROWSER that hold a cookie store.",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return runBrowserProfiles(cmd, args[0], asJSON)
+		},
+	}
+	cmd.Flags().BoolVar(&asJSON, "json", false, "Emit the profiles as JSON.")
 	return cmd
 }
 
@@ -133,6 +148,41 @@ func runBrowserRm(cmd *cobra.Command, host, browserName, profile string) error {
 	return nil
 }
 
+// runBrowserProfiles resolves the browser by id and lists this host's profiles
+// that hold a cookie store. Because it enumerates the local filesystem, running it
+// over ssh on a peer returns that peer's profiles — the remote-enumeration endpoint
+// the add picker drives. JSON emits the exported [{"Dir","Name","Email"}, ...]
+// array; text emits an aligned dir/name/email table.
+func runBrowserProfiles(cmd *cobra.Command, browserName string, asJSON bool) error {
+	browser, err := cookie.Lookup(cookie.BrowserName(browserName))
+	if err != nil {
+		known, kerr := knownBrowsers()
+		if kerr != nil {
+			return kerr
+		}
+		return fmt.Errorf("unknown browser %q; choose from %s", browserName, strings.Join(known, ", "))
+	}
+	profiles, err := browser.Profiles()
+	if err != nil {
+		return err
+	}
+	if asJSON {
+		out, err := json.Marshal(profiles)
+		if err != nil {
+			return err
+		}
+		_, err = cmd.OutOrStdout().Write(append(out, '\n'))
+		return err
+	}
+	tw := tabwriter.NewWriter(cmd.OutOrStdout(), 0, 0, 2, ' ', 0)
+	for _, p := range profiles {
+		if _, err := fmt.Fprintf(tw, "%s\t%s\t%s\n", p.Dir, p.Name, p.Email); err != nil {
+			return err
+		}
+	}
+	return tw.Flush()
+}
+
 // endpointJSON is the frozen browser-ls JSON object: host, browser, profile in that
 // field order, matching the Python BrowserEndpoint.to_json.
 type endpointJSON struct {
@@ -157,6 +207,21 @@ func validateBrowser(name string) error {
 	}
 	sort.Strings(known)
 	return fmt.Errorf("unknown browser %q; choose from %s", name, strings.Join(known, ", "))
+}
+
+// knownBrowsers returns the registered browser names sorted, for the "choose from"
+// hint when a lookup fails.
+func knownBrowsers() ([]string, error) {
+	registry, err := cookie.Registry()
+	if err != nil {
+		return nil, err
+	}
+	known := make([]string, 0, len(registry))
+	for n := range registry {
+		known = append(known, string(n))
+	}
+	sort.Strings(known)
+	return known, nil
 }
 
 // sortedEndpoints returns endpoints ordered by id, so ls output is stable across the
