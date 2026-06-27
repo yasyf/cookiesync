@@ -6,6 +6,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-06-27
+
+### Fixed
+- The TUI's browser-add profile picker now shows each profile's display name and account email
+  (read from the browser's `Local State`) instead of bare directory names, and drops Arc's internal
+  system profile. The tracked endpoint still stores the on-disk profile directory.
+- The Hosts tab sorts registered mesh peers above discovered candidates (via synckit v0.4.1).
+
 ## [0.6.0] - 2026-06-27
 
 ### Added
@@ -51,7 +59,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `synckitd install` now owns the agents. The host mesh is read from the shared
   `~/.config/synckit`.
 
-[Unreleased]: https://github.com/yasyf/cookiesync/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/yasyf/cookiesync/compare/v0.6.1...HEAD
+[0.6.1]: https://github.com/yasyf/cookiesync/releases/tag/v0.6.1
 [0.6.0]: https://github.com/yasyf/cookiesync/releases/tag/v0.6.0
 [0.5.0]: https://github.com/yasyf/cookiesync/releases/tag/v0.5.0
 [0.4.0]: https://github.com/yasyf/cookiesync/releases/tag/v0.4.0

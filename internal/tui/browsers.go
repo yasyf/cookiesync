@@ -281,7 +281,7 @@ func (m *browsersModel) advancePick() (stui.Screen, tea.Cmd) {
 			return m, nil
 		}
 		m.pick.step = pickProfile
-		m.pick.list = newPickList(pickItems(profiles), m.mdListW, m.mdHeight)
+		m.pick.list = newPickList(profileItems(profiles), m.mdListW, m.mdHeight)
 		return m, nil
 	case pickProfile:
 		ep := state.Endpoint{Host: m.pick.host, Browser: m.pick.browser, Profile: it.value}
@@ -387,8 +387,9 @@ func browserNames() ([]string, error) {
 }
 
 // browserProfiles scans the named browser's local data root for profiles that
-// hold a cookie store, the choices the add picker's profile step offers.
-func browserProfiles(name string) ([]string, error) {
+// hold a cookie store, enriched with display name and email, the choices the add
+// picker's profile step offers.
+func browserProfiles(name string) ([]cookie.Profile, error) {
 	browser, err := cookie.Lookup(cookie.BrowserName(name))
 	if err != nil {
 		return nil, err

@@ -11,6 +11,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/x/exp/teatest"
 
+	"github.com/yasyf/cookiesync/internal/cookie"
 	"github.com/yasyf/cookiesync/internal/state"
 	stui "github.com/yasyf/synckit/tui"
 )
@@ -164,5 +165,35 @@ func TestBrowserItemFilterValue(t *testing.T) {
 	it := browserItem{endpoint: state.Endpoint{Host: "me@laptop", Browser: "arc", Profile: "Work"}}
 	if got := it.FilterValue(); got != "me@laptop/arc/Work" {
 		t.Fatalf("FilterValue = %q, want me@laptop/arc/Work", got)
+	}
+}
+
+// TestProfileItems proves the profile picker renders identity (display name as the
+// label, email as the detail) while the selected value stays the on-disk
+// directory, and that an empty name falls back to the directory. The dir is what
+// keys the cookie store and gets written to state, so it must never be the name.
+func TestProfileItems(t *testing.T) {
+	profiles := []cookie.Profile{
+		{Dir: "Profile 3", Name: "Gmail", Email: "yasyfm@gmail.com"},
+		{Dir: "Default", Name: "Yasyf", Email: ""},
+		{Dir: "Profile 7", Name: "", Email: ""},
+	}
+	items := profileItems(profiles)
+	want := []pickItem{
+		{label: "Gmail", detail: "yasyfm@gmail.com", filter: "Gmail yasyfm@gmail.com Profile 3", value: "Profile 3"},
+		{label: "Yasyf", detail: "", filter: "Yasyf  Default", value: "Default"},
+		{label: "Profile 7", detail: "", filter: "Profile 7  Profile 7", value: "Profile 7"},
+	}
+	if len(items) != len(want) {
+		t.Fatalf("profileItems returned %d items, want %d", len(items), len(want))
+	}
+	for i, w := range want {
+		got := items[i].(pickItem)
+		if got != w {
+			t.Fatalf("profileItems[%d] = %#v, want %#v", i, got, w)
+		}
+		if got.value != profiles[i].Dir {
+			t.Fatalf("profileItems[%d].value = %q, want dir %q", i, got.value, profiles[i].Dir)
+		}
 	}
 }

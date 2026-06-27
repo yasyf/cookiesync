@@ -8,6 +8,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
+	"github.com/yasyf/cookiesync/internal/cookie"
 	"github.com/yasyf/cookiesync/internal/state"
 	stui "github.com/yasyf/synckit/tui"
 )
@@ -81,16 +82,20 @@ func renderBrowserDetail(item list.Item) string {
 	return strings.Join(lines, "\n")
 }
 
-// pickItem is one row of the staged add picker — a label and the value it
-// resolves to (a host target, a browser name, or a profile dir name).
+// pickItem is one row of the staged add picker — a primary label, an optional
+// dimmed secondary line (a profile's account email), the filter text, and the
+// value it resolves to (a host target, a browser name, or a profile dir name).
 type pickItem struct {
-	label string
-	value string
+	label  string
+	detail string
+	filter string
+	value  string
 }
 
-func (i pickItem) FilterValue() string { return i.label }
+func (i pickItem) FilterValue() string { return i.filter }
 
-// pickDelegate renders a pickItem as a single accented label row.
+// pickDelegate renders a pickItem as an accented label row, trailing the dimmed
+// detail inline when one is set.
 type pickDelegate struct{}
 
 func (pickDelegate) Height() int                         { return 1 }
@@ -99,9 +104,13 @@ func (pickDelegate) Update(tea.Msg, *list.Model) tea.Cmd { return nil }
 
 func (d pickDelegate) Render(w io.Writer, m list.Model, index int, item list.Item) {
 	it := item.(pickItem)
-	row := "  " + it.label
+	label := it.label
+	if it.detail != "" {
+		label += "  " + stui.Dim.Render(it.detail)
+	}
+	row := "  " + label
 	if index == m.Index() {
-		row = stui.Accent.Render("> ") + it.label
+		row = stui.Accent.Render("> ") + label
 	}
 	_, _ = io.WriteString(w, lipgloss.NewStyle().MaxWidth(m.Width()).Render(row))
 }
@@ -109,7 +118,28 @@ func (d pickDelegate) Render(w io.Writer, m list.Model, index int, item list.Ite
 func pickItems(labels []string) []list.Item {
 	items := make([]list.Item, len(labels))
 	for i, l := range labels {
-		items[i] = pickItem{label: l, value: l}
+		items[i] = pickItem{label: l, filter: l, value: l}
+	}
+	return items
+}
+
+// profileItems builds picker rows from enriched profiles: the display name leads
+// (falling back to the directory when empty), the account email trails dimmed,
+// and the value stays the on-disk directory so the cookie store and state key off
+// it. Filtering matches name, email, and directory together.
+func profileItems(profiles []cookie.Profile) []list.Item {
+	items := make([]list.Item, len(profiles))
+	for i, p := range profiles {
+		label := p.Name
+		if label == "" {
+			label = p.Dir
+		}
+		items[i] = pickItem{
+			label:  label,
+			detail: p.Email,
+			filter: label + " " + p.Email + " " + p.Dir,
+			value:  p.Dir,
+		}
 	}
 	return items
 }
