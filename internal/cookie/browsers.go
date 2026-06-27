@@ -1,9 +1,11 @@
 package cookie
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 )
 
 // BrowserName is a browser's CLI/config identity (e.g. "chrome", "arc").
@@ -33,6 +35,34 @@ func (b Browser) CookiesDB(profile string) string {
 // LocalState is the Local State JSON file at this browser's data root.
 func (b Browser) LocalState() string {
 	return filepath.Join(b.DataRoot, "Local State")
+}
+
+// Profiles scans the immediate subdirectories of this browser's data root and
+// returns, sorted, the names of those that hold a cookie store — the set this
+// host could track. The layout differs per browser (Chrome uses "Default" and
+// "Profile N", Arc names them otherwise), so membership is decided by the
+// presence of a CookiesDB rather than a fixed profile list. A missing data root
+// yields no profiles.
+func (b Browser) Profiles() ([]string, error) {
+	entries, err := os.ReadDir(b.DataRoot)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("scan %s profiles: %w", b.Name, err)
+	}
+	var profiles []string
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		if info, err := os.Stat(b.CookiesDB(entry.Name())); err != nil || info.IsDir() {
+			continue
+		}
+		profiles = append(profiles, entry.Name())
+	}
+	sort.Strings(profiles)
+	return profiles, nil
 }
 
 // Registry maps every supported browser to its on-disk layout, resolved against

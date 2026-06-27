@@ -10,6 +10,8 @@ import (
 	"syscall"
 
 	"github.com/spf13/cobra"
+
+	"github.com/yasyf/cookiesync/internal/tui"
 )
 
 // statusError carries a process exit code out of a command so a remote command's
@@ -47,7 +49,10 @@ func newRoot(version string) *cobra.Command {
 		SilenceErrors: true,
 		Args:          cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			return cmd.Help()
+			if !isInteractive() {
+				return cmd.Help()
+			}
+			return tui.Run(cmd.Context(), version)
 		},
 	}
 	root.AddCommand(
@@ -62,6 +67,7 @@ func newRoot(version string) *cobra.Command {
 		newInstallCmd(),
 		newUninstallCmd(),
 		newDoctorCmd(),
+		newTUICmd(version),
 	)
 	return root
 }

@@ -6,6 +6,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-06-27
+
+### Added
+- A terminal UI: bare `cookiesync` on a TTY (or `cookiesync tui`) opens a Browsers tab listing the
+  tracked endpoints with per-profile presence and a full-picker add flow (host → browser → profile),
+  plus the shared Hosts tab from synckit for discovering and bootstrapping peers. `browser add/ls/rm`
+  stays the non-interactive path.
+- `cookie.Browser.Profiles()` — enumerates a browser's on-disk profiles (subdirs of its data root
+  that hold a Cookies store), feeding the add-flow's profile picker.
+
+### Changed
+- Adopt synckit v0.4.0's shared `tui` package. The UI shell and Hosts tab are shared with reposync,
+  and the host-discovery fixes ride along: the local Mac no longer lists itself in Hosts, and a peer
+  with the daemon installed reads "installed" instead of "reachable, not installed".
+
 ## [0.5.0] - 2026-06-26
 
 ### Changed
@@ -36,6 +51,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `synckitd install` now owns the agents. The host mesh is read from the shared
   `~/.config/synckit`.
 
-[Unreleased]: https://github.com/yasyf/cookiesync/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/yasyf/cookiesync/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/yasyf/cookiesync/releases/tag/v0.6.0
 [0.5.0]: https://github.com/yasyf/cookiesync/releases/tag/v0.5.0
 [0.4.0]: https://github.com/yasyf/cookiesync/releases/tag/v0.4.0
