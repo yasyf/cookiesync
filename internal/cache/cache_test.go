@@ -6,7 +6,9 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -91,9 +93,13 @@ func TestSecureEnclaveWrapperRoundTripsViaTheSignedHelper(t *testing.T) {
 	t.Cleanup(restore)
 	ctx := context.Background()
 
-	wrapper, err := OpenWrapper(ctx, helper.Bridge{})
+	opened, err := OpenWrapper(ctx, helper.Bridge{})
 	if err != nil {
 		t.Fatalf("OpenWrapper: %v", err)
+	}
+	wrapper, ok := opened.(*SecureEnclaveWrapper)
+	if !ok {
+		t.Fatalf("wrapper = %T, want *SecureEnclaveWrapper", opened)
 	}
 	key := testKey()
 	blob, err := wrapper.Wrap(ctx, key)
@@ -132,6 +138,404 @@ func TestSecureEnclaveWrapperFailsClosedWhenHelperMissing(t *testing.T) {
 	var helperErr *paths.HelperError
 	if !errors.As(err, &helperErr) {
 		t.Fatalf("err = %v, want *paths.HelperError", err)
+	}
+}
+
+// writeFailingNewkeyHelper writes a fake cookiesync-keyhelper whose cache-newkey
+// prints diagnostic to stderr and exits with code; any other verb exits 99.
+func writeFailingNewkeyHelper(t *testing.T, code int, diagnostic string) string {
+	t.Helper()
+	binary := filepath.Join(t.TempDir(), "cookiesync-keyhelper")
+	body := `#!/bin/sh
+case "$1" in
+cache-newkey)
+  printf '%s\n' "` + diagnostic + `" >&2
+  exit ` + strconv.Itoa(code) + `
+  ;;
+*)
+  echo "unexpected verb $1" >&2
+  exit 99
+  ;;
+esac
+`
+	if err := os.WriteFile(binary, []byte(body), 0o755); err != nil { //nolint:gosec // test fixture script must be executable.
+		t.Fatalf("write failing newkey helper: %v", err)
+	}
+	return binary
+}
+
+func TestOpenWrapperDegradesToMemoryWhenPresenceUnavailable(t *testing.T) {
+	const diagnostic = "keyhelper: SecKeyCreateRandomKey failed: interaction not allowed (OSStatus -25308)"
+	script := writeFailingNewkeyHelper(t, 3, diagnostic)
+	ctx := context.Background()
+
+	wrapper, err := OpenWrapper(ctx, helper.Bridge{Binary: script})
+	if !errors.Is(err, ErrSEPresenceUnavailable) {
+		t.Fatalf("err = %v, want ErrSEPresenceUnavailable", err)
+	}
+	if !strings.Contains(err.Error(), diagnostic) {
+		t.Fatalf("err = %q, want it to carry the helper stderr %q", err, diagnostic)
+	}
+	hw, ok := wrapper.(*healingWrapper)
+	if !ok {
+		t.Fatalf("wrapper = %T, want *healingWrapper", wrapper)
+	}
+	if !hw.degraded() {
+		t.Fatalf("healingWrapper not degraded at open")
+	}
+	key := testKey()
+	blob, err := wrapper.Wrap(ctx, key)
+	if err != nil {
+		t.Fatalf("Wrap: %v", err)
+	}
+	got, err := wrapper.Unwrap(ctx, blob)
+	if err != nil {
+		t.Fatalf("Unwrap: %v", err)
+	}
+	if !bytes.Equal(got, key) {
+		t.Fatalf("round-trip = %x, want %x", got, key)
+	}
+	if err := wrapper.Close(ctx); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+}
+
+func TestOpenWrapperFailsLoudOnExitTwoWithHelperStderr(t *testing.T) {
+	const diagnostic = "keyhelper: SecKeyCreateRandomKey failed: no Secure Enclave (OSStatus -4)"
+	script := writeFailingNewkeyHelper(t, 2, diagnostic)
+
+	wrapper, err := OpenWrapper(context.Background(), helper.Bridge{Binary: script})
+	if wrapper != nil {
+		t.Fatalf("wrapper = %T, want nil", wrapper)
+	}
+	if err == nil || errors.Is(err, ErrSEPresenceUnavailable) {
+		t.Fatalf("err = %v, want a non-degraded failure", err)
+	}
+	for _, want := range []string{"cache-newkey exited 2", diagnostic} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("err = %q, want it to contain %q", err, want)
+		}
+	}
+}
+
+// writeHealingHelper writes a fake cookiesync-keyhelper whose cache-newkey exits 3
+// (presence unavailable) for its first exit3 invocations — counted in a sidecar
+// file — and thenCode afterwards (0 heals, anything else refuses). Every verb is
+// logged; cache-wrap / cache-unwrap XOR stdin to stdout and cache-dropkey no-ops.
+func writeHealingHelper(t *testing.T, exit3, thenCode int) (binary, logPath string) {
+	t.Helper()
+	dir := t.TempDir()
+	binary = filepath.Join(dir, "cookiesync-keyhelper")
+	logPath = filepath.Join(dir, "helper.log")
+	countPath := filepath.Join(dir, "newkey.count")
+	body := `#!/bin/sh
+verb="$1"
+label="$2"
+printf '%s %s\n' "$verb" "$label" >> "` + logPath + `"
+case "$verb" in
+cache-newkey)
+  n=$(cat "` + countPath + `" 2>/dev/null || echo 0)
+  n=$((n+1))
+  printf '%s' "$n" > "` + countPath + `"
+  if [ "$n" -le ` + strconv.Itoa(exit3) + ` ]; then
+    echo "keyhelper: SecKeyCreateRandomKey failed: interaction not allowed (OSStatus -25308)" >&2
+    exit 3
+  fi
+  if [ ` + strconv.Itoa(thenCode) + ` -ne 0 ]; then
+    echo "keyhelper: SecKeyCreateRandomKey failed: no Secure Enclave (OSStatus -4)" >&2
+    exit ` + strconv.Itoa(thenCode) + `
+  fi
+  exit 0
+  ;;
+cache-dropkey)
+  exit 0
+  ;;
+cache-wrap|cache-unwrap)
+  exec /usr/bin/perl -0777 -pe 's/(.)/chr(ord($1)^0x5A)/ges'
+  ;;
+*)
+  echo "unexpected verb $verb" >&2
+  exit 99
+  ;;
+esac
+`
+	if err := os.WriteFile(binary, []byte(body), 0o755); err != nil { //nolint:gosec // test fixture script must be executable.
+		t.Fatalf("write healing helper: %v", err)
+	}
+	return binary, logPath
+}
+
+func TestKeyCachePutHealsTheDegradedWrapper(t *testing.T) {
+	binary, logPath := writeHealingHelper(t, 3, 0)
+	ctx := context.Background()
+
+	wrapper, err := OpenWrapper(ctx, helper.Bridge{Binary: binary})
+	if !errors.Is(err, ErrSEPresenceUnavailable) {
+		t.Fatalf("OpenWrapper err = %v, want ErrSEPresenceUnavailable", err)
+	}
+	c := NewKeyCache(wrapper)
+	if !c.Degraded() {
+		t.Fatalf("Degraded() = false at open")
+	}
+
+	key := testKey()
+	for _, id := range []string{endpoint, other} {
+		if err := c.Put(ctx, id, key, 30*time.Second); err != nil {
+			t.Fatalf("degraded Put %s: %v", id, err)
+		}
+		if !bytes.Equal(c.entries[id].blob, key) {
+			t.Fatalf("degraded blob for %s = %x, want the identity RAM copy %x", id, c.entries[id].blob, key)
+		}
+		got, ok, err := c.Get(ctx, id)
+		if err != nil || !ok || !bytes.Equal(got, key) {
+			t.Fatalf("degraded Get %s = %x ok=%v err=%v", id, got, ok, err)
+		}
+	}
+	if !c.Degraded() {
+		t.Fatalf("Degraded() = false while re-probes still exit 3")
+	}
+	if log := readFile(t, logPath); strings.Contains(log, "cache-wrap") || strings.Contains(log, "cache-unwrap") {
+		t.Fatalf("degraded Put/Get must stay in process memory, not shell the helper:\n%s", log)
+	}
+
+	const healed = "yasyf-home:arc:Default"
+	if err := c.Put(ctx, healed, key, 30*time.Second); err != nil {
+		t.Fatalf("healing Put: %v", err)
+	}
+	if c.Degraded() {
+		t.Fatalf("Degraded() = true after the healing Put")
+	}
+	if len(c.entries) != 1 {
+		t.Fatalf("entries after heal = %d, want 1 (every identity blob evicted)", len(c.entries))
+	}
+	if blob := c.entries[healed].blob; !bytes.Equal(blob, xor(key)) {
+		t.Fatalf("healed blob = %x, want the Enclave-wrapped %x", blob, xor(key))
+	}
+	for _, id := range []string{endpoint, other} {
+		if _, ok, _ := c.Get(ctx, id); ok {
+			t.Fatalf("identity entry %s still served after the heal swap", id)
+		}
+	}
+	got, ok, err := c.Get(ctx, healed)
+	if err != nil || !ok || !bytes.Equal(got, key) {
+		t.Fatalf("Get after heal = %x ok=%v err=%v", got, ok, err)
+	}
+
+	if err := c.Put(ctx, endpoint, key, 30*time.Second); err != nil {
+		t.Fatalf("post-heal Put: %v", err)
+	}
+	if got := strings.Count(readFile(t, logPath), "cache-newkey"); got != 4 {
+		t.Fatalf("cache-newkey ran %d times, want 4 (open + one re-probe per degraded Put, none after heal)", got)
+	}
+	if err := wrapper.Close(ctx); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if !strings.Contains(readFile(t, logPath), "cache-dropkey") {
+		t.Fatalf("Close after heal must drop the Enclave key")
+	}
+}
+
+func TestKeyCachePutFailsLoudWhenReprobeRefuses(t *testing.T) {
+	binary, _ := writeHealingHelper(t, 1, 2)
+	ctx := context.Background()
+
+	wrapper, err := OpenWrapper(ctx, helper.Bridge{Binary: binary})
+	if !errors.Is(err, ErrSEPresenceUnavailable) {
+		t.Fatalf("OpenWrapper err = %v, want ErrSEPresenceUnavailable", err)
+	}
+	c := NewKeyCache(wrapper)
+
+	err = c.Put(ctx, endpoint, testKey(), 30*time.Second)
+	if err == nil {
+		t.Fatalf("Put succeeded, want the exit-2 re-probe failure")
+	}
+	for _, want := range []string{"cache-newkey re-probe exited 2", "no Secure Enclave (OSStatus -4)"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("err = %q, want it to contain %q", err, want)
+		}
+	}
+	if !c.Degraded() {
+		t.Fatalf("Degraded() = false after a refused re-probe")
+	}
+	if len(c.entries) != 0 {
+		t.Fatalf("failed Put stored an entry")
+	}
+}
+
+func TestPutRewrapsWhenAHealSwapsMidPut(t *testing.T) {
+	binary, logPath := writeHealingHelper(t, 2, 0)
+	ctx := context.Background()
+
+	wrapper, err := OpenWrapper(ctx, helper.Bridge{Binary: binary})
+	if !errors.Is(err, ErrSEPresenceUnavailable) {
+		t.Fatalf("OpenWrapper err = %v, want ErrSEPresenceUnavailable", err)
+	}
+	hw := wrapper.(*healingWrapper)
+	c := NewKeyCache(hw)
+	key := testKey()
+
+	// Park the stale Put on c.mu after its re-probe stayed degraded (identity blob
+	// in hand), let a second Put heal and swap, then release: the stale Put must
+	// notice the swap and re-wrap through the Enclave instead of inserting.
+	c.mu.Lock()
+	stale := make(chan error, 1)
+	go func() { stale <- c.Put(ctx, endpoint, key, 30*time.Second) }()
+	waitFor(t, func() bool { return strings.Count(readFile(t, logPath), "cache-newkey") == 2 })
+
+	healing := make(chan error, 1)
+	go func() { healing <- c.Put(ctx, other, key, 30*time.Second) }()
+	waitFor(t, func() bool { return !hw.degraded() })
+	c.mu.Unlock()
+
+	if err := <-stale; err != nil {
+		t.Fatalf("stale Put: %v", err)
+	}
+	if err := <-healing; err != nil {
+		t.Fatalf("healing Put: %v", err)
+	}
+	if got := strings.Count(readFile(t, logPath), "cache-wrap"); got != 2 {
+		t.Fatalf("cache-wrap ran %d times, want 2 (the healing Put plus the stale Put's re-wrap)", got)
+	}
+	for id, e := range c.entries {
+		if !bytes.Equal(e.blob, xor(key)) {
+			t.Fatalf("entry %s = %x, want Enclave-wrapped %x (identity blob crossed the heal swap)", id, e.blob, xor(key))
+		}
+	}
+}
+
+func waitFor(t *testing.T, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatalf("condition not reached within 5s")
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+}
+
+func TestKeyCacheHealSwapUnderConcurrentUse(t *testing.T) {
+	ctx := context.Background()
+	keyFor := func(id string) []byte {
+		k := make([]byte, 32)
+		for i := range k {
+			k[i] = byte(i) ^ id[len(id)-1]
+		}
+		return k
+	}
+	for iter := range 4 {
+		binary, _ := writeHealingHelper(t, 3, 0)
+		wrapper, err := OpenWrapper(ctx, helper.Bridge{Binary: binary})
+		if !errors.Is(err, ErrSEPresenceUnavailable) {
+			t.Fatalf("iter %d: OpenWrapper err = %v, want ErrSEPresenceUnavailable", iter, err)
+		}
+		c := NewKeyCache(wrapper)
+
+		var wg sync.WaitGroup
+		failures := make(chan string, 64)
+		for g := range 6 {
+			id := endpoint + strconv.Itoa(g)
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for range 3 {
+					if err := c.Put(ctx, id, keyFor(id), 30*time.Second); err != nil {
+						failures <- "Put " + id + ": " + err.Error()
+						return
+					}
+					got, ok, err := c.Get(ctx, id)
+					if err != nil {
+						failures <- "Get " + id + ": " + err.Error()
+						return
+					}
+					if ok && !bytes.Equal(got, keyFor(id)) {
+						failures <- "Get " + id + " returned wrong bytes"
+						return
+					}
+				}
+			}()
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for range 3 {
+				c.EvictAll()
+			}
+		}()
+		wg.Wait()
+		close(failures)
+		for msg := range failures {
+			t.Fatalf("iter %d: %s", iter, msg)
+		}
+
+		if c.Degraded() {
+			t.Fatalf("iter %d: still degraded after every Put completed", iter)
+		}
+		c.mu.Lock()
+		for id, e := range c.entries {
+			if !bytes.Equal(e.blob, xor(keyFor(id))) {
+				c.mu.Unlock()
+				t.Fatalf("iter %d: surviving entry %s is not Enclave-wrapped", iter, id)
+			}
+		}
+		c.mu.Unlock()
+
+		final := endpoint + "0"
+		if err := c.Put(ctx, final, keyFor(final), 30*time.Second); err != nil {
+			t.Fatalf("iter %d: final Put: %v", iter, err)
+		}
+		got, ok, err := c.Get(ctx, final)
+		if err != nil || !ok || !bytes.Equal(got, keyFor(final)) {
+			t.Fatalf("iter %d: final Get = %x ok=%v err=%v", iter, got, ok, err)
+		}
+	}
+}
+
+func TestKeyCacheOverAPlainWrapperIsNotDegraded(t *testing.T) {
+	if NewKeyCache(fakeWrapper{}).Degraded() {
+		t.Fatalf("Degraded() = true over a plain wrapper")
+	}
+}
+
+func TestMemoryWrapperRoundTripsKeyByteForByte(t *testing.T) {
+	ctx := context.Background()
+	w := memoryWrapper{}
+	key := []byte{0x00, 0x01, 0xFF, 0x5A, 0x80, 0x0A, 0x00}
+
+	blob, err := w.Wrap(ctx, key)
+	if err != nil {
+		t.Fatalf("Wrap: %v", err)
+	}
+	if !bytes.Equal(blob, key) {
+		t.Fatalf("blob = %x, want identity %x", blob, key)
+	}
+	key[0] = 0xEE
+	if blob[0] != 0x00 {
+		t.Fatalf("blob aliases the caller's key slice")
+	}
+	got, err := w.Unwrap(ctx, blob)
+	if err != nil {
+		t.Fatalf("Unwrap: %v", err)
+	}
+	if !bytes.Equal(got, blob) {
+		t.Fatalf("round-trip = %x, want %x", got, blob)
+	}
+}
+
+func TestKeyCacheOverTheMemoryWrapper(t *testing.T) {
+	ctx := context.Background()
+	c := NewKeyCache(memoryWrapper{})
+	key := testKey()
+	if err := c.Put(ctx, endpoint, key, 30*time.Second); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	got, ok, err := c.Get(ctx, endpoint)
+	if err != nil || !ok || !bytes.Equal(got, key) {
+		t.Fatalf("Get = %x ok=%v err=%v", got, ok, err)
+	}
+	c.EvictAll()
+	if _, ok, _ := c.Get(ctx, endpoint); ok {
+		t.Fatalf("endpoint present after EvictAll")
 	}
 }
 

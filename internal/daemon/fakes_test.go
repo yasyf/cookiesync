@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -49,14 +50,18 @@ func fakeMesh(t *testing.T, self string, peers ...string) {
 // ObtainKey to simulate a declined prompt), so the consent path runs without Touch ID
 // or the signed helper.
 type fakeConsent struct {
-	key              cookie.AesKey
-	obtainErr        error
+	key       cookie.AesKey
+	obtainErr error
+
+	mu               sync.Mutex
 	promptedReasons  []string
 	unpromptedCalled int
 }
 
 func (c *fakeConsent) ObtainKey(_ context.Context, _ cookie.Browser, reason string) (cookie.AesKey, error) {
+	c.mu.Lock()
 	c.promptedReasons = append(c.promptedReasons, reason)
+	c.mu.Unlock()
 	if c.obtainErr != nil {
 		return nil, c.obtainErr
 	}
@@ -64,16 +69,77 @@ func (c *fakeConsent) ObtainKey(_ context.Context, _ cookie.Browser, reason stri
 }
 
 func (c *fakeConsent) ObtainKeyUnprompted(_ context.Context, _ cookie.Browser) (cookie.AesKey, error) {
+	c.mu.Lock()
 	c.unpromptedCalled++
+	c.mu.Unlock()
 	return c.key, nil
 }
 
+// gateConsent blocks every ObtainKey until release closes, counting entries — the
+// consent double a concurrency test holds mid-prompt to prove concurrent cold primes
+// join one flight instead of prompting again. Like the real Touch ID gate, it honors
+// ctx: a canceled prompt returns ctx.Err().
+type gateConsent struct {
+	key     cookie.AesKey
+	entered chan struct{}
+	release chan struct{}
+	calls   atomic.Int32
+}
+
+func (c *gateConsent) ObtainKey(ctx context.Context, _ cookie.Browser, _ string) (cookie.AesKey, error) {
+	c.calls.Add(1)
+	c.entered <- struct{}{}
+	select {
+	case <-c.release:
+		return c.key, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+func (c *gateConsent) ObtainKeyUnprompted(_ context.Context, _ cookie.Browser) (cookie.AesKey, error) {
+	panic("gateConsent: unexpected unprompted release")
+}
+
+// countingConsent tracks the peak number of concurrent ObtainKey prompts, holding
+// each for hold so an unserialized overlap is observable — the double that proves
+// promptGate admits one consent sheet at a time.
+type countingConsent struct {
+	key        cookie.AesKey
+	hold       time.Duration
+	calls      atomic.Int32
+	concurrent atomic.Int32
+	peak       atomic.Int32
+}
+
+func (c *countingConsent) ObtainKey(_ context.Context, _ cookie.Browser, _ string) (cookie.AesKey, error) {
+	c.calls.Add(1)
+	n := c.concurrent.Add(1)
+	for {
+		p := c.peak.Load()
+		if n <= p || c.peak.CompareAndSwap(p, n) {
+			break
+		}
+	}
+	time.Sleep(c.hold)
+	c.concurrent.Add(-1)
+	return c.key, nil
+}
+
+func (c *countingConsent) ObtainKeyUnprompted(_ context.Context, _ cookie.Browser) (cookie.AesKey, error) {
+	panic("countingConsent: unexpected unprompted release")
+}
+
 // fakeCache is an in-memory key cache double: it stores raw keys without wrapping, so
-// the handler logic is exercised without the Secure Enclave. It records Put calls.
+// the handler logic is exercised without the Secure Enclave. It records Put calls and
+// counts Gets, so a concurrency test can tell when every caller has probed the cache.
 type fakeCache struct {
+	degraded bool
+
 	mu      sync.Mutex
 	entries map[string][]byte
 	puts    []string
+	gets    int
 }
 
 func newFakeCache() *fakeCache {
@@ -83,6 +149,7 @@ func newFakeCache() *fakeCache {
 func (c *fakeCache) Get(_ context.Context, id string) ([]byte, bool, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	c.gets++
 	key, ok := c.entries[id]
 	return key, ok, nil
 }
@@ -93,6 +160,22 @@ func (c *fakeCache) Put(_ context.Context, id string, key []byte, _ time.Duratio
 	c.entries[id] = key
 	c.puts = append(c.puts, id)
 	return nil
+}
+
+func (c *fakeCache) getCalls() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.gets
+}
+
+func (c *fakeCache) putCalls() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return len(c.puts)
+}
+
+func (c *fakeCache) Degraded() bool {
+	return c.degraded
 }
 
 // fixedState is a StateLoader and RegistryLoader returning a fixed snapshot. Its
@@ -155,6 +238,67 @@ func (r *recordingRunner) Run(_ context.Context, target, cmd string, _ []byte) (
 // staticProbe returns a fixed session snapshot.
 func staticProbe(snap SessionSnapshot) Probe {
 	return func(_ context.Context) (SessionSnapshot, error) { return snap, nil }
+}
+
+// fakeStore satisfies engine.Store with an injected WithLock, so a dispatcher test
+// gates or counts the converge pass's flock section without a real state file. Its
+// registry paths serve the seeded registry (empty when unset), enough for a clean
+// no-endpoint pass or a converge over fixture endpoints.
+type fakeStore struct {
+	withLock func(ctx context.Context, fn func() error) error
+	registry cregistry.Registry[state.EndpointMeta]
+}
+
+func (s *fakeStore) WithLock(ctx context.Context, fn func() error) error {
+	return s.withLock(ctx, fn)
+}
+
+func (s *fakeStore) LoadRegistry(_ context.Context) (cregistry.Registry[state.EndpointMeta], error) {
+	if s.registry == nil {
+		return cregistry.New[state.EndpointMeta](), nil
+	}
+	return s.registry, nil
+}
+
+func (s *fakeStore) SaveRegistryUnlocked(_ context.Context, _ cregistry.Registry[state.EndpointMeta]) error {
+	return nil
+}
+
+// countingRecorder tracks the peak number of concurrent RecordApplied calls — the
+// first statement inside handleApply's per-endpoint critical section — holding each
+// call for hold so an unserialized overlap is observable, then forwards to inner.
+type countingRecorder struct {
+	inner      cookie.Recorder
+	hold       time.Duration
+	concurrent atomic.Int32
+	peak       atomic.Int32
+}
+
+func (r *countingRecorder) RecordApplied(endpointID string, digest cookie.Digest) {
+	n := r.concurrent.Add(1)
+	for {
+		p := r.peak.Load()
+		if n <= p || r.peak.CompareAndSwap(p, n) {
+			break
+		}
+	}
+	time.Sleep(r.hold)
+	r.inner.RecordApplied(endpointID, digest)
+	r.concurrent.Add(-1)
+}
+
+// meetRecorder parks every RecordApplied at a rendezvous — send on arrived, wait for
+// release — so a test proves two applies are mid-critical-section at the same time.
+type meetRecorder struct {
+	inner   cookie.Recorder
+	arrived chan string
+	release chan struct{}
+}
+
+func (r *meetRecorder) RecordApplied(endpointID string, digest cookie.Digest) {
+	r.arrived <- endpointID
+	<-r.release
+	r.inner.RecordApplied(endpointID, digest)
 }
 
 // stateWith builds a State with the given self target, consent route, and endpoints.

@@ -3,17 +3,20 @@ package engine
 import (
 	"context"
 	"log/slog"
+	"sync"
 
 	"github.com/yasyf/cookiesync/internal/cookie"
 	"github.com/yasyf/cookiesync/internal/state"
 )
 
 // gathered is one endpoint's decrypted cookies for the union, with the source that
-// yielded them, so the merged set can be applied back through the same seam.
+// yielded them, so the merged set can be applied back through the same seam. local
+// marks a same-host endpoint, whose write-back runs under its apply lock.
 type gathered struct {
 	endpoint state.Endpoint
 	source   Source
 	cookies  []cookie.Cookie
+	local    bool
 }
 
 // targetRow is the full value-bearing tuple used to decide whether an endpoint already
@@ -77,12 +80,17 @@ func rowSetEqual(a, b []cookie.Cookie) bool {
 // applyTo writes merged back to one gathered endpoint when its rows differ, recording
 // the anti-echo digest before the write. It returns whether a write happened. When the
 // endpoint already holds exactly the merged rows the write is skipped, so the converge
-// is idempotent. Mirrors the Python sync.apply_to.
-func applyTo(ctx context.Context, g gathered, merged []cookie.Cookie, rec cookie.Recorder) (bool, error) {
+// is idempotent. A local endpoint's skip-check + record + write runs under its apply
+// lock, serializing with the daemon's concurrent apply handler; a peer's apply crosses
+// ssh unlocked. Mirrors the Python sync.apply_to.
+func applyTo(ctx context.Context, g gathered, merged []cookie.Cookie, deps ConvergeDeps) (bool, error) {
+	if g.local {
+		defer deps.LockFor(string(g.endpoint.ID())).Unlock()
+	}
 	if rowSetEqual(merged, g.cookies) {
 		return false, nil
 	}
-	rec.RecordApplied(string(g.endpoint.ID()), cookie.LogicalDigest(merged))
+	deps.Recorder.RecordApplied(string(g.endpoint.ID()), cookie.LogicalDigest(merged))
 	if _, err := g.source.Apply(ctx, g.endpoint.Browser, g.endpoint.Profile, merged); err != nil {
 		return false, err
 	}
@@ -99,6 +107,10 @@ type ConvergeDeps struct {
 	LocalSource Source
 	// SourceFor builds the Source for a peer ssh target.
 	SourceFor func(peer string) Source
+	// LockFor acquires endpointID's apply lock and returns it held — the engine's
+	// per-endpoint mutex shared with the daemon's apply handler. Only a local
+	// endpoint's record+write pair runs under it, never a peer call.
+	LockFor func(endpointID string) *sync.Mutex
 }
 
 // Converge merges the union of endpoint's cookies and every peer's across this host
@@ -110,8 +122,9 @@ type ConvergeDeps struct {
 // the host that triggered it, and skipping a cold same-host peer (logged, not silent).
 // The union newest-wins cookie.Merge selects per cookie by raw last_update_utc, and
 // the result is written to any endpoint whose stored rows differ, the applied digest
-// recorded before each write so the induced filesystem event is suppressed. It returns
-// the merged set.
+// recorded before each write so the induced filesystem event is suppressed. A local
+// write holds the endpoint's apply lock (LockFor), so it never interleaves with a
+// concurrent peer-driven apply on the same store. It returns the merged set.
 func Converge(
 	ctx context.Context,
 	endpoint state.Endpoint,
@@ -125,7 +138,7 @@ func Converge(
 		return nil, ErrNeedsAuth
 	}
 
-	sources := []gathered{{endpoint: endpoint, source: deps.LocalSource}}
+	sources := []gathered{{endpoint: endpoint, source: deps.LocalSource, local: true}}
 	for _, peer := range peers {
 		if peer.Host == origin {
 			continue
@@ -137,7 +150,7 @@ func Converge(
 				slog.WarnContext(ctx, "converge: skip cold same-host endpoint", "endpoint", peer.ID())
 				continue
 			}
-			sources = append(sources, gathered{endpoint: peer, source: deps.LocalSource})
+			sources = append(sources, gathered{endpoint: peer, source: deps.LocalSource, local: true})
 			continue
 		}
 		sources = append(sources, gathered{endpoint: peer, source: deps.SourceFor(peer.Host)})
@@ -158,7 +171,7 @@ func Converge(
 	merged := cookie.Merge(sets...)
 
 	for _, g := range sources {
-		if _, err := applyTo(ctx, g, merged, deps.Recorder); err != nil {
+		if _, err := applyTo(ctx, g, merged, deps); err != nil {
 			return nil, err
 		}
 	}

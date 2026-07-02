@@ -2,12 +2,15 @@ package engine
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/yasyf/cookiesync/internal/cookie"
 	"github.com/yasyf/cookiesync/internal/state"
 	"github.com/yasyf/synckit/cregistry"
+	"github.com/yasyf/synckit/rpc"
 	"github.com/yasyf/synckit/syncservice"
 )
 
@@ -100,6 +103,74 @@ func TestSSHBackendApplyPipesWireArray(t *testing.T) {
 	}
 }
 
+// TestExtractTimeoutTracksDispatchWindow pins extractTimeout to the peer handler's
+// rpc.DispatchTimeout: a routed consent keeps nearly the peer's full dispatch window
+// for the human's Touch ID tap, and the extract gives up 30s before the peer's own
+// deadline fires. Guards against shrinking the window with a hardcoded value again.
+func TestExtractTimeoutTracksDispatchWindow(t *testing.T) {
+	if want := rpc.DispatchTimeout - 30*time.Second; extractTimeout != want {
+		t.Fatalf("extractTimeout = %v, want %v (rpc.DispatchTimeout - 30s)", extractTimeout, want)
+	}
+}
+
+// wedgedRunner blocks until the call's deadline kills it, then reports the kill the way
+// exec.CommandContext does — a bare exit error that loses the context cause — so the
+// deadline test proves the backend restores context.DeadlineExceeded itself.
+type wedgedRunner struct{}
+
+func (wedgedRunner) Run(ctx context.Context, _, _ string, _ []byte) (string, error) {
+	<-ctx.Done()
+	return "", errors.New("signal: killed")
+}
+
+// TestSSHBackendDeadlines proves a wedged peer makes Extract and Apply fail at their
+// per-call deadline with an error that is context.DeadlineExceeded and names the
+// operation and peer.
+func TestSSHBackendDeadlines(t *testing.T) {
+	restoreExtract, restoreApply := extractTimeout, applyTimeout
+	extractTimeout, applyTimeout = 25*time.Millisecond, 25*time.Millisecond
+	t.Cleanup(func() { extractTimeout, applyTimeout = restoreExtract, restoreApply })
+
+	backend := NewSSHBackend(wedgedRunner{}, "you@desktop", "me@laptop")
+	tests := []struct {
+		name string
+		call func(context.Context) error
+		want string
+	}{
+		{
+			name: "extract",
+			call: func(ctx context.Context) error {
+				_, err := backend.Extract(ctx, "chrome", "Default")
+				return err
+			},
+			want: "rpc extract on you@desktop",
+		},
+		{
+			name: "apply",
+			call: func(ctx context.Context) error {
+				_, err := backend.Apply(ctx, "chrome", "Default", []cookie.Cookie{ck(".x.com", "sid", "v", 1)})
+				return err
+			},
+			want: "rpc apply on you@desktop",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			start := time.Now()
+			err := tt.call(context.Background())
+			if elapsed := time.Since(start); elapsed > 2*time.Second {
+				t.Fatalf("%s took %v, want failure at the ~25ms deadline", tt.name, elapsed)
+			}
+			if !errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("%s error = %v, want context.DeadlineExceeded", tt.name, err)
+			}
+			if !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("%s error %q does not name the operation and peer %q", tt.name, err, tt.want)
+			}
+		})
+	}
+}
+
 // fakeStateGetter serves a canned svc.get_state reply and records its Close, so the
 // fetcher's parse and its Close-on-defer contract are asserted without spawning ssh. It
 // has NO write method — that absence is the structural loop guard: the fetcher cannot
@@ -141,5 +212,37 @@ func TestSSHFetcherRoundTrip(t *testing.T) {
 	}
 	if !getter.closed {
 		t.Fatalf("fetcher did not close the typed client")
+	}
+}
+
+// wedgedStateGetter blocks until the fetch deadline fires, then returns the context
+// error the way the real ssh-stdio transport does on ctx.Done().
+type wedgedStateGetter struct{}
+
+func (wedgedStateGetter) GetState(ctx context.Context) (syncservice.RawRegistry, error) {
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+func (wedgedStateGetter) Close() error { return nil }
+
+// TestSSHFetcherDeadline proves a wedged peer makes Fetch fail at fetchTimeout with an
+// error that is context.DeadlineExceeded and names the operation and peer.
+func TestSSHFetcherDeadline(t *testing.T) {
+	restore := fetchTimeout
+	fetchTimeout = 25 * time.Millisecond
+	t.Cleanup(func() { fetchTimeout = restore })
+
+	fetcher := newSSHFetcher(func(string) stateGetter { return wedgedStateGetter{} })
+	start := time.Now()
+	_, err := fetcher.Fetch(context.Background(), "you@desktop")
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("Fetch took %v, want failure at the ~25ms deadline", elapsed)
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Fetch error = %v, want context.DeadlineExceeded", err)
+	}
+	if want := "get_state from you@desktop"; !strings.Contains(err.Error(), want) {
+		t.Fatalf("Fetch error %q does not name the operation and peer %q", err, want)
 	}
 }

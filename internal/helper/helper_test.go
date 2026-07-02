@@ -24,7 +24,7 @@ func writeScript(t *testing.T, body string) string {
 }
 
 func TestRunReportsExitCodeNotError(t *testing.T) {
-	for _, code := range []int{0, 1, 2} {
+	for _, code := range []int{0, 1, 2, 3} {
 		script := writeScript(t, "exit "+strconv.Itoa(code)+"\n")
 		res, err := Bridge{Binary: script}.VaultStatus(context.Background(), "vault")
 		if err != nil {
@@ -33,6 +33,26 @@ func TestRunReportsExitCodeNotError(t *testing.T) {
 		if res.Code != code {
 			t.Fatalf("code = %d, want %d", res.Code, code)
 		}
+	}
+}
+
+func TestRunCapturesStderrOnCleanNonZeroExit(t *testing.T) {
+	// A non-zero exit is not an error, but the helper's stderr diagnostic (the
+	// failing operation + OSStatus) must reach the caller for logging/classifying.
+	const diagnostic = "keyhelper: SecKeyCreateRandomKey failed: interaction not allowed (OSStatus -25308)"
+	script := writeScript(t, "printf 'partial'\nprintf '%s\\n' \""+diagnostic+"\" >&2\nexit 3\n")
+	res, err := Bridge{Binary: script}.CacheNewkey(context.Background(), "label")
+	if err != nil {
+		t.Fatalf("CacheNewkey: %v", err)
+	}
+	if res.Code != CodePresenceUnavailable {
+		t.Fatalf("Code = %d, want %d", res.Code, CodePresenceUnavailable)
+	}
+	if got := string(res.Stderr); got != diagnostic+"\n" {
+		t.Fatalf("Stderr = %q, want %q", got, diagnostic+"\n")
+	}
+	if got := string(res.Stdout); got != "partial" {
+		t.Fatalf("Stdout = %q, want %q", got, "partial")
 	}
 }
 

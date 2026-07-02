@@ -155,7 +155,10 @@ func (d *Daemon) handleRequestConsent(ctx context.Context, params map[string]any
 	if err != nil {
 		return nil, err
 	}
-	if _, err := d.consent.ObtainKey(ctx, b, fmt.Sprintf("sync them to %s", endpoint)); err != nil {
+	d.promptGate.Lock()
+	_, err = d.consent.ObtainKey(ctx, b, fmt.Sprintf("sync them to %s", endpoint))
+	d.promptGate.Unlock()
+	if err != nil {
 		var declined *cookie.ConsentError
 		if errors.As(err, &declined) {
 			return map[string]any{"status": "denied"}, nil

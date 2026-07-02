@@ -7,9 +7,11 @@ import (
 	"fmt"
 	"os/exec"
 	"strings"
+	"time"
 
 	"github.com/yasyf/cookiesync/internal/cookie"
 	"github.com/yasyf/synckit/hostregistry"
+	"github.com/yasyf/synckit/rpc"
 )
 
 // SSH option set mirrors synckit's host transport: BatchMode plus connect/keepalive
@@ -20,6 +22,17 @@ var sshOpts = []string{
 	"-o", "ServerAliveInterval=5",
 	"-o", "ServerAliveCountMax=3",
 }
+
+// Per-call deadlines for the two remote rpc calls, vars so tests shrink them.
+var (
+	// extractTimeout bounds a remote extract, which may block on a routed human
+	// consent — a Touch ID tap on the peer. Derived from the peer handler's own
+	// rpc.DispatchTimeout: the human keeps nearly that full window, and the 30s
+	// margin makes us give up just before the peer's deadline fires.
+	extractTimeout = rpc.DispatchTimeout - 30*time.Second
+	// applyTimeout bounds a remote store write; no human is in the loop.
+	applyTimeout = 60 * time.Second
+)
 
 // brewShellenv sources Homebrew's environment first, since a non-interactive ssh on
 // macOS lacks brew — and thus a brew-installed cookiesync — on PATH.
@@ -79,7 +92,7 @@ func NewSSHBackend(runner SSHRunner, target, origin string) SSHBackend {
 // Extract drives the peer's "cookiesync rpc extract" and parses the wire cookie
 // records it streams back.
 func (b SSHBackend) Extract(ctx context.Context, browser, profile string) (Extracted, error) {
-	out, err := b.runner.Run(ctx, b.target, b.extractCmd(browser, profile), nil)
+	out, err := b.run(ctx, extractTimeout, "rpc extract", b.extractCmd(browser, profile), nil)
 	if err != nil {
 		return Extracted{}, err
 	}
@@ -103,7 +116,7 @@ func (b SSHBackend) Apply(ctx context.Context, browser, profile string, cookies 
 	if err != nil {
 		return 0, err
 	}
-	out, err := b.runner.Run(ctx, b.target, b.applyCmd(browser, profile), body)
+	out, err := b.run(ctx, applyTimeout, "rpc apply", b.applyCmd(browser, profile), body)
 	if err != nil {
 		return 0, err
 	}
@@ -114,6 +127,23 @@ func (b SSHBackend) Apply(ctx context.Context, browser, profile string, cookies 
 		return 0, fmt.Errorf("parse rpc apply from %s: %w", b.target, err)
 	}
 	return payload.Applied, nil
+}
+
+// run drives one remote rpc call bounded by timeout. A failure names the operation and
+// peer; when the deadline killed the call the wrapped error is the context's, since
+// exec.CommandContext reports the kill as a bare exit error that loses
+// context.DeadlineExceeded.
+func (b SSHBackend) run(ctx context.Context, timeout time.Duration, op, remoteCmd string, stdin []byte) (string, error) {
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	out, err := b.runner.Run(ctx, b.target, remoteCmd, stdin)
+	if err == nil {
+		return out, nil
+	}
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		err = ctxErr
+	}
+	return "", fmt.Errorf("%s on %s: %w", op, b.target, err)
 }
 
 func (b SSHBackend) extractCmd(browser, profile string) string {

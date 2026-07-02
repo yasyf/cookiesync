@@ -177,6 +177,7 @@ func TestReconcilePassConvergesWarmLocalSkipsRemote(t *testing.T) {
 		Recorder:    &countingRecorder{},
 		LocalSource: local,
 		SourceFor:   func(string) Source { return peer },
+		LockFor:     testLockFor(),
 	}
 	driver := NewDriver(store, self, deps)
 

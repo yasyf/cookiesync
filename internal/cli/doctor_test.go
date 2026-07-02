@@ -22,6 +22,7 @@ func passing() doctorEnv {
 	return doctorEnv{
 		helper:   ok("key helper"),
 		socket:   ok("helper socket"),
+		keyCache: ok("key cache"),
 		mesh:     ok("mesh"),
 		manifest: ok("manifest"),
 		state:    ok("state"),
@@ -39,7 +40,7 @@ func TestDoctorAllGreenExitsZero(t *testing.T) {
 		t.Fatalf("runDoctor all-green = %v, want nil", err)
 	}
 	got := out.String()
-	for _, label := range []string{"key helper", "helper socket", "mesh", "manifest", "state", "browsers"} {
+	for _, label := range []string{"key helper", "helper socket", "key cache", "mesh", "manifest", "state", "browsers"} {
 		if !strings.Contains(got, "OK   "+label) {
 			t.Errorf("doctor output missing OK line for %q:\n%s", label, got)
 		}
@@ -67,8 +68,8 @@ func TestDoctorFailingCheckExitsNonZero(t *testing.T) {
 	if err == nil {
 		t.Fatal("runDoctor with two failing checks = nil error, want non-nil")
 	}
-	if !strings.Contains(err.Error(), "2 of 6 checks failed") {
-		t.Fatalf("doctor error = %v, want \"2 of 6 checks failed\"", err)
+	if !strings.Contains(err.Error(), "2 of 7 checks failed") {
+		t.Fatalf("doctor error = %v, want \"2 of 7 checks failed\"", err)
 	}
 	got := out.String()
 	if !strings.Contains(got, "FAIL key helper: not installed") {

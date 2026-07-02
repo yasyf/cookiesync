@@ -69,8 +69,8 @@ func TestHandleWhoamiWireShape(t *testing.T) {
 }
 
 // TestHandleAuthStatusWireShape proves auth_status reports cache warmth under the
-// frozen {"endpoint", "authenticated"} shape: true once a key is cached for the
-// endpoint, false otherwise.
+// frozen {"endpoint", "authenticated", "degraded"} shape: authenticated once a key is
+// cached for the endpoint, degraded while the cache is memory-wrapped.
 func TestHandleAuthStatusWireShape(t *testing.T) {
 	cache := newFakeCache()
 	st := stateWith("me@laptop", "")
@@ -82,7 +82,7 @@ func TestHandleAuthStatusWireShape(t *testing.T) {
 	if err != nil {
 		t.Fatalf("auth_status cold: %v", err)
 	}
-	if got := marshalResult(t, cold); got != `{"authenticated":false,"endpoint":"me@laptop:chrome:Default"}` {
+	if got := marshalResult(t, cold); got != `{"authenticated":false,"degraded":false,"endpoint":"me@laptop:chrome:Default"}` {
 		t.Fatalf("cold auth_status = %s", got)
 	}
 
@@ -91,8 +91,27 @@ func TestHandleAuthStatusWireShape(t *testing.T) {
 	if err != nil {
 		t.Fatalf("auth_status warm: %v", err)
 	}
-	if got := marshalResult(t, warm); got != `{"authenticated":true,"endpoint":"me@laptop:chrome:Default"}` {
+	if got := marshalResult(t, warm); got != `{"authenticated":true,"degraded":false,"endpoint":"me@laptop:chrome:Default"}` {
 		t.Fatalf("warm auth_status = %s", got)
+	}
+}
+
+// TestHandleAuthStatusReportsDegradedCache proves auth_status surfaces the cache's
+// degradation state: degraded=true over a memory-wrapped cache, independent of warmth.
+func TestHandleAuthStatusReportsDegradedCache(t *testing.T) {
+	cache := newFakeCache()
+	cache.degraded = true
+	st := stateWith("me@laptop", "")
+	fakeMesh(t, "me@laptop")
+	d := New(&fakeConsent{}, cache, nil, staticProbe(SessionSnapshot{}), &recordingRunner{}, fixedState{st: st}, fixedState{st: st})
+	_ = cache.Put(context.Background(), endpointID("me@laptop", "chrome", "Default"), []byte("k"), 0)
+
+	got, err := d.handleAuthStatus(context.Background(), map[string]any{"browser": "chrome"})
+	if err != nil {
+		t.Fatalf("auth_status degraded: %v", err)
+	}
+	if marshalResult(t, got) != `{"authenticated":true,"degraded":true,"endpoint":"me@laptop:chrome:Default"}` {
+		t.Fatalf("degraded auth_status = %s", marshalResult(t, got))
 	}
 }
 

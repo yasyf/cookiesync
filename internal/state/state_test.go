@@ -270,10 +270,37 @@ func TestDefaultSettingsSerialize(t *testing.T) {
 		Interval:      "15m",
 		IdleThreshold: "5m",
 		WatchDebounce: "3s",
-		OpTimeout:     "2m",
 		AuthTTL:       "5m",
 	}
 	if got != want {
 		t.Fatalf("default settings JSON = %+v, want %+v", got, want)
+	}
+}
+
+// TestSettingsLoadToleratesRemovedOpTimeout proves a state.json written before the dead
+// op_timeout knob was deleted still loads: the leftover key is ignored, the surviving
+// knobs parse.
+func TestSettingsLoadToleratesRemovedOpTimeout(t *testing.T) {
+	store, path := newTestStore(t, time.Unix(1_700_000_000, 0))
+	body := `{"settings":{"interval":"10m","idle_threshold":"4m","watch_debounce":"5s","op_timeout":"2m","auth_ttl":"7m"}}`
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatalf("mkdir config dir: %v", err)
+	}
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatalf("seed state file: %v", err)
+	}
+
+	st, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load with legacy op_timeout key: %v", err)
+	}
+	want := Settings{
+		Interval:      10 * time.Minute,
+		IdleThreshold: 4 * time.Minute,
+		WatchDebounce: 5 * time.Second,
+		AuthTTL:       7 * time.Minute,
+	}
+	if st.Settings != want {
+		t.Fatalf("settings = %+v, want %+v", st.Settings, want)
 	}
 }

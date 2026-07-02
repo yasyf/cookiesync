@@ -7,15 +7,22 @@
 //
 // SecureEnclaveWrapper drives the installed, Developer-ID-signed
 // cookiesync-keyhelper.app (cache-newkey / cache-wrap / cache-unwrap /
-// cache-dropkey) through the helper bridge. A missing helper fails closed. Tests
-// inject a Wrapper double and a clock, so the cache logic is exercised without any
-// macOS API.
+// cache-dropkey) through the helper bridge. A missing helper fails closed. When
+// the Enclave refuses the per-boot key because no user is present (locked screen,
+// screen-sharing session), OpenWrapper degrades to an in-memory wrapper instead of
+// killing the daemon; see ErrSEPresenceUnavailable. The degradation self-heals:
+// every KeyCache.Put re-probes cache-newkey until the keybag unlocks, then swaps to
+// the real Enclave wrapper and evicts every identity-wrapped entry so cached keys
+// re-prime Enclave-wrapped. Tests inject a Wrapper double and a clock, so the cache
+// logic is exercised without any macOS API.
 package cache
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -23,12 +30,26 @@ import (
 	"github.com/yasyf/cookiesync/internal/helper"
 )
 
+// ErrSEPresenceUnavailable reports that the Secure Enclave refused the per-boot key
+// because the data-protection keybag is locked (screen locked / no user present).
+// OpenWrapper returns it alongside a degraded in-memory wrapper: callers log the
+// degradation and proceed, or fail as usual on any other error.
+var ErrSEPresenceUnavailable = errors.New("secure-enclave presence unavailable")
+
 // Wrapper wraps and unwraps key bytes so the at-rest cache value is opaque off-box.
 type Wrapper interface {
 	// Wrap returns an opaque blob that only Unwrap can reverse.
 	Wrap(ctx context.Context, plaintext []byte) ([]byte, error)
 	// Unwrap recovers the plaintext from a blob produced by Wrap.
 	Unwrap(ctx context.Context, blob []byte) ([]byte, error)
+}
+
+// KeyWrapper is what OpenWrapper returns: a Wrapper plus Close, which drops the
+// key material backing the wrapped blobs.
+type KeyWrapper interface {
+	Wrapper
+	// Close drops whatever backs the wrapped blobs, making them unrecoverable.
+	Close(ctx context.Context) error
 }
 
 // SecureEnclaveWrapper wraps key bytes against a per-boot ephemeral Secure-Enclave
@@ -54,7 +75,14 @@ func newLabel() (string, error) {
 // fresh random label) through bridge and returns a wrapper bound to it. The caller
 // must Close the wrapper to drop the Enclave key. bridge's zero value resolves the
 // installed signed helper, failing closed if absent.
-func OpenWrapper(ctx context.Context, bridge helper.Bridge) (*SecureEnclaveWrapper, error) {
+//
+// When the keybag is unavailable (helper exit 3: screen locked, no user present),
+// OpenWrapper returns a degraded wrapper together with an error matching
+// ErrSEPresenceUnavailable, so the caller can warn and proceed with cached keys
+// held only in process memory. The degraded wrapper heals itself: each KeyCache.Put
+// re-probes cache-newkey and swaps to the Enclave once the keybag unlocks. Any
+// other non-zero exit fails with the helper's stderr in the error.
+func OpenWrapper(ctx context.Context, bridge helper.Bridge) (KeyWrapper, error) {
 	label, err := newLabel()
 	if err != nil {
 		return nil, err
@@ -63,10 +91,16 @@ func OpenWrapper(ctx context.Context, bridge helper.Bridge) (*SecureEnclaveWrapp
 	if err != nil {
 		return nil, err
 	}
-	if result.Code != 0 {
-		return nil, fmt.Errorf("cache-newkey exited %d (no Secure Enclave or keygen refused)", result.Code)
+	switch result.Code {
+	case 0:
+		return &SecureEnclaveWrapper{helper: bridge, label: label}, nil
+	case helper.CodePresenceUnavailable:
+		return &healingWrapper{bridge: bridge, label: label}, fmt.Errorf("cache-newkey exited %d (%s): %w",
+			result.Code, bytes.TrimSpace(result.Stderr), ErrSEPresenceUnavailable)
+	default:
+		return nil, fmt.Errorf("cache-newkey exited %d (no Secure Enclave or keygen refused): %s",
+			result.Code, bytes.TrimSpace(result.Stderr))
 	}
-	return &SecureEnclaveWrapper{helper: bridge, label: label}, nil
 }
 
 // Label is the per-boot Enclave key label this wrapper drives.
@@ -79,7 +113,8 @@ func (w *SecureEnclaveWrapper) Wrap(ctx context.Context, plaintext []byte) ([]by
 		return nil, err
 	}
 	if result.Code != 0 {
-		return nil, fmt.Errorf("cache-wrap exited %d (key missing or encrypt failed)", result.Code)
+		return nil, fmt.Errorf("cache-wrap exited %d (key missing or encrypt failed): %s",
+			result.Code, bytes.TrimSpace(result.Stderr))
 	}
 	return result.Stdout, nil
 }
@@ -91,7 +126,8 @@ func (w *SecureEnclaveWrapper) Unwrap(ctx context.Context, blob []byte) ([]byte,
 		return nil, err
 	}
 	if result.Code != 0 {
-		return nil, fmt.Errorf("cache-unwrap exited %d (key missing or decrypt failed)", result.Code)
+		return nil, fmt.Errorf("cache-unwrap exited %d (key missing or decrypt failed): %s",
+			result.Code, bytes.TrimSpace(result.Stderr))
 	}
 	return result.Stdout, nil
 }
@@ -105,9 +141,98 @@ func (w *SecureEnclaveWrapper) Close(ctx context.Context) error {
 	return nil
 }
 
-// entry is one cached key: the wrapped blob and its absolute expiry.
+// memoryWrapper is the degraded inner of a healingWrapper: identity Wrap/Unwrap over
+// copies, so cached keys live only in this process's memory — nothing ever touches
+// the Enclave, the keychain, or disk — and Close has nothing to drop.
+type memoryWrapper struct{}
+
+func (memoryWrapper) Wrap(_ context.Context, plaintext []byte) ([]byte, error) {
+	return bytes.Clone(plaintext), nil
+}
+
+func (memoryWrapper) Unwrap(_ context.Context, blob []byte) ([]byte, error) {
+	return bytes.Clone(blob), nil
+}
+
+func (memoryWrapper) Close(context.Context) error { return nil }
+
+// healingWrapper is the ErrSEPresenceUnavailable fallback: it starts over the
+// identity memoryWrapper and swaps — permanently and at most once — to the real
+// SecureEnclaveWrapper the first time a heal re-probe finds the keybag unlocked.
+// KeyCache drives heal from Put and evicts every entry on the swap, so no
+// identity-wrapped blob outlives the degradation.
+type healingWrapper struct {
+	bridge helper.Bridge
+	label  string
+
+	mu sync.Mutex
+	se *SecureEnclaveWrapper
+}
+
+// current is the wrapper blobs are wrapped and unwrapped with right now: the
+// Enclave wrapper once healed, the identity memoryWrapper while degraded.
+func (w *healingWrapper) current() Wrapper {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.se != nil {
+		return w.se
+	}
+	return memoryWrapper{}
+}
+
+func (w *healingWrapper) degraded() bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.se == nil
+}
+
+// heal re-probes cache-newkey while degraded, returning the wrapper to wrap with
+// and whether this call performed the memory-to-Enclave swap. A probe exit 3 stays
+// degraded silently; any other non-zero exit fails the caller's Put loudly.
+func (w *healingWrapper) heal(ctx context.Context) (Wrapper, bool, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.se != nil {
+		return w.se, false, nil
+	}
+	result, err := w.bridge.CacheNewkey(ctx, w.label)
+	if err != nil {
+		return nil, false, err
+	}
+	switch result.Code {
+	case 0:
+		w.se = &SecureEnclaveWrapper{helper: w.bridge, label: w.label}
+		return w.se, true, nil
+	case helper.CodePresenceUnavailable:
+		return memoryWrapper{}, false, nil
+	default:
+		return nil, false, fmt.Errorf("cache-newkey re-probe exited %d (no Secure Enclave or keygen refused): %s",
+			result.Code, bytes.TrimSpace(result.Stderr))
+	}
+}
+
+func (w *healingWrapper) Wrap(ctx context.Context, plaintext []byte) ([]byte, error) {
+	return w.current().Wrap(ctx, plaintext)
+}
+
+func (w *healingWrapper) Unwrap(ctx context.Context, blob []byte) ([]byte, error) {
+	return w.current().Unwrap(ctx, blob)
+}
+
+func (w *healingWrapper) Close(ctx context.Context) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.se == nil {
+		return nil
+	}
+	return w.se.Close(ctx)
+}
+
+// entry is one cached key: the wrapped blob, the wrapper that produced it, and its
+// absolute expiry.
 type entry struct {
 	blob      []byte
+	wrapper   Wrapper
 	expiresAt time.Time
 }
 
@@ -117,8 +242,13 @@ type entry struct {
 // persisted to disk and never logged. Eviction is lazy — there is no background
 // goroutine — so an expired entry is dropped only when next requested or evicted
 // explicitly. The clock is injectable for tests.
+//
+// Over a degraded healingWrapper, each Put first re-probes the Enclave: the Put
+// that heals evicts every identity-wrapped entry, so cached keys re-prime
+// Enclave-wrapped, and Degraded flips false.
 type KeyCache struct {
 	wrapper Wrapper
+	healer  *healingWrapper
 	now     func() time.Time
 
 	mu      sync.Mutex
@@ -132,24 +262,68 @@ func NewKeyCache(wrapper Wrapper) *KeyCache {
 
 // NewKeyCacheWithClock builds a cache over wrapper with an injected clock, for tests.
 func NewKeyCacheWithClock(wrapper Wrapper, now func() time.Time) *KeyCache {
-	return &KeyCache{wrapper: wrapper, now: now, entries: make(map[string]entry)}
+	healer, _ := wrapper.(*healingWrapper)
+	return &KeyCache{wrapper: wrapper, healer: healer, now: now, entries: make(map[string]entry)}
+}
+
+// Degraded reports whether cached keys are currently identity-wrapped in process
+// memory because the Secure Enclave refused its per-boot key at open. It flips
+// false permanently once a Put heals the wrapper.
+func (c *KeyCache) Degraded() bool {
+	return c.healer != nil && c.healer.degraded()
+}
+
+// inner is the wrapper entries must have been wrapped with to be served.
+func (c *KeyCache) inner() Wrapper {
+	if c.healer == nil {
+		return c.wrapper
+	}
+	return c.healer.current()
+}
+
+// heal re-probes a degraded healer and evicts every entry on the swap; with no
+// healer it hands back the cache's own wrapper untouched.
+func (c *KeyCache) heal(ctx context.Context) (Wrapper, error) {
+	if c.healer == nil {
+		return c.wrapper, nil
+	}
+	inner, healed, err := c.healer.heal(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if healed {
+		c.EvictAll()
+	}
+	return inner, nil
 }
 
 // Put wraps key and records it under endpointID with the given TTL, overwriting
 // any existing entry.
 func (c *KeyCache) Put(ctx context.Context, endpointID string, key []byte, ttl time.Duration) error {
-	blob, err := c.wrapper.Wrap(ctx, key)
-	if err != nil {
-		return err
+	for {
+		inner, err := c.heal(ctx)
+		if err != nil {
+			return err
+		}
+		blob, err := inner.Wrap(ctx, key)
+		if err != nil {
+			return err
+		}
+		c.mu.Lock()
+		if inner == c.inner() {
+			c.entries[endpointID] = entry{blob: blob, wrapper: inner, expiresAt: c.now().Add(ttl)}
+			c.mu.Unlock()
+			return nil
+		}
+		// A concurrent Put healed the wrapper mid-wrap; re-wrap with the Enclave so
+		// no identity blob outlives the swap.
+		c.mu.Unlock()
 	}
-	c.mu.Lock()
-	c.entries[endpointID] = entry{blob: blob, expiresAt: c.now().Add(ttl)}
-	c.mu.Unlock()
-	return nil
 }
 
 // Get returns the cached key for endpointID, unwrapping it transiently. It returns
-// (nil, false, nil) on a miss: no entry, or an expired entry (which it evicts).
+// (nil, false, nil) on a miss: no entry, an expired entry (which it evicts), or an
+// entry wrapped before a heal swap (which the healing Put's eviction drops).
 func (c *KeyCache) Get(ctx context.Context, endpointID string) ([]byte, bool, error) {
 	c.mu.Lock()
 	e, ok := c.entries[endpointID]
@@ -164,7 +338,10 @@ func (c *KeyCache) Get(ctx context.Context, endpointID string) ([]byte, bool, er
 	}
 	c.mu.Unlock()
 
-	key, err := c.wrapper.Unwrap(ctx, e.blob)
+	if e.wrapper != c.inner() {
+		return nil, false, nil
+	}
+	key, err := e.wrapper.Unwrap(ctx, e.blob)
 	if err != nil {
 		return nil, false, err
 	}

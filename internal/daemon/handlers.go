@@ -9,6 +9,7 @@ import (
 	"github.com/yasyf/cookiesync/internal/cookie"
 	"github.com/yasyf/cookiesync/internal/engine"
 	"github.com/yasyf/cookiesync/internal/state"
+	synckit "github.com/yasyf/synckit/rpc"
 )
 
 // handleSync converges the union of every tracked endpoint, suppressing the origin
@@ -104,7 +105,10 @@ func (d *Daemon) handleExtract(ctx context.Context, params map[string]any) (any,
 
 // handleApply ingests a merged wire cookie array and writes it to this host's store,
 // recording the anti-echo digest before the write so the induced filesystem event is
-// recognized as the daemon's own echo. Emits the frozen {"applied": int}.
+// recognized as the daemon's own echo. Concurrent applies to the same endpoint
+// serialize behind the engine's per-endpoint apply lock — the same mutex a converge
+// pass's local write holds — keeping the recorded digest true to the store's final
+// content; distinct endpoints apply concurrently. Emits the frozen {"applied": int}.
 func (d *Daemon) handleApply(ctx context.Context, params map[string]any) (any, error) {
 	browser, err := stringParam(params, "browser")
 	if err != nil {
@@ -119,7 +123,9 @@ func (d *Daemon) handleApply(ctx context.Context, params map[string]any) (any, e
 	if err != nil {
 		return nil, err
 	}
-	d.engine.Recorder().RecordApplied(endpointID(self, browser, profile), cookie.LogicalDigest(cookies))
+	id := endpointID(self, browser, profile)
+	defer d.engine.ApplyLock(id).Unlock()
+	d.engine.Recorder().RecordApplied(id, cookie.LogicalDigest(cookies))
 	applied, err := engine.NewCachedKeySource(d.cache, self).Apply(ctx, browser, profile, cookies)
 	if err != nil {
 		return nil, err
@@ -153,8 +159,10 @@ func (d *Daemon) handlePrimeAuth(ctx context.Context, params map[string]any) (an
 	return map[string]any{"primed": true, "endpoint": endpointID(self, browser, profile)}, nil
 }
 
-// handleAuthStatus reports whether the endpoint's key is warm in the cache, the frozen
-// {"endpoint", "authenticated"} shape.
+// handleAuthStatus reports whether the endpoint's key is warm in the cache and whether
+// the cache is degraded to process memory (Secure Enclave presence unavailable at
+// open, not yet healed by a Put), the frozen {"endpoint", "authenticated", "degraded"}
+// shape.
 func (d *Daemon) handleAuthStatus(ctx context.Context, params map[string]any) (any, error) {
 	browser, err := stringParam(params, "browser")
 	if err != nil {
@@ -170,7 +178,7 @@ func (d *Daemon) handleAuthStatus(ctx context.Context, params map[string]any) (a
 	if err != nil {
 		return nil, err
 	}
-	return map[string]any{"endpoint": id, "authenticated": ok}, nil
+	return map[string]any{"endpoint": id, "authenticated": ok, "degraded": d.cache.Degraded()}, nil
 }
 
 // handleGetCookies renders one or more urls' cookies from the cached key, merged into
@@ -218,10 +226,49 @@ func (d *Daemon) handleGetCookies(ctx context.Context, params map[string]any) (a
 }
 
 // primeAuth obtains the Safe Storage key via the presence gate (releaseKey) and caches
-// it under the endpoint's TTL. On a verified routed approval this host releases its own
-// key non-interactively — the key never leaves this box. A cold remote mesh fails closed
-// with AuthRequired. Mirrors the Python prime_auth.
+// it under the endpoint's TTL. Concurrent calls for the same endpoint collapse into
+// one primeFlight flight — one consent prompt, human or routed — whose released key
+// every waiter shares. The flight runs detached from every caller's ctx, bounded only
+// by the dispatch timeout, so a caller that disconnects mid-consent neither poisons
+// the flight for the survivors nor stays parked behind it: it returns its own
+// ctx.Err() immediately while the flight (and the prompt) runs on. On a verified
+// routed approval this host releases its own key non-interactively — the key never
+// leaves this box. A cold remote mesh fails closed with AuthRequired. Mirrors the
+// Python prime_auth.
 func (d *Daemon) primeAuth(ctx context.Context, browser, profile, reason string) (cookie.AesKey, error) {
+	self, err := meshSelf(ctx)
+	if err != nil {
+		return nil, err
+	}
+	id := endpointID(self, browser, profile)
+	ch := d.primeFlight.DoChan(id, func() (any, error) {
+		fctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), synckit.DispatchTimeout)
+		defer cancel()
+		return d.releaseAndCacheKey(fctx, id, browser, profile, reason)
+	})
+	select {
+	case res := <-ch:
+		if res.Err != nil {
+			return nil, res.Err
+		}
+		return res.Val.(cookie.AesKey), nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+// releaseAndCacheKey is one primeAuth flight: it re-probes the cache — a straggler
+// whose fresh flight starts just after another flight primed the endpoint returns the
+// warm key instead of re-prompting — then releases the key behind the presence gate
+// and caches it under id with the configured TTL.
+func (d *Daemon) releaseAndCacheKey(ctx context.Context, id, browser, profile, reason string) (cookie.AesKey, error) {
+	cached, ok, err := d.cache.Get(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	if ok {
+		return cookie.AesKey(cached), nil
+	}
 	st, err := d.state.Load(ctx)
 	if err != nil {
 		return nil, err
@@ -234,11 +281,6 @@ func (d *Daemon) primeAuth(ctx context.Context, browser, profile, reason string)
 	if err != nil {
 		return nil, err
 	}
-	self, err := meshSelf(ctx)
-	if err != nil {
-		return nil, err
-	}
-	id := endpointID(self, browser, profile)
 	if err := d.cache.Put(ctx, id, []byte(key), st.Settings.AuthTTL); err != nil {
 		return nil, err
 	}
@@ -248,8 +290,11 @@ func (d *Daemon) primeAuth(ctx context.Context, browser, profile, reason string)
 // releaseKey obtains the Safe Storage key behind the presence gate that applies. A hard
 // consent route (ConsentRouteHard) to a live ConsentRouteTo peer wins outright — this
 // host routes the gate even when it looks locally attended. Otherwise a live local
-// session releases the key behind one Touch ID tap, and a cold local session routes the
-// gate to the active peer.
+// session releases the key behind one Touch ID tap — serialized across endpoints by
+// promptGate so distinct cold primes never stack two consent sheets — and a cold local
+// session routes the gate to the active peer. The gate is never held across
+// routedRelease: an inbound request_consent must stay promptable while this host's
+// own outbound route is in flight, or the same-host routed-consent cycle deadlocks.
 func (d *Daemon) releaseKey(ctx context.Context, st *state.State, b cookie.Browser, browser, profile, reason string) (cookie.AesKey, error) {
 	if st.ConsentRouteHard && st.ConsentRouteTo != "" {
 		live, err := d.peerIsLive(ctx, st.ConsentRouteTo)
@@ -265,6 +310,8 @@ func (d *Daemon) releaseKey(ctx context.Context, st *state.State, b cookie.Brows
 		return nil, err
 	}
 	if live {
+		d.promptGate.Lock()
+		defer d.promptGate.Unlock()
 		return d.consent.ObtainKey(ctx, b, reason)
 	}
 	return d.routedRelease(ctx, b, browser, profile)

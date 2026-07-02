@@ -29,7 +29,10 @@
 //   0 = ok
 //   1 = cancelled / denied / operation failed (key missing, decrypt failed, bad input)
 //   2 = unavailable (no biometrics + no passcode, no Secure Enclave, not found,
-//       non-interactive, key generation refused)
+//       non-interactive, key generation misconfigured)
+//   3 = presence unavailable: the data-protection keybag refused the operation with
+//       errSecInteractionNotAllowed (-25308) — screen locked / no user present;
+//       retry after unlock
 
 import Foundation
 import LocalAuthentication
@@ -40,6 +43,19 @@ let CACHE_TAG_PREFIX = "cookiesync.cache."
 
 func fail(_ message: String) {
     FileHandle.standardError.write(Data("keyhelper: \(message)\n".utf8))
+}
+
+// failSec reports a failed Security call to stderr (operation + description + numeric
+// OSStatus) and classifies it: errSecInteractionNotAllowed (-25308) means the
+// data-protection keybag refused the call because no user is present (locked screen)
+// and exits 3; anything else exits `otherwise`.
+func failSec(_ operation: String, _ error: Unmanaged<CFError>?, otherwise: Int32) -> Int32 {
+    let nsError = error!.takeRetainedValue() as Error as NSError
+    fail("\(operation) failed: \(nsError.localizedDescription) (OSStatus \(nsError.code))")
+    if nsError.domain == NSOSStatusErrorDomain, nsError.code == Int(errSecInteractionNotAllowed) {
+        return 3
+    }
+    return otherwise
 }
 
 // MARK: - Consent vault (was keyvault.swift)
@@ -199,7 +215,7 @@ func deleteStaleCacheKeys() {
     ] as CFDictionary)
 }
 
-func loadPrivateKey(_ label: String) -> SecKey? {
+func loadPrivateKey(_ label: String) -> (key: SecKey?, status: OSStatus) {
     let query: [String: Any] = [
         kSecClass as String: kSecClassKey,
         kSecAttrKeyType as String: kSecAttrKeyTypeECSECPrimeRandom,
@@ -210,10 +226,28 @@ func loadPrivateKey(_ label: String) -> SecKey? {
         kSecReturnRef as String: true,
     ]
     var item: CFTypeRef?
-    guard SecItemCopyMatching(query as CFDictionary, &item) == errSecSuccess else {
-        return nil
+    let status = SecItemCopyMatching(query as CFDictionary, &item)
+    guard status == errSecSuccess else {
+        return (nil, status)
     }
-    return (item as! SecKey)
+    return ((item as! SecKey), errSecSuccess)
+}
+
+// failKeyLookup classifies a failed SE cache-key lookup: the key is created under
+// kSecAttrAccessibleWhenUnlockedThisDeviceOnly, so a locked keybag refuses the item
+// lookup itself with errSecInteractionNotAllowed (-25308) — that exits 3, like
+// failSec. errSecItemNotFound is the documented exit-1 "no key" path; anything else
+// exits 1 (operation failed).
+func failKeyLookup(_ label: String, _ status: OSStatus) -> Int32 {
+    if status == errSecItemNotFound {
+        fail("no Secure-Enclave cache key for '\(label)'")
+        return 1
+    }
+    fail("SecItemCopyMatching failed: \(SecCopyErrorMessageString(status, nil) as String? ?? "\(status)") (OSStatus \(status))")
+    if status == errSecInteractionNotAllowed {
+        return 3
+    }
+    return 1
 }
 
 func cacheNewkey(_ label: String) -> Int32 {
@@ -226,8 +260,7 @@ func cacheNewkey(_ label: String) -> Int32 {
         .privateKeyUsage,
         &acError
     ) else {
-        fail("could not build access control: \(acError?.takeRetainedValue().localizedDescription ?? "unknown")")
-        return 2
+        return failSec("SecAccessControlCreateWithFlags", acError, otherwise: 2)
     }
     let attributes: [String: Any] = [
         kSecAttrKeyType as String: kSecAttrKeyTypeECSECPrimeRandom,
@@ -243,16 +276,15 @@ func cacheNewkey(_ label: String) -> Int32 {
     ]
     var genError: Unmanaged<CFError>?
     guard SecKeyCreateRandomKey(attributes as CFDictionary, &genError) != nil else {
-        fail("SecKeyCreateRandomKey failed: \(genError?.takeRetainedValue().localizedDescription ?? "unknown")")
-        return 2
+        return failSec("SecKeyCreateRandomKey", genError, otherwise: 2)
     }
     return 0
 }
 
 func cacheWrap(_ label: String) -> Int32 {
-    guard let privateKey = loadPrivateKey(label) else {
-        fail("no Secure-Enclave cache key for '\(label)'")
-        return 1
+    let (loaded, status) = loadPrivateKey(label)
+    guard let privateKey = loaded else {
+        return failKeyLookup(label, status)
     }
     guard let publicKey = SecKeyCopyPublicKey(privateKey) else {
         fail("could not derive public key for '\(label)'")
@@ -266,17 +298,16 @@ func cacheWrap(_ label: String) -> Int32 {
         plaintext as CFData,
         &encError
     ) else {
-        fail("SecKeyCreateEncryptedData failed: \(encError?.takeRetainedValue().localizedDescription ?? "unknown")")
-        return 1
+        return failSec("SecKeyCreateEncryptedData", encError, otherwise: 1)
     }
     FileHandle.standardOutput.write(blob as Data)
     return 0
 }
 
 func cacheUnwrap(_ label: String) -> Int32 {
-    guard let privateKey = loadPrivateKey(label) else {
-        fail("no Secure-Enclave cache key for '\(label)'")
-        return 1
+    let (loaded, status) = loadPrivateKey(label)
+    guard let privateKey = loaded else {
+        return failKeyLookup(label, status)
     }
     let blob = FileHandle.standardInput.readDataToEndOfFile()
     var decError: Unmanaged<CFError>?
@@ -286,8 +317,7 @@ func cacheUnwrap(_ label: String) -> Int32 {
         blob as CFData,
         &decError
     ) else {
-        fail("SecKeyCreateDecryptedData failed: \(decError?.takeRetainedValue().localizedDescription ?? "unknown")")
-        return 1
+        return failSec("SecKeyCreateDecryptedData", decError, otherwise: 1)
     }
     FileHandle.standardOutput.write(plaintext as Data)
     return 0

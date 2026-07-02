@@ -14,19 +14,17 @@ type Settings struct {
 	Interval      time.Duration
 	IdleThreshold time.Duration
 	WatchDebounce time.Duration
-	OpTimeout     time.Duration
 	AuthTTL       time.Duration
 }
 
 // DefaultSettings returns the cadence defaults: a 15m reconcile interval, a 5m idle
-// threshold, a 3s watch debounce, a 2m op timeout, and a 5m key-cache TTL — the same
-// defaults as the Python Settings dataclass.
+// threshold, a 3s watch debounce, and a 5m key-cache TTL — the same defaults as the
+// Python Settings dataclass.
 func DefaultSettings() Settings {
 	return Settings{
 		Interval:      15 * time.Minute,
 		IdleThreshold: 5 * time.Minute,
 		WatchDebounce: 3 * time.Second,
-		OpTimeout:     2 * time.Minute,
 		AuthTTL:       5 * time.Minute,
 	}
 }
@@ -82,7 +80,6 @@ type settingsJSON struct {
 	Interval      string `json:"interval"`
 	IdleThreshold string `json:"idle_threshold"`
 	WatchDebounce string `json:"watch_debounce"`
-	OpTimeout     string `json:"op_timeout"`
 	AuthTTL       string `json:"auth_ttl"`
 }
 
@@ -91,7 +88,6 @@ func (s Settings) toJSON() settingsJSON {
 		Interval:      FormatDuration(s.Interval),
 		IdleThreshold: FormatDuration(s.IdleThreshold),
 		WatchDebounce: FormatDuration(s.WatchDebounce),
-		OpTimeout:     FormatDuration(s.OpTimeout),
 		AuthTTL:       FormatDuration(s.AuthTTL),
 	}
 }
@@ -109,9 +105,6 @@ func settingsFromJSON(raw settingsJSON) (Settings, error) {
 	}
 	if s.WatchDebounce, err = ParseDuration(raw.WatchDebounce); err != nil {
 		return Settings{}, fmt.Errorf("watch_debounce: %w", err)
-	}
-	if s.OpTimeout, err = ParseDuration(raw.OpTimeout); err != nil {
-		return Settings{}, fmt.Errorf("op_timeout: %w", err)
 	}
 	if s.AuthTTL, err = ParseDuration(raw.AuthTTL); err != nil {
 		return Settings{}, fmt.Errorf("auth_ttl: %w", err)

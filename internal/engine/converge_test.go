@@ -2,11 +2,19 @@ package engine
 
 import (
 	"context"
+	"slices"
+	"sync"
 	"testing"
 
 	"github.com/yasyf/cookiesync/internal/cookie"
 	"github.com/yasyf/cookiesync/internal/state"
 )
+
+// testLockFor is a fresh per-test apply-lock seam over a private keyedLocks.
+func testLockFor() func(string) *sync.Mutex {
+	var locks keyedLocks
+	return locks.lock
+}
 
 // fakeSource is an in-memory Source: it serves a fixed cookie set and records every
 // Apply, so a test can assert what was written (or that nothing was) per endpoint.
@@ -92,6 +100,7 @@ func TestConvergeValueUnionNewestWins(t *testing.T) {
 		Recorder:    rec,
 		LocalSource: local,
 		SourceFor:   func(string) Source { return peer },
+		LockFor:     testLockFor(),
 	}
 
 	anchor := state.Endpoint{Host: self, Browser: "chrome", Profile: "Default"}
@@ -145,6 +154,7 @@ func TestConvergeIdempotentOnRerun(t *testing.T) {
 		Recorder:    rec,
 		LocalSource: local,
 		SourceFor:   func(string) Source { return peer },
+		LockFor:     testLockFor(),
 	}
 	anchor := state.Endpoint{Host: self, Browser: "chrome", Profile: "Default"}
 	peerEP := state.Endpoint{Host: peerHost, Browser: "chrome", Profile: "Default"}
@@ -178,6 +188,7 @@ func TestConvergeAntiEchoSuppressesSelfWrite(t *testing.T) {
 		Recorder:    rec,
 		LocalSource: local,
 		SourceFor:   func(string) Source { return peer },
+		LockFor:     testLockFor(),
 	}
 	anchor := state.Endpoint{Host: self, Browser: "chrome", Profile: "Default"}
 	peerEP := state.Endpoint{Host: "you@desktop", Browser: "chrome", Profile: "Default"}
@@ -220,6 +231,7 @@ func TestConvergeSkipsOriginHost(t *testing.T) {
 		Recorder:    &countingRecorder{},
 		LocalSource: local,
 		SourceFor:   func(string) Source { return originSrc },
+		LockFor:     testLockFor(),
 	}
 	anchor := state.Endpoint{Host: self, Browser: "chrome", Profile: "Default"}
 	originEP := state.Endpoint{Host: originHost, Browser: "chrome", Profile: "Default"}
@@ -254,6 +266,7 @@ func TestConvergeSkipsColdSameHostPeer(t *testing.T) {
 		Recorder:    &countingRecorder{},
 		LocalSource: local,
 		SourceFor:   func(string) Source { t.Fatal("no ssh source for a same-host peer"); return nil },
+		LockFor:     testLockFor(),
 	}
 
 	if _, err := Converge(ctx, anchor, []state.Endpoint{coldPeer}, "", deps); err != nil {
@@ -277,5 +290,47 @@ func TestConvergeColdAnchorNeedsAuth(t *testing.T) {
 	_, err := Converge(ctx, anchor, nil, "", deps)
 	if err == nil {
 		t.Fatalf("expected ErrNeedsAuth for a cold anchor")
+	}
+}
+
+// TestConvergeLocksLocalWritesOnly proves a converge takes the per-endpoint apply lock
+// for exactly the local endpoints it writes — the anchor and the same-host peer — and
+// never for a remote peer, whose apply crosses ssh and must not run under a held lock.
+// Every lock is released by the time Converge returns.
+func TestConvergeLocksLocalWritesOnly(t *testing.T) {
+	ctx := context.Background()
+	self := "me@laptop"
+
+	local := &fakeSource{cookies: []cookie.Cookie{ck(".x.com", "sid", "old", 100)}}
+	peer := &fakeSource{cookies: []cookie.Cookie{ck(".x.com", "sid", "new", 200)}}
+
+	var locks keyedLocks
+	var acquired []string
+	deps := ConvergeDeps{
+		SelfTarget:  self,
+		Cache:       warmCache{},
+		Recorder:    &countingRecorder{},
+		LocalSource: local,
+		SourceFor:   func(string) Source { return peer },
+		LockFor: func(endpointID string) *sync.Mutex {
+			acquired = append(acquired, endpointID)
+			return locks.lock(endpointID)
+		},
+	}
+	anchor := state.Endpoint{Host: self, Browser: "chrome", Profile: "Default"}
+	sameHost := state.Endpoint{Host: self, Browser: "arc", Profile: "Default"}
+	remote := state.Endpoint{Host: "you@desktop", Browser: "chrome", Profile: "Default"}
+
+	if _, err := Converge(ctx, anchor, []state.Endpoint{sameHost, remote}, "", deps); err != nil {
+		t.Fatalf("Converge: %v", err)
+	}
+	want := []string{string(anchor.ID()), string(sameHost.ID())}
+	if !slices.Equal(acquired, want) {
+		t.Fatalf("apply locks acquired for %v, want exactly the local endpoints %v", acquired, want)
+	}
+	for _, id := range want {
+		if !locks.locks[id].TryLock() {
+			t.Fatalf("apply lock for %s still held after Converge", id)
+		}
 	}
 }

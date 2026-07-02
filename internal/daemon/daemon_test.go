@@ -1,12 +1,20 @@
 package daemon
 
 import (
+	"bytes"
 	"context"
+	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
+	"github.com/yasyf/cookiesync/internal/cookie"
+	"github.com/yasyf/cookiesync/internal/engine"
 	"github.com/yasyf/cookiesync/internal/paths"
 	synckit "github.com/yasyf/synckit/rpc"
 )
@@ -99,6 +107,177 @@ func TestBuildOpensAndDropsTheEnclaveKey(t *testing.T) {
 	}
 }
 
+// TestBuildDegradedPresenceStartsWithMemoryCache proves a cache-newkey presence
+// refusal (helper exit 3: screen locked or screen-shared, errSecInteractionNotAllowed)
+// does not kill the daemon: Build warns exactly once — carrying the helper's OSStatus
+// diagnostic — and serves with the in-memory wrapper, whose cached keys round-trip in
+// process memory and leave the helper untouched after the one newkey probe.
+func TestBuildDegradedPresenceStartsWithMemoryCache(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	binary, logPath := writeStubHelper(t, 3, "keyhelper: cache-newkey failed: interaction not allowed (OSStatus -25308)")
+	restore := paths.SetHelperBinaryForTest(binary)
+	t.Cleanup(restore)
+	fakeMesh(t, "me@laptop")
+
+	var logs bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	ctx := context.Background()
+	d, closer, err := Build(ctx)
+	if err != nil {
+		t.Fatalf("Build with a presence-unavailable helper must degrade, got %v", err)
+	}
+
+	const warn = "Secure Enclave presence unavailable — screen-shared/locked; using in-memory key cache this session"
+	if got := strings.Count(logs.String(), warn); got != 1 {
+		t.Fatalf("degraded Build must WARN exactly once, got %d in:\n%s", got, logs.String())
+	}
+	if !strings.Contains(logs.String(), "level=WARN") || !strings.Contains(logs.String(), "OSStatus -25308") {
+		t.Fatalf("the WARN must log at level WARN with the helper diagnostic, got:\n%s", logs.String())
+	}
+
+	id := endpointID("me@laptop", "chrome", "Default")
+	if err := d.cache.Put(ctx, id, []byte("k"), 5*time.Minute); err != nil {
+		t.Fatalf("cache Put on the memory wrapper: %v", err)
+	}
+	if key, ok, err := d.cache.Get(ctx, id); err != nil || !ok || string(key) != "k" {
+		t.Fatalf("cache Get = %q, %v, %v, want k true nil", key, ok, err)
+	}
+	if !d.cache.Degraded() {
+		t.Fatalf("the cache must report Degraded while the keybag stays locked")
+	}
+	if err := closer(ctx); err != nil {
+		t.Fatalf("closer: %v", err)
+	}
+	if _, ok, _ := d.cache.Get(ctx, id); ok {
+		t.Fatalf("cache not evicted on shutdown")
+	}
+	// The helper is touched only for newkey probes — the open probe plus the Put's
+	// heal re-probe — never wrap/unwrap/dropkey while degraded.
+	lines := strings.Split(strings.TrimSpace(readLog(t, logPath)), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("a degraded open + one Put must probe the helper exactly twice, got:\n%s", readLog(t, logPath))
+	}
+	for _, line := range lines {
+		if !strings.HasPrefix(line, "cache-newkey ") {
+			t.Fatalf("a degraded session must touch the helper only for newkey probes, got:\n%s", readLog(t, logPath))
+		}
+	}
+	if lines[0] != lines[1] {
+		t.Fatalf("the heal re-probe must reuse the open probe's label, got:\n%s", readLog(t, logPath))
+	}
+}
+
+// TestBuildNoEnclaveStaysFatal proves a genuine cache-newkey refusal (exit 2: no
+// Secure Enclave or keygen misconfigured) still fails Build outright, surfacing the
+// helper's stderr diagnostic — only the presence refusal degrades.
+func TestBuildNoEnclaveStaysFatal(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	binary, _ := writeStubHelper(t, 2, "keyhelper: cache-newkey failed: no Secure Enclave (OSStatus -34018)")
+	restore := paths.SetHelperBinaryForTest(binary)
+	t.Cleanup(restore)
+	fakeMesh(t, "me@laptop")
+
+	d, closer, err := Build(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "cache-newkey exited 2") || !strings.Contains(err.Error(), "OSStatus -34018") {
+		t.Fatalf("Build = %v, want the fatal exit-2 error carrying the helper stderr", err)
+	}
+	if d != nil || closer != nil {
+		t.Fatalf("a fatal Build must return no daemon")
+	}
+}
+
+// TestConvergeMethodsShareOneExclusiveMutex proves every method that runs the
+// flock-wrapped converge pass — sync, reconcile, svc.sync, svc.reconcile — is
+// registered exclusive: two passes never hold the store lock at once, whichever
+// method drives them.
+func TestConvergeMethodsShareOneExclusiveMutex(t *testing.T) {
+	fakeMesh(t, "me@laptop")
+	var concurrent, peak atomic.Int32
+	store := &fakeStore{withLock: func(_ context.Context, fn func() error) error {
+		n := concurrent.Add(1)
+		for {
+			p := peak.Load()
+			if n <= p || peak.CompareAndSwap(p, n) {
+				break
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+		err := fn()
+		concurrent.Add(-1)
+		return err
+	}}
+	dispatcher := newConvergeDaemon(t, store, &fakeConsent{}).Dispatcher()
+
+	var wg sync.WaitGroup
+	for _, method := range []string{"sync", "reconcile", "svc.sync", "svc.reconcile", "sync"} {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if resp := dispatcher.Dispatch(context.Background(), request(method)); !resp.OK {
+				t.Errorf("dispatch %s: %s", method, resp.Error)
+			}
+		}()
+	}
+	wg.Wait()
+	if got := peak.Load(); got != 1 {
+		t.Errorf("peak concurrent converge passes = %d, want 1 (sync/reconcile must share the exclusive mutex)", got)
+	}
+}
+
+// TestRequestConsentAnswersWhileSyncHoldsTheFlock is the same-host routed-consent
+// cycle regression: request_consent must stay a concurrent handler, answering while a
+// sync pass holds the exclusive mutex. A host mid-pass that could not approve consent
+// would deadlock two hosts converging each other.
+func TestRequestConsentAnswersWhileSyncHoldsTheFlock(t *testing.T) {
+	fakeMesh(t, "me@laptop")
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	store := &fakeStore{withLock: func(_ context.Context, fn func() error) error {
+		close(entered)
+		<-release
+		return fn()
+	}}
+	consent := &fakeConsent{key: cookie.DeriveKey(cookie.SafeStorageKey("peanuts"))}
+	dispatcher := newConvergeDaemon(t, store, consent).Dispatcher()
+
+	syncDone := make(chan *synckit.Response, 1)
+	go func() { syncDone <- dispatcher.Dispatch(context.Background(), request("sync")) }()
+	<-entered
+
+	consentDone := make(chan *synckit.Response, 1)
+	go func() { consentDone <- dispatcher.Dispatch(context.Background(), request("request_consent")) }()
+	select {
+	case resp := <-consentDone:
+		if !resp.OK {
+			t.Errorf("request_consent mid-sync: %s", resp.Error)
+		}
+		if got := marshalResult(t, resp.Result); got != `{"endpoint":"e","nonce":"n","status":"approved"}` {
+			t.Errorf("request_consent = %s, want the approved echo", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("request_consent blocked behind a mid-pass sync — the routed-consent cycle regressed")
+	}
+
+	close(release)
+	if resp := <-syncDone; !resp.OK {
+		t.Errorf("sync: %s", resp.Error)
+	}
+}
+
+// newConvergeDaemon builds a daemon whose engine runs a real converge pass over the
+// injected store, for dispatcher-level concurrency tests. The probe reports a live
+// session so request_consent can approve locally.
+func newConvergeDaemon(t *testing.T, store *fakeStore, consent cookie.Consent) *Daemon {
+	t.Helper()
+	cache := newFakeCache()
+	st := stateWith("me@laptop", "")
+	eng := engine.New(store, cache, &recordingRunner{}, engine.NewDigestRecorder())
+	return New(consent, cache, eng, staticProbe(liveSession(currentUser(t))), &recordingRunner{}, fixedState{st: st}, fixedState{st: st})
+}
+
 func request(method string) *synckit.Request {
 	return &synckit.Request{Method: method, Params: map[string]any{
 		"browser": "chrome", "url": "https://x.com", "nonce": "n", "endpoint": "e", "cookies": []any{},
@@ -147,6 +326,25 @@ esac
 `
 	if err := os.WriteFile(binary, []byte(body), 0o755); err != nil { //nolint:gosec // test fixture script must be executable.
 		t.Fatalf("write fake cache helper: %v", err)
+	}
+	return binary, logPath
+}
+
+// writeStubHelper writes a fake cookiesync-keyhelper that logs every invocation, then
+// prints stderrMsg and exits with code — the cache-newkey refusal doubles (presence
+// exit 3, no-Enclave exit 2) the Build degradation tests drive.
+func writeStubHelper(t *testing.T, code int, stderrMsg string) (binary, logPath string) {
+	t.Helper()
+	dir := t.TempDir()
+	binary = filepath.Join(dir, "cookiesync-keyhelper")
+	logPath = filepath.Join(dir, "helper.log")
+	body := fmt.Sprintf(`#!/bin/sh
+printf '%%s %%s\n' "$1" "$2" >> %q
+echo %q >&2
+exit %d
+`, logPath, stderrMsg, code)
+	if err := os.WriteFile(binary, []byte(body), 0o755); err != nil { //nolint:gosec // test fixture script must be executable.
+		t.Fatalf("write stub helper: %v", err)
 	}
 	return binary, logPath
 }

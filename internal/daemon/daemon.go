@@ -12,7 +12,8 @@
 // (behind one Touch ID tap when a session is live, else by routing the user-presence
 // gate to the active peer and then releasing this host's own key non-interactively)
 // and caches it; get_cookies renders one or more urls' cookies from the cached key,
-// merged into one set; auth_status reports cache warmth; request_consent shows the
+// merged into one set; auth_status reports cache warmth and Secure-Enclave
+// degradation; request_consent shows the
 // Touch ID prompt for the named browser to the person at this machine and echoes the
 // requester's nonce + endpoint to bind the approval — the key never crosses hosts.
 //
@@ -27,8 +28,11 @@ package daemon
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"log/slog"
 	"os"
+	"sync"
 	"time"
 
 	"github.com/yasyf/cookiesync/internal/cache"
@@ -40,6 +44,7 @@ import (
 	"github.com/yasyf/cookiesync/internal/state"
 	synckit "github.com/yasyf/synckit/rpc"
 	"github.com/yasyf/synckit/syncservice"
+	"golang.org/x/sync/singleflight"
 )
 
 // consentReason is the default Touch ID prompt reason for a prime_auth with no
@@ -62,11 +67,15 @@ type AuthRequired struct {
 func (e *AuthRequired) Error() string { return e.Msg }
 
 // Cache is the slice of the key cache the daemon drives: the warmth read the engine
-// shares plus the put prime_auth seeds. Defined here, where it is consumed.
+// shares, the put prime_auth seeds, and the degradation state auth_status surfaces.
+// Defined here, where it is consumed.
 type Cache interface {
 	engine.KeyCache
 	// Put wraps key and records it under endpointID with the given TTL.
 	Put(ctx context.Context, endpointID string, key []byte, ttl time.Duration) error
+	// Degraded reports whether cached keys are identity-wrapped in process memory
+	// because the Secure Enclave refused its per-boot key at open; a later Put heals it.
+	Degraded() bool
 }
 
 // StateLoader loads the cookiesync state. It is the read seam the handlers resolve the
@@ -89,6 +98,19 @@ type Daemon struct {
 	state    StateLoader
 	registry RegistryLoader
 
+	// primeFlight collapses concurrent primeAuth calls for the same endpoint into
+	// one flight, so a burst of cold extracts costs one consent prompt — the
+	// serialization the transport's old global dispatch mutex used to provide,
+	// scoped to the endpoint.
+	primeFlight singleflight.Group
+
+	// promptGate serializes the interactive Touch ID prompts across endpoints —
+	// distinct cold primes and inbound request_consents never stack two consent
+	// sheets. It is held only around a consent.ObtainKey call, never across
+	// routedRelease or any outbound ssh, so the same-host routed-consent cycle
+	// cannot deadlock on it.
+	promptGate sync.Mutex
+
 	// newNonce mints a fresh routed-consent nonce. It is a field so a test can pin
 	// the nonce and assert the echo binding; production uses the crypto/rand source.
 	newNonce func() (string, error)
@@ -106,7 +128,10 @@ func Build(ctx context.Context) (*Daemon, func(context.Context) error, error) {
 	}
 
 	wrapper, err := cache.OpenWrapper(ctx, helper.Bridge{})
-	if err != nil {
+	switch {
+	case errors.Is(err, cache.ErrSEPresenceUnavailable):
+		slog.WarnContext(ctx, "Secure Enclave presence unavailable — screen-shared/locked; using in-memory key cache this session", "err", err)
+	case err != nil:
 		return nil, nil, err
 	}
 	keyCache := cache.NewKeyCache(wrapper)
@@ -142,9 +167,18 @@ func New(consent cookie.Consent, c Cache, eng *engine.Engine, probe Probe, runne
 	}
 }
 
-// Dispatcher builds the synckit Dispatcher with every peer and local method bound. The
-// transport serializes handlers behind one mutex, so two requests never race the
-// shared cache or the cross-process state flock.
+// Dispatcher builds the synckit Dispatcher with every peer and local method bound.
+// The transport dispatches handlers concurrently, so a host mid-pass keeps answering
+// its peers. Only sync and reconcile are registered exclusive: they run the
+// flock-wrapped converge pass, queueing behind the same per-dispatcher mutex as
+// svc.sync and svc.reconcile instead of contending on the non-reentrant flock.
+// Everything else stays concurrent — request_consent above all, since a routed
+// consent must be answerable while this host is itself mid-prime (the same-host
+// routed-consent cycle). The shared in-process state behind the concurrent handlers
+// (key cache, digest recorder) locks internally; handleApply serializes per endpoint
+// via the engine's apply lock — shared with a converge pass's local writes — primeAuth
+// single-flights per endpoint via primeFlight, and the interactive Touch ID prompt
+// serializes across endpoints behind promptGate.
 func (d *Daemon) Dispatcher() *synckit.Dispatcher {
 	dispatcher := synckit.NewDispatcher()
 	// The typed sync contract synckitd drives: svc.capabilities/list/reconcile/sync/
@@ -154,9 +188,9 @@ func (d *Daemon) Dispatcher() *synckit.Dispatcher {
 	// The bare fleet/local methods: extract/apply (the cookie value-union pull/push the
 	// peer SSHBackend drives), whoami, prime_auth, get_cookies, auth_status,
 	// request_consent. sync and reconcile stay too — the `cookiesync rpc sync|reconcile`
-	// fleet CLI still reaches them.
-	dispatcher.Register("sync", d.handleSync)
-	dispatcher.Register("reconcile", d.handleReconcile)
+	// fleet CLI still reaches them — and take the state flock, so they are exclusive.
+	dispatcher.RegisterExclusive("sync", d.handleSync)
+	dispatcher.RegisterExclusive("reconcile", d.handleReconcile)
 	dispatcher.Register("extract", d.handleExtract)
 	dispatcher.Register("apply", d.handleApply)
 	dispatcher.Register("whoami", d.handleWhoami)

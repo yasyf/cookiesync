@@ -12,6 +12,7 @@ import (
 	"github.com/yasyf/cookiesync/internal/helper"
 	"github.com/yasyf/cookiesync/internal/mesh"
 	"github.com/yasyf/cookiesync/internal/paths"
+	"github.com/yasyf/cookiesync/internal/rpc"
 	"github.com/yasyf/cookiesync/internal/state"
 	"github.com/yasyf/synckit/manifest"
 	"github.com/yasyf/synckit/syncservice"
@@ -36,6 +37,7 @@ type check struct {
 type doctorEnv struct {
 	helper   func(ctx context.Context) check
 	socket   func(ctx context.Context) check
+	keyCache func(ctx context.Context) check
 	mesh     func(ctx context.Context) check
 	manifest func(ctx context.Context) check
 	state    func(ctx context.Context) check
@@ -47,6 +49,7 @@ func (e doctorEnv) checks(ctx context.Context) []check {
 	return []check{
 		e.helper(ctx),
 		e.socket(ctx),
+		e.keyCache(ctx),
 		e.mesh(ctx),
 		e.manifest(ctx),
 		e.state(ctx),
@@ -91,6 +94,7 @@ func realDoctorEnv() doctorEnv {
 	return doctorEnv{
 		helper:   checkHelper,
 		socket:   checkSocket,
+		keyCache: checkKeyCache,
 		mesh:     checkMesh,
 		manifest: checkManifest,
 		state:    checkState,
@@ -137,6 +141,26 @@ func checkSocket(ctx context.Context) check {
 		return check{label: "helper socket", detail: fmt.Sprintf("not serving the typed contract at %s; run 'synckitd install' to start the resident helper (cookiesync helper-serve): %v", sock, err)}
 	}
 	return check{label: "helper socket", ok: true, detail: fmt.Sprintf("%s (svc protocol v%d)", sock, caps.ProtocolVersion)}
+}
+
+// checkKeyCache confirms the resident daemon's key cache is Secure-Enclave wrapped,
+// not degraded to plain process memory because the keybag was locked when the daemon
+// started. The degraded flag is cache-global, so the probe reads it off auth_status
+// for the default chrome endpoint — the endpoint itself is immaterial. Degradation
+// self-heals on the next prime once the screen unlocks.
+func checkKeyCache(ctx context.Context) check {
+	probeCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	var status struct {
+		Degraded bool `json:"degraded"`
+	}
+	if err := rpc.CallJSON(probeCtx, "auth_status", map[string]any{"browser": "chrome"}, &status); err != nil {
+		return check{label: "key cache", detail: fmt.Sprintf("auth_status probe failed: %v", err)}
+	}
+	if status.Degraded {
+		return check{label: "key cache", detail: "degraded: Secure Enclave presence was unavailable at daemon start; cached keys live in process memory until a prime after the screen unlocks"}
+	}
+	return check{label: "key cache", ok: true, detail: "Secure-Enclave wrapped"}
 }
 
 // checkMesh confirms this host has joined the synckit host mesh — that the shared

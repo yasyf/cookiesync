@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"sync"
 
 	"github.com/yasyf/cookiesync/internal/cookie"
 	"github.com/yasyf/cookiesync/internal/mesh"
@@ -31,6 +32,11 @@ type Engine struct {
 	cache    KeyCache
 	runner   SSHRunner
 	recorder cookie.Recorder
+
+	// applyLocks serializes writes to one endpoint's local store: the daemon's apply
+	// handler and a converge pass's local applies hold the same per-endpoint mutex, so
+	// the anti-echo digest is always recorded against the store's final content.
+	applyLocks keyedLocks
 }
 
 // New builds the sync engine over the state store and the injected collaborators.
@@ -41,6 +47,13 @@ func New(store Store, cache KeyCache, runner SSHRunner, recorder cookie.Recorder
 // Recorder is the anti-echo ledger the engine records applied digests through; the
 // daemon shares it with the watch loop.
 func (e *Engine) Recorder() cookie.Recorder { return e.recorder }
+
+// ApplyLock acquires endpointID's apply mutex and returns it held for the caller to
+// Unlock. The daemon's apply handler and a converge pass's local writes serialize
+// behind the same lock; it is never held across a peer call.
+func (e *Engine) ApplyLock(endpointID string) *sync.Mutex {
+	return e.applyLocks.lock(endpointID)
+}
 
 // Result is one endpoint's reconcile outcome enriched with the merged cookie count of
 // its converged group. Cookies is the size of the union written this pass for a
@@ -82,6 +95,7 @@ func (e *Engine) run(ctx context.Context, origin string) ([]Result, error) {
 		Recorder:    e.recorder,
 		LocalSource: NewCachedKeySource(e.cache, self),
 		SourceFor:   func(peer string) Source { return NewSSHBackend(e.runner, peer, self) },
+		LockFor:     e.ApplyLock,
 	}
 	driver := NewDriver(e.store, self, deps)
 	items, err := converge.Reconcile(ctx, e.store.WithLock, driver, newFetcher(), peers, origin)
