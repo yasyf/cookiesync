@@ -72,3 +72,8 @@ homebrew_casks:
       Wire up the watch daemon and reconcile tick, then track your first browser:
 
         cookiesync install
+
+release:
+  # The shared release workflow retries `goreleaser release` on transient
+  # failures; without this a retry after a partial publish 422s.
+  replace_existing_artifacts: true
