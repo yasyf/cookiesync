@@ -16,20 +16,22 @@ import (
 // (self, hosts) are preserved untouched by every write here, since all writes go
 // through the foreign-key-preserving hostregistry raw writer.
 const (
-	keySelfTarget   = "self_target"
-	keyBrowsers     = "browsers"
-	keySettings     = "settings"
-	keyConsentRoute = "consent_route_to"
+	keySelfTarget       = "self_target"
+	keyBrowsers         = "browsers"
+	keySettings         = "settings"
+	keyConsentRoute     = "consent_route_to"
+	keyConsentRouteHard = "consent_route_hard"
 )
 
 // State is cookiesync's full on-disk configuration for this host: how peers reach it,
 // the cadence settings, the optional consent route, and the convergent registry of
 // tracked browser endpoints.
 type State struct {
-	SelfTarget     string
-	Settings       Settings
-	ConsentRouteTo string
-	Browsers       cregistry.Registry[EndpointMeta]
+	SelfTarget       string
+	Settings         Settings
+	ConsentRouteTo   string
+	ConsentRouteHard bool
+	Browsers         cregistry.Registry[EndpointMeta]
 }
 
 // Endpoints returns the present (non-tombstoned) tracked endpoints, decoded from the
@@ -176,6 +178,14 @@ func (s *Store) SetConsentRoute(ctx context.Context, target string) error {
 	})
 }
 
+// SetConsentRouteHard records whether the consent gate must route to the configured
+// target even when this host looks locally attended.
+func (s *Store) SetConsentRouteHard(ctx context.Context, hard bool) error {
+	return s.cfg.UpdateRaw(ctx, func(raw map[string]json.RawMessage) error {
+		return putBool(raw, keyConsentRouteHard, hard)
+	})
+}
+
 // SetAuthTTL overrides the cached-key TTL setting, leaving the other cadence knobs
 // untouched.
 func (s *Store) SetAuthTTL(ctx context.Context, ttl time.Duration) error {
@@ -201,6 +211,11 @@ func stateFromRaw(raw map[string]json.RawMessage) (*State, error) {
 	if v, ok := raw[keyConsentRoute]; ok {
 		if err := json.Unmarshal(v, &st.ConsentRouteTo); err != nil {
 			return nil, fmt.Errorf("parse consent_route_to: %w", err)
+		}
+	}
+	if v, ok := raw[keyConsentRouteHard]; ok {
+		if err := json.Unmarshal(v, &st.ConsentRouteHard); err != nil {
+			return nil, fmt.Errorf("parse consent_route_hard: %w", err)
 		}
 	}
 	if v, ok := raw[keySettings]; ok {
@@ -258,6 +273,15 @@ func putSettings(raw map[string]json.RawMessage, settings Settings) error {
 }
 
 func putString(raw map[string]json.RawMessage, key, value string) error {
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		return fmt.Errorf("encode %s: %w", key, err)
+	}
+	raw[key] = encoded
+	return nil
+}
+
+func putBool(raw map[string]json.RawMessage, key string, value bool) error {
 	encoded, err := json.Marshal(value)
 	if err != nil {
 		return fmt.Errorf("encode %s: %w", key, err)

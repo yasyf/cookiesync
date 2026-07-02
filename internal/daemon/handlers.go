@@ -8,6 +8,7 @@ import (
 
 	"github.com/yasyf/cookiesync/internal/cookie"
 	"github.com/yasyf/cookiesync/internal/engine"
+	"github.com/yasyf/cookiesync/internal/state"
 )
 
 // handleSync converges the union of every tracked endpoint, suppressing the origin
@@ -127,7 +128,7 @@ func (d *Daemon) handleApply(ctx context.Context, params map[string]any) (any, e
 }
 
 // handleWhoami reports this host's console session state, the frozen
-// {"on_console", "locked", "console_user"} shape.
+// {"on_console", "locked", "console_user", "screen_shared"} shape.
 func (d *Daemon) handleWhoami(ctx context.Context, _ map[string]any) (any, error) {
 	return sessionSummary(ctx, d.probe)
 }
@@ -216,11 +217,10 @@ func (d *Daemon) handleGetCookies(ctx context.Context, params map[string]any) (a
 	return cookiesPayload(cookie.Merge(sets...)), nil
 }
 
-// primeAuth obtains the Safe Storage key and caches it under the endpoint's TTL. A
-// live local session releases it behind one Touch ID tap here; otherwise the
-// user-presence check is routed to the active peer, and on a verified approval this
-// host releases its own key non-interactively — the key never leaves this box. A cold
-// remote mesh fails closed with AuthRequired. Mirrors the Python prime_auth.
+// primeAuth obtains the Safe Storage key via the presence gate (releaseKey) and caches
+// it under the endpoint's TTL. On a verified routed approval this host releases its own
+// key non-interactively — the key never leaves this box. A cold remote mesh fails closed
+// with AuthRequired. Mirrors the Python prime_auth.
 func (d *Daemon) primeAuth(ctx context.Context, browser, profile, reason string) (cookie.AesKey, error) {
 	st, err := d.state.Load(ctx)
 	if err != nil {
@@ -230,16 +230,7 @@ func (d *Daemon) primeAuth(ctx context.Context, browser, profile, reason string)
 	if err != nil {
 		return nil, err
 	}
-	live, err := HasActiveSession(ctx, d.probe)
-	if err != nil {
-		return nil, err
-	}
-	var key cookie.AesKey
-	if live {
-		key, err = d.consent.ObtainKey(ctx, b, reason)
-	} else {
-		key, err = d.routedRelease(ctx, b, browser, profile)
-	}
+	key, err := d.releaseKey(ctx, st, b, browser, profile, reason)
 	if err != nil {
 		return nil, err
 	}
@@ -252,6 +243,31 @@ func (d *Daemon) primeAuth(ctx context.Context, browser, profile, reason string)
 		return nil, err
 	}
 	return key, nil
+}
+
+// releaseKey obtains the Safe Storage key behind the presence gate that applies. A hard
+// consent route (ConsentRouteHard) to a live ConsentRouteTo peer wins outright — this
+// host routes the gate even when it looks locally attended. Otherwise a live local
+// session releases the key behind one Touch ID tap, and a cold local session routes the
+// gate to the active peer.
+func (d *Daemon) releaseKey(ctx context.Context, st *state.State, b cookie.Browser, browser, profile, reason string) (cookie.AesKey, error) {
+	if st.ConsentRouteHard && st.ConsentRouteTo != "" {
+		live, err := d.peerIsLive(ctx, st.ConsentRouteTo)
+		if err != nil {
+			return nil, err
+		}
+		if live {
+			return d.routedRelease(ctx, b, browser, profile)
+		}
+	}
+	live, err := HasActiveSession(ctx, d.probe)
+	if err != nil {
+		return nil, err
+	}
+	if live {
+		return d.consent.ObtainKey(ctx, b, reason)
+	}
+	return d.routedRelease(ctx, b, browser, profile)
 }
 
 // cookiesPayload is the frozen {"cookies": [...]} envelope a cookie set crosses the

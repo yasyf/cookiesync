@@ -116,3 +116,93 @@ func TestSessionSummaryNullsConsoleUserWhenHeadless(t *testing.T) {
 		t.Fatalf("console_user = %v, want nil", got["console_user"])
 	}
 }
+
+// TestParseScreenShare table-drives parseScreenShare over real `netstat -anv -p tcp`
+// rows. An inbound Screen Sharing session — this host's local address on .5900 in the
+// ESTABLISHED state — is the only shape that counts as shared. The always-present *.5900
+// LISTEN listener, a busy connection on another port, and a socketless table are all
+// "not shared"; a payload with no netstat header at all is malformed.
+func TestParseScreenShare(t *testing.T) {
+	const header = "Active Internet connections (including servers)\n" +
+		"Proto Recv-Q Send-Q  Local Address          Foreign Address        (state)      rxbytes  txbytes  rhiwat  shiwat  process:pid  options  gencnt  flags  flags1 usecnt rtncnt fltrs\n"
+	const listen5900 = "tcp46      0      0  *.5900                 *.*                    LISTEN            0            0  131072  131072    screensharingd:912   00100 00000006 00000000000037c9 00000001 00000800      1      0 000000\n"
+	const established5900 = "tcp4       0      0  192.168.4.145.5900     192.168.4.50.54873     ESTABLISHED   14832         1083  131072  131600    screensharingd:912   00102 00000008 0000000001fec78d 00000081 04000900      2      0 000000\n"
+	const established443 = "tcp4       0      0  192.168.4.145.55531    35.190.46.17.443       ESTABLISHED   3010          839  131072  131600          2.1.198:60299  00102 00000008 00000000021a4621 00000081 04000900      2      0 000000\n"
+
+	tests := []struct {
+		name    string
+		payload string
+		want    bool
+		wantErr bool
+	}{
+		{
+			name:    "inbound established screen share on .5900",
+			payload: header + listen5900 + established443 + established5900,
+			want:    true,
+		},
+		{
+			name:    "listen-only on *.5900 is the idle listener",
+			payload: header + listen5900 + established443,
+			want:    false,
+		},
+		{
+			name:    "established on a non-5900 local port",
+			payload: header + established443,
+			want:    false,
+		},
+		{
+			name:    "socketless table",
+			payload: header,
+			want:    false,
+		},
+		{
+			name:    "malformed payload with no netstat header",
+			payload: "this is not netstat output\n",
+			wantErr: true,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := parseScreenShare([]byte(tc.payload))
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("parseScreenShare = %v, want error", got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("parseScreenShare: %v", err)
+			}
+			if got != tc.want {
+				t.Fatalf("parseScreenShare = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestHasActiveSessionScreenShareWins proves a live screen share makes HasActiveSession
+// return false even when the console is held, unlocked, and owned by this user — we
+// cannot prove a Touch ID tap reaches the physically-present human, so the host is not
+// locally attended and consent must route to a peer.
+func TestHasActiveSessionScreenShareWins(t *testing.T) {
+	me := currentUser(t)
+
+	attended := liveSession(me)
+	live, err := HasActiveSession(context.Background(), staticProbe(attended))
+	if err != nil {
+		t.Fatalf("HasActiveSession: %v", err)
+	}
+	if !live {
+		t.Fatalf("an unlocked console owned by this user must be a live session")
+	}
+
+	shared := attended
+	shared.ScreenShared = true
+	live, err = HasActiveSession(context.Background(), staticProbe(shared))
+	if err != nil {
+		t.Fatalf("HasActiveSession: %v", err)
+	}
+	if live {
+		t.Fatalf("a screen-shared host must NOT be a live local session (screen-share wins)")
+	}
+}

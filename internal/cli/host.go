@@ -9,19 +9,33 @@ import (
 )
 
 func newRouteConsentCmd() *cobra.Command {
+	var hard bool
 	cmd := &cobra.Command{
 		Use:   "route-consent <target>",
 		Short: "Route the consent gate to TARGET first when it has a live, unlocked session.",
-		Args:  cobra.ExactArgs(1),
+		Long: "Route the consent gate to TARGET first when it has a live, unlocked session.\n\n" +
+			"By default the gate still prefers this host when it looks locally attended. With\n" +
+			"--hard, always route the consent gate to TARGET when TARGET has a live, unlocked,\n" +
+			"un-shared session, even if this host looks locally attended.",
+		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			target := args[0]
-			if err := state.New(paths.Config).SetConsentRoute(cmd.Context(), target); err != nil {
+			store := state.New(paths.Config)
+			if err := store.SetConsentRoute(cmd.Context(), target); err != nil {
 				return err
+			}
+			if err := store.SetConsentRouteHard(cmd.Context(), hard); err != nil {
+				return err
+			}
+			if hard {
+				cmd.Printf("Routing consent to %s (hard: overrides local presence).\n", target)
+				return nil
 			}
 			cmd.Printf("Routing consent to %s.\n", target)
 			return nil
 		},
 	}
+	cmd.Flags().BoolVar(&hard, "hard", false, "always route the consent gate to TARGET when TARGET has a live, unlocked, un-shared session, even if this host looks locally attended")
 	return cmd
 }
 

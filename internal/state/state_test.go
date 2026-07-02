@@ -102,6 +102,48 @@ func TestRemoveBrowserTombstones(t *testing.T) {
 	}
 }
 
+// TestConsentRouteHardRoundTrip proves SetConsentRouteHard persists the hard-route flag
+// and Load reads it back, independent of the routed target: it toggles true then false
+// without disturbing consent_route_to.
+func TestConsentRouteHardRoundTrip(t *testing.T) {
+	ctx := context.Background()
+	now := time.Unix(1_700_000_000, 0)
+	store, _ := newTestStore(t, now)
+
+	if err := store.SetConsentRoute(ctx, "you@desktop"); err != nil {
+		t.Fatalf("SetConsentRoute: %v", err)
+	}
+	if err := store.SetConsentRouteHard(ctx, true); err != nil {
+		t.Fatalf("SetConsentRouteHard(true): %v", err)
+	}
+
+	st, err := store.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if st.ConsentRouteTo != "you@desktop" {
+		t.Fatalf("consent_route_to = %q, want you@desktop", st.ConsentRouteTo)
+	}
+	if !st.ConsentRouteHard {
+		t.Fatalf("consent_route_hard = false, want true after SetConsentRouteHard(true)")
+	}
+
+	// Downgrade: the flag clears but the routed target is untouched.
+	if err := store.SetConsentRouteHard(ctx, false); err != nil {
+		t.Fatalf("SetConsentRouteHard(false): %v", err)
+	}
+	st, err = store.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if st.ConsentRouteHard {
+		t.Fatalf("consent_route_hard = true, want false after SetConsentRouteHard(false)")
+	}
+	if st.ConsentRouteTo != "you@desktop" {
+		t.Fatalf("consent_route_to = %q, want you@desktop (untouched by the hard toggle)", st.ConsentRouteTo)
+	}
+}
+
 // TestForeignKeyPreserve proves a write through the cookiesync store leaves the host
 // registry's own keys (self, hosts) untouched, since both share the one state.json.
 func TestForeignKeyPreserve(t *testing.T) {

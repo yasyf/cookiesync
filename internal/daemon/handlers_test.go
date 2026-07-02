@@ -41,17 +41,17 @@ func TestHandleWhoamiWireShape(t *testing.T) {
 		{
 			name: "live unlocked console",
 			snap: SessionSnapshot{OnConsole: true, Locked: false, ConsoleUser: "alice"},
-			want: `{"console_user":"alice","locked":false,"on_console":true}`,
+			want: `{"console_user":"alice","locked":false,"on_console":true,"screen_shared":false}`,
 		},
 		{
 			name: "locked console",
 			snap: SessionSnapshot{OnConsole: true, Locked: true, ConsoleUser: "alice"},
-			want: `{"console_user":"alice","locked":true,"on_console":true}`,
+			want: `{"console_user":"alice","locked":true,"on_console":true,"screen_shared":false}`,
 		},
 		{
 			name: "headless: console_user is null",
 			snap: SessionSnapshot{OnConsole: false, Locked: false, ConsoleUser: ""},
-			want: `{"console_user":null,"locked":false,"on_console":false}`,
+			want: `{"console_user":null,"locked":false,"on_console":false,"screen_shared":false}`,
 		},
 	}
 	for _, tc := range tests {
@@ -139,6 +139,109 @@ func TestHandlePrimeAuthDefaultReason(t *testing.T) {
 	}
 	if len(consent.promptedReasons) != 1 || consent.promptedReasons[0] != consentReason {
 		t.Fatalf("default reason = %v, want [%q]", consent.promptedReasons, consentReason)
+	}
+}
+
+// TestHandlePrimeAuthHardRouteOverridesLocalSession proves a hard consent route to a
+// live peer wins outright: even with a live local session, prime_auth routes the gate to
+// the peer (releasing via the unprompted path) instead of prompting Touch ID locally,
+// and still caches the released key under the endpoint.
+func TestHandlePrimeAuthHardRouteOverridesLocalSession(t *testing.T) {
+	me := currentUser(t)
+	self := "me@laptop"
+	peer := "you@desktop"
+	endpoint := endpointID(self, "chrome", "Default")
+	nonce := "hard-route-nonce"
+
+	fakeMesh(t, self, peer)
+	consent := &fakeConsent{key: cookie.DeriveKey(cookie.SafeStorageKey("peanuts"))}
+	runner := &recordingRunner{
+		replies:  map[string]string{"cookiesync rpc whoami": liveWhoami},
+		byMethod: map[string]string{"request_consent": approvedReply(t, nonce, endpoint)},
+	}
+	st := stateWith(self, peer, stateEndpoint(peer, "chrome", "Default"))
+	st.ConsentRouteHard = true
+	cache := newFakeCache()
+	// The LOCAL session is also live — the hard route must still win.
+	d := New(consent, cache, nil, staticProbe(liveSession(me)), runner, fixedState{st: st}, fixedState{st: st})
+	pinnedNonce(d, nonce)
+
+	got, err := d.handlePrimeAuth(context.Background(), map[string]any{"browser": "chrome"})
+	if err != nil {
+		t.Fatalf("handlePrimeAuth: %v", err)
+	}
+	if marshalResult(t, got) != `{"endpoint":"me@laptop:chrome:Default","primed":true}` {
+		t.Fatalf("prime_auth = %s", marshalResult(t, got))
+	}
+	if len(consent.promptedReasons) != 0 {
+		t.Fatalf("hard route must not prompt Touch ID locally, got prompts %v", consent.promptedReasons)
+	}
+	if consent.unpromptedCalled != 1 {
+		t.Fatalf("hard route must release via the routed unprompted path exactly once, got %d", consent.unpromptedCalled)
+	}
+	if _, ok, _ := cache.Get(context.Background(), endpoint); !ok {
+		t.Fatalf("prime_auth did not cache the routed key under %s", endpoint)
+	}
+}
+
+// TestHandlePrimeAuthHardRoutePeerOfflineFallsBackLocal proves a hard route whose target
+// is offline does not override local presence: prime_auth falls back to the local Touch
+// ID path when this host is attended.
+func TestHandlePrimeAuthHardRoutePeerOfflineFallsBackLocal(t *testing.T) {
+	me := currentUser(t)
+	self := "me@laptop"
+	peer := "you@desktop"
+
+	fakeMesh(t, self, peer)
+	consent := &fakeConsent{key: cookie.DeriveKey(cookie.SafeStorageKey("peanuts"))}
+	// The routed target is locked, so peerIsLive is false and the hard route cannot fire.
+	runner := &recordingRunner{replies: map[string]string{"cookiesync rpc whoami": deadWhoami}}
+	st := stateWith(self, peer, stateEndpoint(peer, "chrome", "Default"))
+	st.ConsentRouteHard = true
+	cache := newFakeCache()
+	d := New(consent, cache, nil, staticProbe(liveSession(me)), runner, fixedState{st: st}, fixedState{st: st})
+
+	if _, err := d.handlePrimeAuth(context.Background(), map[string]any{"browser": "chrome", "reason": "post a tweet"}); err != nil {
+		t.Fatalf("handlePrimeAuth: %v", err)
+	}
+	if len(consent.promptedReasons) != 1 || consent.promptedReasons[0] != "post a tweet" {
+		t.Fatalf("an offline hard-route target must fall back to local Touch ID, got prompts %v", consent.promptedReasons)
+	}
+	if consent.unpromptedCalled != 0 {
+		t.Fatalf("the local fallback must not use the routed unprompted release, got %d", consent.unpromptedCalled)
+	}
+	if _, ok, _ := cache.Get(context.Background(), endpointID(self, "chrome", "Default")); !ok {
+		t.Fatalf("prime_auth did not cache the locally-released key")
+	}
+}
+
+// TestHandlePrimeAuthSoftRouteDoesNotOverrideLocalSession is the regression guard for a
+// non-hard route: with ConsentRouteHard unset, a live local session still prompts Touch
+// ID locally and the routed target is never even probed, exactly as before the override.
+func TestHandlePrimeAuthSoftRouteDoesNotOverrideLocalSession(t *testing.T) {
+	me := currentUser(t)
+	self := "me@laptop"
+	peer := "you@desktop"
+
+	fakeMesh(t, self, peer)
+	consent := &fakeConsent{key: cookie.DeriveKey(cookie.SafeStorageKey("peanuts"))}
+	// The peer is live, but the route is soft (ConsentRouteHard defaults false).
+	runner := &recordingRunner{replies: map[string]string{"cookiesync rpc whoami": liveWhoami}}
+	st := stateWith(self, peer, stateEndpoint(peer, "chrome", "Default"))
+	cache := newFakeCache()
+	d := New(consent, cache, nil, staticProbe(liveSession(me)), runner, fixedState{st: st}, fixedState{st: st})
+
+	if _, err := d.handlePrimeAuth(context.Background(), map[string]any{"browser": "chrome", "reason": "local tap"}); err != nil {
+		t.Fatalf("handlePrimeAuth: %v", err)
+	}
+	if len(consent.promptedReasons) != 1 || consent.promptedReasons[0] != "local tap" {
+		t.Fatalf("a soft route must not override a live local session, got prompts %v", consent.promptedReasons)
+	}
+	if consent.unpromptedCalled != 0 {
+		t.Fatalf("a soft route with a live local session must not route, got %d unprompted releases", consent.unpromptedCalled)
+	}
+	if len(runner.calls) != 0 {
+		t.Fatalf("a soft route must not probe the peer when locally attended, got calls %+v", runner.calls)
 	}
 }
 

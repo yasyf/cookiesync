@@ -290,3 +290,90 @@ func TestNonceFreshnessPerRelease(t *testing.T) {
 		t.Fatalf("expected 200 distinct nonces, got %d (reuse detected)", len(seen))
 	}
 }
+
+// TestPeerIsLiveExcludesScreenSharedPeer proves peerIsLive treats a peer whose whoami
+// reports screen_shared:true as not live — its Touch ID prompt could be tapped by the
+// remote viewer, not the physically-present human — while an on-console, unlocked,
+// un-shared peer is live.
+func TestPeerIsLiveExcludesScreenSharedPeer(t *testing.T) {
+	peer := "you@desktop"
+	tests := []struct {
+		name   string
+		whoami string
+		want   bool
+	}{
+		{
+			name:   "on-console unlocked un-shared is live",
+			whoami: `{"on_console":true,"locked":false,"console_user":"peer","screen_shared":false}`,
+			want:   true,
+		},
+		{
+			name:   "screen-shared peer is not live",
+			whoami: `{"on_console":true,"locked":false,"console_user":"peer","screen_shared":true}`,
+			want:   false,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			runner := &recordingRunner{replies: map[string]string{"cookiesync rpc whoami": tc.whoami}}
+			d := New(&fakeConsent{}, newFakeCache(), nil, staticProbe(SessionSnapshot{}), runner, fixedState{}, fixedState{})
+			got, err := d.peerIsLive(context.Background(), peer)
+			if err != nil {
+				t.Fatalf("peerIsLive: %v", err)
+			}
+			if got != tc.want {
+				t.Fatalf("peerIsLive = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestHandleRequestConsentIgnoresConsentRouteTo locks in the routing invariant: the
+// consent gate on the receiving side decides purely on THIS host's local session and
+// never re-routes, even when ConsentRouteTo points at another peer. The route override
+// lives only in primeAuth's outbound path (primeAuth -> routedRelease -> activePeer); if
+// handleRequestConsent honored it too, an A->B request would bounce B->A and ping-pong.
+// So it must never touch the runner regardless of the local decision.
+func TestHandleRequestConsentIgnoresConsentRouteTo(t *testing.T) {
+	self := "me@laptop"
+	routeTo := "elsewhere@box"
+	me := currentUser(t)
+	st := stateWith(self, routeTo, stateEndpoint(routeTo, "chrome", "Default"))
+
+	tests := []struct {
+		name string
+		snap SessionSnapshot
+		want string
+	}{
+		{
+			name: "no local session: unavailable, never routes",
+			snap: SessionSnapshot{OnConsole: false},
+			want: `{"status":"unavailable"}`,
+		},
+		{
+			name: "live local session: approves locally, never routes",
+			snap: liveSession(me),
+			want: `{"endpoint":"them@host:chrome:Work","nonce":"n","status":"approved"}`,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			consent := &fakeConsent{key: cookie.DeriveKey(cookie.SafeStorageKey("peanuts"))}
+			runner := &recordingRunner{}
+			d := New(consent, newFakeCache(), nil, staticProbe(tc.snap), runner, fixedState{st: st}, fixedState{st: st})
+
+			got, err := d.handleRequestConsent(context.Background(), map[string]any{
+				"browser": "chrome", "nonce": "n", "endpoint": "them@host:chrome:Work",
+			})
+			if err != nil {
+				t.Fatalf("handleRequestConsent: %v", err)
+			}
+			if marshalResult(t, got) != tc.want {
+				t.Fatalf("handleRequestConsent = %s, want %s", marshalResult(t, got), tc.want)
+			}
+			if len(runner.calls) != 0 {
+				t.Fatalf("handleRequestConsent must not route with ConsentRouteTo set, got ssh calls %+v", runner.calls)
+			}
+		})
+	}
+}

@@ -105,21 +105,25 @@ func (d *Daemon) activePeer(ctx context.Context, st *state.State) (string, error
 	return "", &AuthRequired{Msg: "no peer has a live session to approve consent"}
 }
 
-// peerIsLive reports whether peer has a live, unlocked console session, read over ssh
-// via its whoami RPC: on_console && !locked. Mirrors the Python peer_is_live.
+// peerIsLive reports whether peer has a live, unlocked, un-shared console session, read
+// over ssh via its whoami RPC: on_console && !locked && !screen_shared. A screen-shared
+// peer is not a valid approver — its Touch ID prompt may be tapped by the remote viewer
+// rather than the physically-present human — so it is skipped. Mirrors the Python
+// peer_is_live.
 func (d *Daemon) peerIsLive(ctx context.Context, peer string) (bool, error) {
 	out, err := d.runner.Run(ctx, peer, "cookiesync rpc whoami", nil)
 	if err != nil {
 		return false, err
 	}
 	var summary struct {
-		OnConsole bool `json:"on_console"`
-		Locked    bool `json:"locked"`
+		OnConsole    bool `json:"on_console"`
+		Locked       bool `json:"locked"`
+		ScreenShared bool `json:"screen_shared"`
 	}
 	if err := json.Unmarshal([]byte(out), &summary); err != nil {
 		return false, fmt.Errorf("parse whoami from %s: %w", peer, err)
 	}
-	return summary.OnConsole && !summary.Locked, nil
+	return summary.OnConsole && !summary.Locked && !summary.ScreenShared, nil
 }
 
 // handleRequestConsent shows the Touch ID prompt to the person at this machine for the
