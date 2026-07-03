@@ -69,7 +69,11 @@ func newRPCExtractCmd() *cobra.Command {
 			// (priming behind consent when cold), so a peer's pull reuses the warm key
 			// and never prompts a fresh tap per sync. origin is carried for symmetry; a
 			// direct extract has no echo to suppress.
-			return rpcPassthrough(cmd, "extract", map[string]any{"browser": browser, "profile": profile, "origin": origin})
+			params := map[string]any{"browser": browser, "profile": profile, "origin": origin}
+			if r, ok := resolveRequestor(); ok {
+				params["requestor"] = r
+			}
+			return rpcPassthrough(cmd, "extract", params)
 		},
 	}
 	cmd.Flags().StringVar(&browser, "browser", "", "The browser to extract cookies from.")
@@ -96,10 +100,14 @@ func newRPCGetCookiesCmd() *cobra.Command {
 			if browser == "" {
 				return fmt.Errorf("--browser must not be empty")
 			}
-			return rpcPassthrough(cmd, "get_cookies", map[string]any{
+			params := map[string]any{
 				"browser": browser, "profile": profile, "origin": origin,
 				"url": args[0], "urls": asAnySlice(args),
-			})
+			}
+			if r, ok := resolveRequestor(); ok {
+				params["requestor"] = r
+			}
+			return rpcPassthrough(cmd, "get_cookies", params)
 		},
 	}
 	cmd.Flags().StringVar(&browser, "browser", "", "The browser to read cookies from.")

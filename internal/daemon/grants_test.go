@@ -220,6 +220,7 @@ func TestRequestorReasonNamesTheProcess(t *testing.T) {
 		want      string
 	}{
 		{"req token names itself with zero subprocess", "req:claude", os.Getpid(), true, consentReason + " for claude"},
+		{"req composite token renders verbatim", "req:Claude Code · a3283ae1", os.Getpid(), true, consentReason + " for Claude Code · a3283ae1"},
 		{"sid requestor with a live pid gains the process name", "sid:1", os.Getpid(), true, consentReason + " for " + filepath.Base(exe)},
 		{"sid requestor with no pid unchanged", "sid:1", 0, false, consentReason},
 		{"sid requestor with a dead pid unchanged", "sid:1", 99999999, true, consentReason},

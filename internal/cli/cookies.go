@@ -59,8 +59,8 @@ func runAuth(cmd *cobra.Command, browser, profile, reason, ttl string) error {
 	if reason != "" {
 		params["reason"] = reason
 	}
-	if req := os.Getenv("COOKIESYNC_REQUESTOR"); req != "" {
-		params["requestor"] = req
+	if r, ok := resolveRequestor(); ok {
+		params["requestor"] = r
 	}
 	var result struct {
 		Endpoint string `json:"endpoint"`
@@ -83,8 +83,8 @@ func runAuthAll(cmd *cobra.Command, reason string) error {
 	if reason != "" {
 		params["reason"] = reason
 	}
-	if req := os.Getenv("COOKIESYNC_REQUESTOR"); req != "" {
-		params["requestor"] = req
+	if r, ok := resolveRequestor(); ok {
+		params["requestor"] = r
 	}
 	var result struct {
 		Endpoints []string `json:"endpoints"`
@@ -227,8 +227,8 @@ func runCookies(cmd *cobra.Command, urls []string, browser, profile, format stri
 		"browser": browser,
 		"profile": profile,
 	}
-	if req := os.Getenv("COOKIESYNC_REQUESTOR"); req != "" {
-		params["requestor"] = req
+	if r, ok := resolveRequestor(); ok {
+		params["requestor"] = r
 	}
 	var result struct {
 		Cookies []cookie.WireCookie `json:"cookies"`
@@ -252,8 +252,8 @@ func runCookiesAll(cmd *cobra.Command, urls []string, format string) error {
 		"url":  urls[0],
 		"urls": asAnySlice(urls),
 	}
-	if req := os.Getenv("COOKIESYNC_REQUESTOR"); req != "" {
-		params["requestor"] = req
+	if r, ok := resolveRequestor(); ok {
+		params["requestor"] = r
 	}
 	var result struct {
 		Cookies  []cookie.WireCookie `json:"cookies"`

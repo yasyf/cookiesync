@@ -222,6 +222,15 @@ func TestComposeReasonMapExamples(t *testing.T) {
 	}
 }
 
+// TestComposeReasonKeepsCompositeRequestorMiddleDot pins that the U+00B7 in a composite
+// requestor reference survives the whitespace collapse into the real sheet text.
+func TestComposeReasonKeepsCompositeRequestorMiddleDot(t *testing.T) {
+	got := ComposeReason("Chrome", "sync them across your Macs for Claude Code · a3283ae1")
+	if !strings.Contains(got, "Claude Code · a3283ae1") {
+		t.Fatalf("ComposeReason = %q, want it to contain %q verbatim", got, "Claude Code · a3283ae1")
+	}
+}
+
 func TestComposeBatchReason(t *testing.T) {
 	cases := []struct {
 		name     string
