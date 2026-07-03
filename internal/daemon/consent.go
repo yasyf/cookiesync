@@ -159,7 +159,7 @@ func (d *Daemon) handleRequestConsent(ctx context.Context, params map[string]any
 		return map[string]any{"status": "unavailable"}, nil
 	}
 	host, _, _ := strings.Cut(endpoint, ":")
-	if _, err := d.primeAuth(ctx, "host:"+host, browserID, profile, fmt.Sprintf("sync them to %s", endpoint), releaseApprover); err != nil {
+	if _, _, err := d.primeAuth(ctx, "host:"+host, browserID, profile, fmt.Sprintf("sync them to %s", endpoint), releaseApprover); err != nil {
 		var authErr *AuthRequired
 		if errors.Is(err, cookie.ErrKeybagLocked) || errors.As(err, &authErr) {
 			return map[string]any{"status": "unavailable"}, nil

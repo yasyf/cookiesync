@@ -248,25 +248,88 @@ func TestGetCookiesUnionLocalWinsTie(t *testing.T) {
 	}
 }
 
-// TestGetCookiesUnionColdLocalSkippedRemoteContributes proves the never-route rule: a
-// cold local endpoint on an unattended host is skipped with a warning (cookies never
-// routes consent — that is auth's job), the remote endpoint still contributes, and no
-// consent is ever evaluated.
-func TestGetCookiesUnionColdLocalSkippedRemoteContributes(t *testing.T) {
+// TestGetCookiesUnionColdLocalRoutesRemoteContributes proves the unified routing rule on
+// the union's local leg: a cold local endpoint now ROUTES consent to a live peer (exactly
+// like auth) rather than being skipped, releasing its own key non-interactively after the
+// routed approval, so the local leg contributes its cookie alongside the remote one — one
+// unified release, no local Touch ID sheet.
+func TestGetCookiesUnionColdLocalRoutesRemoteContributes(t *testing.T) {
+	ctx := context.Background()
+	browser := chromeStoreUnderHome(t)
+	key := cookie.DeriveKey(cookie.SafeStorageKey("peanuts"))
+	local := []cookie.Cookie{{HostKey: "x.com", Name: "loc", Value: "here", Path: "/", LastUpdateUTC: 13_350_000_000_000_000, SameSite: 2, IsSecure: true, SourceScheme: 2, SourcePort: 443}}
+	if _, err := cookie.Apply(ctx, local, browser, "Default", key); err != nil {
+		t.Fatalf("seed apply: %v", err)
+	}
+
+	self := "me@laptop"
+	peer := "you@desktop"
+	nonce := "union-cold-route-nonce"
+	endpoint := endpointID(self, "chrome", "Default")
+	fakeMesh(t, self, peer)
+	st := stateWith(self, "",
+		stateEndpoint(self, "chrome", "Default"),
+		stateEndpoint(peer, "chrome", "Default"),
+	)
+	runner := &recordingRunner{
+		replies: map[string]string{"cookiesync rpc whoami": liveWhoami},
+		byMethod: map[string]string{
+			"request_consent": approvedReply(t, nonce, endpoint),
+			"rpc get_cookies": peerExtractReply(t, cookie.Cookie{HostKey: "x.com", Name: "rem", Value: "there", Path: "/", LastUpdateUTC: 13_350_000_000_000_000, SameSite: 2, IsSecure: true, SourceScheme: 2, SourcePort: 443}),
+		},
+	}
+	consent := &fakeConsent{key: key}
+	d := New(consent, newFakeCache(), nil, staticProbe(SessionSnapshot{}), runner, fixedState{st: st}, fixedState{st: st})
+	pinnedNonce(d, nonce)
+
+	got, err := d.handleGetCookies(ctx, map[string]any{"url": "https://x.com/"})
+	if err != nil {
+		t.Fatalf("handleGetCookies union: %v", err)
+	}
+	cookies := wireCookieNames(t, got)
+	if len(cookies) != 2 || cookies["loc"].Value != "here" || cookies["rem"].Value != "there" {
+		t.Fatalf("union = %+v, want the routed-local loc=here and the remote rem=there", cookies)
+	}
+	routed := false
+	for _, call := range runner.calls {
+		if strings.Contains(call.cmd, "request_consent") {
+			routed = true
+		}
+	}
+	if !routed {
+		t.Fatalf("the cold local leg must route consent, got runner calls %+v", runner.calls)
+	}
+	if consent.unpromptedCalled != 1 {
+		t.Fatalf("the routed local release must use ObtainKeyUnprompted once, got %d", consent.unpromptedCalled)
+	}
+	if len(consent.promptedReasons) != 0 {
+		t.Fatalf("a routed local leg must not prompt Touch ID, got %v", consent.promptedReasons)
+	}
+}
+
+// TestGetCookiesUnionColdLocalRouteDeniedRemoteContributes proves the best-effort skip: a
+// cold local leg that tries to route but finds no live approver is skipped with a warning
+// naming the endpoint, the remote endpoint still contributes, and no key is released.
+func TestGetCookiesUnionColdLocalRouteDeniedRemoteContributes(t *testing.T) {
 	ctx := context.Background()
 	chromeStoreUnderHome(t)
 	self := "me@laptop"
-	fakeMesh(t, self, "you@desktop")
+	peer := "you@desktop"
+	fakeMesh(t, self, peer)
 	st := stateWith(self, "",
 		stateEndpoint(self, "chrome", "Default"),
-		stateEndpoint("you@desktop", "chrome", "Default"),
+		stateEndpoint(peer, "chrome", "Default"),
 	)
-	runner := &recordingRunner{byMethod: map[string]string{
-		"rpc get_cookies": peerExtractReply(t, cookie.Cookie{HostKey: "x.com", Name: "rem", Value: "there", Path: "/", LastUpdateUTC: 13_350_000_000_000_000, SameSite: 2, IsSecure: true, SourceScheme: 2, SourcePort: 443}),
-	}}
+	// The peer is locked, so routing finds no live approver: the cold local leg fails
+	// closed and is skipped while the remote leg still contributes.
+	runner := &recordingRunner{
+		replies: map[string]string{"cookiesync rpc whoami": deadWhoami},
+		byMethod: map[string]string{
+			"rpc get_cookies": peerExtractReply(t, cookie.Cookie{HostKey: "x.com", Name: "rem", Value: "there", Path: "/", LastUpdateUTC: 13_350_000_000_000_000, SameSite: 2, IsSecure: true, SourceScheme: 2, SourcePort: 443}),
+		},
+	}
 	consent := &fakeConsent{key: cookie.DeriveKey(cookie.SafeStorageKey("peanuts"))}
-	cache := newFakeCache()
-	d := New(consent, cache, nil, staticProbe(SessionSnapshot{}), runner, fixedState{st: st}, fixedState{st: st})
+	d := New(consent, newFakeCache(), nil, staticProbe(SessionSnapshot{}), runner, fixedState{st: st}, fixedState{st: st})
 
 	got, err := d.handleGetCookies(ctx, map[string]any{"url": "https://x.com/"})
 	if err != nil {
@@ -276,8 +339,8 @@ func TestGetCookiesUnionColdLocalSkippedRemoteContributes(t *testing.T) {
 	if len(cookies) != 1 || cookies["rem"].Value != "there" {
 		t.Fatalf("union = %+v, want only the remote rem=there", cookies)
 	}
-	if len(consent.promptedReasons) != 0 || len(consent.batchCalls) != 0 {
-		t.Fatalf("cookies must never prompt or route a cold local endpoint, got prompts %v batches %v", consent.promptedReasons, consent.batchCalls)
+	if consent.unpromptedCalled != 0 || len(consent.promptedReasons) != 0 {
+		t.Fatalf("a denied route must neither release nor prompt, got unprompted %d prompts %v", consent.unpromptedCalled, consent.promptedReasons)
 	}
 	warnings := decodeWarnings(t, got)
 	if len(warnings) != 1 || !strings.Contains(warnings[0], "skip cold") || !strings.Contains(warnings[0], endpointID(self, "chrome", "Default")) {
@@ -416,30 +479,56 @@ func TestGetCookiesSinglePeerDrivenGrantKeysOrigin(t *testing.T) {
 	}
 }
 
-// TestGetCookiesSinglePeerDrivenColdFailsClosed proves a peer-driven read (origin set)
-// on a cold host fails closed with AuthRequired instead of routing the consent gate back
-// out: a union pull against a locked peer must be a caller-side skip, never a surprise
-// Touch ID sheet on the Mac that asked. The runner must see no request_consent.
-func TestGetCookiesSinglePeerDrivenColdFailsClosed(t *testing.T) {
+// TestGetCookiesSinglePeerDrivenColdRoutesConsent proves a peer-driven read (origin set)
+// on a cold host now ROUTES consent per this host's own config instead of failing closed:
+// with a live peer in the mesh it routes the gate there — the request_consent handshake
+// lands on the runner — and serves the cookies off its own key, released
+// non-interactively after the routed approval. The sheet often bounces back to the
+// calling Mac, which is by design.
+func TestGetCookiesSinglePeerDrivenColdRoutesConsent(t *testing.T) {
 	ctx := context.Background()
-	chromeStoreUnderHome(t)
-	self := "me@desktop"
-	fakeMesh(t, self, "you@laptop")
-	st := stateWith(self, "", stateEndpoint(self, "chrome", "Default"))
-	runner := &recordingRunner{}
-	consent := &fakeConsent{key: cookie.DeriveKey(cookie.SafeStorageKey("peanuts"))}
-	d := New(consent, newFakeCache(), nil, staticProbe(SessionSnapshot{}), runner, fixedState{st: st}, fixedState{st: st})
-
-	_, err := d.handleGetCookies(ctx, map[string]any{"browser": "chrome", "url": "https://x.com/", "origin": "you@laptop"})
-	var authErr *AuthRequired
-	if !errors.As(err, &authErr) {
-		t.Fatalf("peer-driven cold read = %v, want *AuthRequired", err)
+	browser := chromeStoreUnderHome(t)
+	key := cookie.DeriveKey(cookie.SafeStorageKey("peanuts"))
+	seed := []cookie.Cookie{{HostKey: "x.com", Name: "sid", Value: "abc", Path: "/", LastUpdateUTC: 13_350_000_000_000_000, SameSite: 2, IsSecure: true, SourceScheme: 2, SourcePort: 443}}
+	if _, err := cookie.Apply(ctx, seed, browser, "Default", key); err != nil {
+		t.Fatalf("seed apply: %v", err)
 	}
-	if len(runner.calls) != 0 {
-		t.Fatalf("a peer-driven read must never route onward, got runner calls %+v", runner.calls)
+
+	self := "me@desktop"
+	peer := "you@laptop"
+	nonce := "peer-cold-route-nonce"
+	endpoint := endpointID(self, "chrome", "Default")
+	fakeMesh(t, self, peer)
+	st := stateWith(self, "", stateEndpoint(self, "chrome", "Default"))
+	runner := &recordingRunner{
+		replies:  map[string]string{"cookiesync rpc whoami": liveWhoami},
+		byMethod: map[string]string{"request_consent": approvedReply(t, nonce, endpoint)},
+	}
+	consent := &fakeConsent{key: key}
+	d := New(consent, newFakeCache(), nil, staticProbe(SessionSnapshot{}), runner, fixedState{st: st}, fixedState{st: st})
+	pinnedNonce(d, nonce)
+
+	got, err := d.handleGetCookies(ctx, map[string]any{"browser": "chrome", "url": "https://x.com/", "origin": peer})
+	if err != nil {
+		t.Fatalf("peer-driven cold read: %v", err)
+	}
+	if cookies := wireCookieNames(t, got); cookies["sid"].Value != "abc" {
+		t.Fatalf("routed peer-driven read = %+v, want sid=abc", cookies)
+	}
+	routed := false
+	for _, call := range runner.calls {
+		if strings.Contains(call.cmd, "request_consent") {
+			routed = true
+		}
+	}
+	if !routed {
+		t.Fatalf("a cold peer-driven read must route consent, got runner calls %+v", runner.calls)
+	}
+	if consent.unpromptedCalled != 1 {
+		t.Fatalf("the routed release must use ObtainKeyUnprompted once, got %d", consent.unpromptedCalled)
 	}
 	if len(consent.promptedReasons) != 0 {
-		t.Fatalf("a cold peer must not prompt, got %v", consent.promptedReasons)
+		t.Fatalf("a routed release must not prompt Touch ID locally, got %v", consent.promptedReasons)
 	}
 }
 
@@ -860,7 +949,7 @@ func TestPrimeAuthStragglerAfterWarmCacheDoesNotReprompt(t *testing.T) {
 	_ = cache.Put(ctx, endpointID("me@laptop", "chrome", "Default"), []byte(consent.key), 0)
 	d.grant("local", []cookie.BrowserName{"chrome"}, time.Hour)
 
-	key, err := d.primeAuth(ctx, "local", "chrome", "Default", consentReason, releaseLocal)
+	key, _, err := d.primeAuth(ctx, "local", "chrome", "Default", consentReason, releaseLocal)
 	if err != nil {
 		t.Fatalf("primeAuth: %v", err)
 	}
@@ -893,14 +982,14 @@ func TestPrimeAuthFlightSurvivesLeaderCancel(t *testing.T) {
 	leaderCtx, cancelLeader := context.WithCancel(context.Background())
 	leaderDone := make(chan error, 1)
 	go func() {
-		_, err := d.primeAuth(leaderCtx, "local", "chrome", "Default", consentReason, releaseLocal)
+		_, _, err := d.primeAuth(leaderCtx, "local", "chrome", "Default", consentReason, releaseLocal)
 		leaderDone <- err
 	}()
 	<-consent.entered
 
 	waiterDone := make(chan error, 1)
 	go func() {
-		key, err := d.primeAuth(context.Background(), "local", "chrome", "Default", consentReason, releaseLocal)
+		key, _, err := d.primeAuth(context.Background(), "local", "chrome", "Default", consentReason, releaseLocal)
 		if err == nil && string(key) != string(consent.key) {
 			err = errors.New("waiter got the wrong key")
 		}
@@ -945,7 +1034,7 @@ func TestPrimeAuthCanceledWaiterReturnsWhileFlightContinues(t *testing.T) {
 
 	leaderDone := make(chan error, 1)
 	go func() {
-		_, err := d.primeAuth(context.Background(), "local", "chrome", "Default", consentReason, releaseLocal)
+		_, _, err := d.primeAuth(context.Background(), "local", "chrome", "Default", consentReason, releaseLocal)
 		leaderDone <- err
 	}()
 	<-consent.entered
@@ -954,7 +1043,7 @@ func TestPrimeAuthCanceledWaiterReturnsWhileFlightContinues(t *testing.T) {
 	cancelWaiter()
 	waiterDone := make(chan error, 1)
 	go func() {
-		_, err := d.primeAuth(waiterCtx, "local", "chrome", "Default", consentReason, releaseLocal)
+		_, _, err := d.primeAuth(waiterCtx, "local", "chrome", "Default", consentReason, releaseLocal)
 		waiterDone <- err
 	}()
 	select {
@@ -1049,14 +1138,14 @@ func TestConcurrentDistinctEndpointPrimesCollapseToOneEvaluation(t *testing.T) {
 
 	leaderDone := make(chan error, 1)
 	go func() {
-		_, err := d.primeAuth(context.Background(), "local", "chrome", "Default", consentReason, releaseLocal)
+		_, _, err := d.primeAuth(context.Background(), "local", "chrome", "Default", consentReason, releaseLocal)
 		leaderDone <- err
 	}()
 	<-consent.entered
 
 	waiterDone := make(chan error, 1)
 	go func() {
-		_, err := d.primeAuth(context.Background(), "local", "chrome", "Work", consentReason, releaseLocal)
+		_, _, err := d.primeAuth(context.Background(), "local", "chrome", "Work", consentReason, releaseLocal)
 		waiterDone <- err
 	}()
 
@@ -1104,14 +1193,14 @@ func TestPrimeAuthPartialBatchServesWaiterWhileLeaderBrowserDenied(t *testing.T)
 
 	leaderDone := make(chan error, 1)
 	go func() {
-		_, err := d.primeAuth(context.Background(), "sid:1", "chrome", "Default", consentReason, releaseLocal)
+		_, _, err := d.primeAuth(context.Background(), "sid:1", "chrome", "Default", consentReason, releaseLocal)
 		leaderDone <- err
 	}()
 	<-consent.entered
 
 	waiterDone := make(chan error, 1)
 	go func() {
-		key, err := d.primeAuth(context.Background(), "sid:1", "arc", "Default", consentReason, releaseLocal)
+		key, _, err := d.primeAuth(context.Background(), "sid:1", "arc", "Default", consentReason, releaseLocal)
 		if err == nil && string(key) != string(consent.key) {
 			err = errors.New("waiter got the wrong key")
 		}
@@ -1150,7 +1239,7 @@ func TestLocalPrimeAndInboundConsentSerializeThePrompt(t *testing.T) {
 
 	done := make(chan error, 2)
 	go func() {
-		_, err := d.primeAuth(context.Background(), "local", "chrome", "Default", consentReason, releaseLocal)
+		_, _, err := d.primeAuth(context.Background(), "local", "chrome", "Default", consentReason, releaseLocal)
 		done <- err
 	}()
 	go func() {
@@ -1175,6 +1264,74 @@ func TestLocalPrimeAndInboundConsentSerializeThePrompt(t *testing.T) {
 	}
 }
 
+// TestConcurrentCookiesAndPrimeShareOneSheet proves decision 3 (D3): a browser-less
+// get_cookies and a single prime_auth from the SAME requestor, racing on a cold-but-live
+// daemon, collapse into ONE release flight — one Touch ID sheet — because every console
+// release now flows through the unified releaseLocal flight key instead of splitting
+// across per-path modes (the two-sheet regression the deleted no-route/route-only modes
+// caused). Both calls succeed off the one evaluation.
+func TestConcurrentCookiesAndPrimeShareOneSheet(t *testing.T) {
+	ctx := context.Background()
+	browser := chromeStoreUnderHome(t)
+	key := cookie.DeriveKey(cookie.SafeStorageKey("peanuts"))
+	seed := []cookie.Cookie{{HostKey: "x.com", Name: "sid", Value: "abc", Path: "/", LastUpdateUTC: 13_350_000_000_000_000, SameSite: 2, IsSecure: true, SourceScheme: 2, SourcePort: 443}}
+	if _, err := cookie.Apply(ctx, seed, browser, "Default", key); err != nil {
+		t.Fatalf("seed apply: %v", err)
+	}
+
+	self := "me@laptop"
+	fakeMesh(t, self)
+	st := stateWith(self, "", stateEndpoint(self, "chrome", "Default"))
+	consent := &gateConsent{
+		key:     key,
+		entered: make(chan struct{}, 2),
+		release: make(chan struct{}),
+	}
+	cache := newFakeCache()
+	d := New(consent, cache, nil, staticProbe(liveSession(currentUser(t))), &recordingRunner{}, fixedState{st: st}, fixedState{st: st})
+
+	type outcome struct {
+		res any
+		err error
+	}
+	cookiesDone := make(chan outcome, 1)
+	go func() {
+		res, err := d.handleGetCookies(ctx, map[string]any{"url": "https://x.com/"})
+		cookiesDone <- outcome{res: res, err: err}
+	}()
+	primeDone := make(chan outcome, 1)
+	go func() {
+		res, err := d.handlePrimeAuth(ctx, map[string]any{"browser": "chrome"})
+		primeDone <- outcome{res: res, err: err}
+	}()
+
+	// One call leads the flight and holds the sheet; the other joins it. Wait until both
+	// have probed the cold cache and reached their DoChan (three Gets: the leader's plus
+	// the waiter's) before releasing, so a regression that splits them into two flights
+	// trips the consent counter instead of racing.
+	<-consent.entered
+	waitFor(t, func() bool { return cache.getCalls() >= 3 })
+	close(consent.release)
+
+	co := <-cookiesDone
+	if co.err != nil {
+		t.Fatalf("get_cookies: %v", co.err)
+	}
+	if cookies := wireCookieNames(t, co.res); cookies["sid"].Value != "abc" {
+		t.Fatalf("get_cookies = %+v, want sid=abc", cookies)
+	}
+	po := <-primeDone
+	if po.err != nil {
+		t.Fatalf("prime_auth: %v", po.err)
+	}
+	if marshalResult(t, po.res) != `{"endpoint":"me@laptop:chrome:Default","primed":true}` {
+		t.Fatalf("prime_auth = %s", marshalResult(t, po.res))
+	}
+	if got := consent.calls.Load(); got != 1 {
+		t.Fatalf("consent evaluations = %d, want 1 (one requestor's concurrent console releases must share one sheet)", got)
+	}
+}
+
 // TestRequestedEndpointRePutSurvivesEvictAllRace proves the verify-and-re-Put tail of
 // releaseAllLocal: when an EvictAll races in right after the requested endpoint's Put
 // (a concurrent Put healing the degraded wrapper mid-batch), the requested endpoint
@@ -1192,7 +1349,7 @@ func TestRequestedEndpointRePutSurvivesEvictAllRace(t *testing.T) {
 	cache := &raceEvictCache{fakeCache: newFakeCache(), evictOn: requested}
 	d := New(consent, cache, nil, staticProbe(liveSession(currentUser(t))), &recordingRunner{}, fixedState{st: st}, fixedState{st: st})
 
-	key, err := d.primeAuth(ctx, "local", "chrome", "Default", consentReason, releaseLocal)
+	key, _, err := d.primeAuth(ctx, "local", "chrome", "Default", consentReason, releaseLocal)
 	if err != nil {
 		t.Fatalf("primeAuth: %v", err)
 	}
@@ -1246,7 +1403,7 @@ func TestRequestedEndpointLastSurvivesRealCacheHeal(t *testing.T) {
 	d := New(consent, keyCache, nil, staticProbe(liveSession(currentUser(t))), &recordingRunner{}, fixedState{st: st}, fixedState{st: st})
 
 	requested := endpointID(self, "chrome", "Default")
-	key, err := d.primeAuth(ctx, "local", "chrome", "Default", consentReason, releaseLocal)
+	key, _, err := d.primeAuth(ctx, "local", "chrome", "Default", consentReason, releaseLocal)
 	if err != nil {
 		t.Fatalf("primeAuth: %v", err)
 	}
@@ -1329,7 +1486,7 @@ func TestRequestConsentAnswersWhileRoutedReleaseInFlight(t *testing.T) {
 
 	primeDone := make(chan error, 1)
 	go func() {
-		_, err := d.primeAuth(context.Background(), "local", "chrome", "Default", consentReason, releaseLocal)
+		_, _, err := d.primeAuth(context.Background(), "local", "chrome", "Default", consentReason, releaseLocal)
 		primeDone <- err
 	}()
 	<-runner.arrived

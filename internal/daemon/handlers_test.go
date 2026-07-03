@@ -444,9 +444,9 @@ func TestPrimeAuthAllMissingBrowserWarnsWithoutSecondSheet(t *testing.T) {
 }
 
 // TestPrimeAuthAllColdRoutesConsentPerBrowser proves the cold-session path: with no live
-// local session the all-mode prime routes consent per distinct browser to a live peer
-// (one request_consent each, never per profile) and bulk-caches a browser's other tracked
-// profiles under the routed key.
+// local session each per-browser prime re-derives the routed split and routes consent per
+// distinct browser to a live peer (one request_consent each, never per profile),
+// bulk-caching a browser's other tracked profiles under the routed key.
 func TestPrimeAuthAllColdRoutesConsentPerBrowser(t *testing.T) {
 	ctx := context.Background()
 	self := "me@laptop"
@@ -498,6 +498,120 @@ func TestPrimeAuthAllColdRoutesConsentPerBrowser(t *testing.T) {
 	}
 	if _, ok, _ := cache.Get(ctx, endpointID(self, "chrome", "Work")); !ok {
 		t.Errorf("chrome:Work must be warmed by the bulk Put after chrome's routed prime")
+	}
+}
+
+// TestPrimeAuthAllColdToLiveFlipKeepsOneSheet proves the loop keys off each flight's
+// ACTUAL consent surface, never a call-start routing snapshot: the console is cold when
+// the call starts — arc's flight routes consent to the live peer — and flips live before
+// chrome's flight, which leads exactly ONE local batch (where chrome is Missing). A
+// stale routed snapshot would disable the one-sheet guard and let the Missing browser
+// fire a second local sheet; here the flip costs one routed approval plus one local
+// evaluation, and the Missing browser is a skip warning.
+func TestPrimeAuthAllColdToLiveFlipKeepsOneSheet(t *testing.T) {
+	ctx := context.Background()
+	self := "me@laptop"
+	peer := "you@desktop"
+	nonce := "flip-live-nonce"
+	fakeMesh(t, self, peer)
+	st := stateWith(self, "",
+		stateEndpoint(self, "arc", "Default"),
+		stateEndpoint(self, "chrome", "Default"),
+	)
+	consent := &fakeConsent{key: cookie.DeriveKey(cookie.SafeStorageKey("peanuts")), missingFor: "chrome"}
+	runner := &recordingRunner{
+		replies:  map[string]string{"cookiesync rpc whoami": liveWhoami},
+		byMethod: map[string]string{"request_consent": approvedReply(t, nonce, endpointID(self, "arc", "Default"))},
+	}
+	cache := newFakeCache()
+	d := New(consent, cache, nil, flipProbe(SessionSnapshot{}, liveSession(currentUser(t))), runner, fixedState{st: st}, fixedState{st: st})
+	pinnedNonce(d, nonce)
+
+	got, err := d.handlePrimeAuth(ctx, map[string]any{})
+	if err != nil {
+		t.Fatalf("handlePrimeAuth all: %v", err)
+	}
+	reply := decodePrimeAll(t, got)
+	consents := 0
+	for _, call := range runner.calls {
+		if strings.Contains(call.cmd, "request_consent") {
+			consents++
+		}
+	}
+	if consents != 1 {
+		t.Fatalf("routed request_consent calls = %d, want 1 (only arc's flight saw the cold console)", consents)
+	}
+	if consent.unpromptedCalled != 1 {
+		t.Fatalf("routed unprompted releases = %d, want 1", consent.unpromptedCalled)
+	}
+	if len(consent.batchCalls) != 1 {
+		t.Fatalf("local consent evaluations = %d, want 1 (a Missing browser after the flip must never fire a second sheet)", len(consent.batchCalls))
+	}
+	if !slices.Equal(reply.Endpoints, []string{endpointID(self, "arc", "Default")}) {
+		t.Fatalf("endpoints = %v, want only the arc endpoint", reply.Endpoints)
+	}
+	if len(reply.Warnings) != 1 || !strings.Contains(reply.Warnings[0], "skip chrome") {
+		t.Fatalf("warnings = %v, want one skipping chrome", reply.Warnings)
+	}
+	if _, ok, _ := cache.Get(ctx, endpointID(self, "chrome", "Default")); ok {
+		t.Errorf("the Missing browser must not be warmed")
+	}
+}
+
+// TestPrimeAuthAllHardRouteFlipDoesNotSkipLaterBrowsers proves the mirror flip: the
+// hard-route peer is dead when the first flight derives routing — so that flight leads
+// ONE local batch covering every tracked browser — and comes alive right after. Later
+// browsers ride the batch's grant: none may be skipped as "not released by the one-tap
+// batch" (the stale live-at-start snapshot regression), no consent is routed, and the
+// batch bulk-caches every profile.
+func TestPrimeAuthAllHardRouteFlipDoesNotSkipLaterBrowsers(t *testing.T) {
+	ctx := context.Background()
+	self := "me@laptop"
+	peer := "you@desktop"
+	nonce := "hard-route-flip-nonce"
+	fakeMesh(t, self, peer)
+	st := stateWith(self, peer,
+		stateEndpoint(self, "arc", "Default"),
+		stateEndpoint(self, "arc", "Work"),
+		stateEndpoint(self, "chrome", "Default"),
+	)
+	st.ConsentRouteHard = true
+	consent := &fakeConsent{key: cookie.DeriveKey(cookie.SafeStorageKey("peanuts"))}
+	runner := &recordingRunner{
+		onceByMethod: map[string]string{"rpc whoami": deadWhoami},
+		replies:      map[string]string{"cookiesync rpc whoami": liveWhoami},
+		byMethod:     map[string]string{"request_consent": approvedReply(t, nonce, endpointID(self, "arc", "Default"))},
+	}
+	cache := newFakeCache()
+	d := New(consent, cache, nil, staticProbe(liveSession(currentUser(t))), runner, fixedState{st: st}, fixedState{st: st})
+	pinnedNonce(d, nonce)
+
+	got, err := d.handlePrimeAuth(ctx, map[string]any{})
+	if err != nil {
+		t.Fatalf("handlePrimeAuth all: %v", err)
+	}
+	reply := decodePrimeAll(t, got)
+	if len(reply.Warnings) != 0 {
+		t.Fatalf("warnings = %v, want none (a routed flip must not skip later browsers)", reply.Warnings)
+	}
+	want := []string{
+		endpointID(self, "arc", "Default"),
+		endpointID(self, "arc", "Work"),
+		endpointID(self, "chrome", "Default"),
+	}
+	if !slices.Equal(reply.Endpoints, want) {
+		t.Fatalf("endpoints = %v, want %v (every tracked endpoint primed by the one batch)", reply.Endpoints, want)
+	}
+	if len(consent.batchCalls) != 1 {
+		t.Fatalf("local consent evaluations = %d, want 1", len(consent.batchCalls))
+	}
+	if consent.unpromptedCalled != 0 {
+		t.Fatalf("unprompted releases = %d, want 0 (the dead-peer flight must release locally)", consent.unpromptedCalled)
+	}
+	for _, call := range runner.calls {
+		if strings.Contains(call.cmd, "request_consent") {
+			t.Fatalf("no consent may be routed after the local batch covered every browser, got %+v", runner.calls)
+		}
 	}
 }
 

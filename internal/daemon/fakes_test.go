@@ -48,11 +48,12 @@ func fakeMesh(t *testing.T, self string, peers ...string) {
 }
 
 // fakeConsent records its calls and returns a canned key (or a canned error from
-// ObtainKey to simulate a declined prompt), so the consent path runs without Touch ID
-// or the signed helper.
+// ObtainKey to simulate a declined prompt; a missingFor browser reports Missing from
+// the batch), so the consent path runs without Touch ID or the signed helper.
 type fakeConsent struct {
-	key       cookie.AesKey
-	obtainErr error
+	key        cookie.AesKey
+	obtainErr  error
+	missingFor cookie.BrowserName
 
 	mu               sync.Mutex
 	promptedReasons  []string
@@ -81,6 +82,10 @@ func (c *fakeConsent) ObtainKeys(_ context.Context, browsers []cookie.Browser, r
 	outcomes := make([]cookie.KeyOutcome, len(browsers))
 	for i, b := range browsers {
 		names[i] = b.Name
+		if b.Name == c.missingFor {
+			outcomes[i] = cookie.KeyOutcome{Browser: b, Missing: true}
+			continue
+		}
 		outcomes[i] = cookie.KeyOutcome{Browser: b, Key: c.key}
 	}
 	c.mu.Lock()
@@ -323,17 +328,19 @@ func (s fixedState) LoadRegistry(_ context.Context) (cregistry.Registry[state.En
 	return s.st.Browsers, nil
 }
 
-// recordingRunner serves a canned ssh reply, matched first by target (perTarget),
-// then by exact remoteCmd (replies), then by a command substring (byMethod), and
-// records every call so a test asserts the exact ssh traffic the routed-consent path
-// made without a real ssh.
+// recordingRunner serves a canned ssh reply, matched first by target (perTarget), then
+// by a once-only command substring (onceByMethod, consumed on first match — the double
+// for a peer whose liveness flips mid-call), then by exact remoteCmd (replies), then by
+// a command substring (byMethod), and records every call so a test asserts the exact
+// ssh traffic the routed-consent path made without a real ssh.
 type recordingRunner struct {
-	mu        sync.Mutex
-	perTarget map[string]string // target -> reply (wins; for distinguishing peers)
-	replies   map[string]string // exact remoteCmd -> reply
-	byMethod  map[string]string // command substring -> reply
-	calls     []runnerCall
-	err       error
+	mu           sync.Mutex
+	perTarget    map[string]string // target -> reply (wins; for distinguishing peers)
+	onceByMethod map[string]string // command substring -> reply served once
+	replies      map[string]string // exact remoteCmd -> reply
+	byMethod     map[string]string // command substring -> reply
+	calls        []runnerCall
+	err          error
 }
 
 type runnerCall struct {
@@ -350,6 +357,12 @@ func (r *recordingRunner) Run(_ context.Context, target, cmd string, _ []byte) (
 	}
 	if reply, ok := r.perTarget[target]; ok {
 		return reply, nil
+	}
+	for sub, reply := range r.onceByMethod {
+		if strings.Contains(cmd, sub) {
+			delete(r.onceByMethod, sub)
+			return reply, nil
+		}
 	}
 	if reply, ok := r.replies[cmd]; ok {
 		return reply, nil
@@ -376,6 +389,18 @@ func (r *forbiddenRunner) Run(_ context.Context, target, cmd string, _ []byte) (
 // staticProbe returns a fixed session snapshot.
 func staticProbe(snap SessionSnapshot) Probe {
 	return func(_ context.Context) (SessionSnapshot, error) { return snap, nil }
+}
+
+// flipProbe returns first on the initial probe call and rest on every later one — the
+// session double for a console whose presence flips mid-call.
+func flipProbe(first, rest SessionSnapshot) Probe {
+	var calls atomic.Int32
+	return func(_ context.Context) (SessionSnapshot, error) {
+		if calls.Add(1) == 1 {
+			return first, nil
+		}
+		return rest, nil
+	}
 }
 
 // fakeStore satisfies engine.Store with an injected WithLock, so a dispatcher test

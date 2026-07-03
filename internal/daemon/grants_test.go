@@ -23,7 +23,7 @@ func TestPrimeAuthGrantsArePerRequestor(t *testing.T) {
 	cache := newFakeCache()
 	d := New(consent, cache, nil, staticProbe(liveSession(currentUser(t))), &recordingRunner{}, fixedState{st: st}, fixedState{st: st})
 
-	if _, err := d.primeAuth(ctx, "host:h1", "chrome", "Default", consentReason, releaseLocal); err != nil {
+	if _, _, err := d.primeAuth(ctx, "host:h1", "chrome", "Default", consentReason, releaseLocal); err != nil {
 		t.Fatalf("A's prime: %v", err)
 	}
 	if len(consent.batchCalls) != 1 {
@@ -33,17 +33,17 @@ func TestPrimeAuthGrantsArePerRequestor(t *testing.T) {
 		t.Fatalf("A's tap must grant host:h1 chrome")
 	}
 
-	if _, err := d.primeAuth(ctx, "host:h2", "chrome", "Default", consentReason, releaseLocal); err != nil {
+	if _, _, err := d.primeAuth(ctx, "host:h2", "chrome", "Default", consentReason, releaseLocal); err != nil {
 		t.Fatalf("B's prime: %v", err)
 	}
 	if len(consent.batchCalls) != 2 {
 		t.Fatalf("B over the warm cache = %d evaluations, want 2 (A's tap must not grant B)", len(consent.batchCalls))
 	}
 
-	if _, err := d.primeAuth(ctx, "host:h1", "chrome", "Default", consentReason, releaseLocal); err != nil {
+	if _, _, err := d.primeAuth(ctx, "host:h1", "chrome", "Default", consentReason, releaseLocal); err != nil {
 		t.Fatalf("A's repeat prime: %v", err)
 	}
-	if _, err := d.primeAuth(ctx, "host:h2", "chrome", "Default", consentReason, releaseLocal); err != nil {
+	if _, _, err := d.primeAuth(ctx, "host:h2", "chrome", "Default", consentReason, releaseLocal); err != nil {
 		t.Fatalf("B's repeat prime: %v", err)
 	}
 	if len(consent.batchCalls) != 2 {
@@ -53,7 +53,7 @@ func TestPrimeAuthGrantsArePerRequestor(t *testing.T) {
 	d.grantMu.Lock()
 	d.grants["host:h1:chrome"] = time.Now().Add(-time.Second)
 	d.grantMu.Unlock()
-	if _, err := d.primeAuth(ctx, "host:h1", "chrome", "Default", consentReason, releaseLocal); err != nil {
+	if _, _, err := d.primeAuth(ctx, "host:h1", "chrome", "Default", consentReason, releaseLocal); err != nil {
 		t.Fatalf("A's prime after expiry: %v", err)
 	}
 	if len(consent.batchCalls) != 3 {
@@ -356,7 +356,7 @@ func TestReleaseUsesEffectiveTTLForCacheAndGrant(t *testing.T) {
 			d := New(consent, cache, nil, staticProbe(liveSession(currentUser(t))), &recordingRunner{}, fixedState{st: st}, fixedState{st: st})
 
 			before := time.Now()
-			if _, err := d.primeAuth(ctx, "local", "chrome", "Default", consentReason, releaseLocal); err != nil {
+			if _, _, err := d.primeAuth(ctx, "local", "chrome", "Default", consentReason, releaseLocal); err != nil {
 				t.Fatalf("primeAuth: %v", err)
 			}
 			if got := cache.putTTL(endpointID(self, "chrome", "Default")); got != tc.want {
