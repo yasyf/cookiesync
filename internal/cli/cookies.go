@@ -1,12 +1,17 @@
 package cli
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"os"
+	"sort"
+	"time"
 
 	"github.com/spf13/cobra"
 
 	"github.com/yasyf/cookiesync/internal/cookie"
+	"github.com/yasyf/cookiesync/internal/mesh"
 	"github.com/yasyf/cookiesync/internal/paths"
 	"github.com/yasyf/cookiesync/internal/rpc"
 	"github.com/yasyf/cookiesync/internal/state"
@@ -22,16 +27,22 @@ func newAuthCmd() *cobra.Command {
 			return runAuth(cmd, browser, profile, reason, ttl)
 		},
 	}
-	cmd.Flags().StringVar(&browser, "browser", "chrome", "The browser to authenticate.")
-	cmd.Flags().StringVar(&profile, "profile", "Default", "The profile to authenticate.")
+	cmd.Flags().StringVar(&browser, "browser", "", "The browser to authenticate; omitted authenticates every registered local browser behind one tap, and a cold session routes the prompt per browser to a live peer.")
+	cmd.Flags().StringVar(&profile, "profile", "Default", "The profile to authenticate (requires --browser).")
 	cmd.Flags().StringVar(&reason, "reason", "", "What the Touch ID prompt should say you're unlocking the cookies to do.")
 	cmd.Flags().StringVar(&ttl, "ttl", "", "Override the cache TTL (Go-style duration, e.g. 15m).")
 	return cmd
 }
 
-// runAuth optionally overrides the cache TTL, then primes the cached key via the daemon
-// and reports the authenticated endpoint, matching the Python run_auth.
+// runAuth optionally overrides the cache TTL, then primes the cached key(s) via the
+// daemon. With an explicit --browser it primes that one endpoint and reports it (the
+// Python run_auth path); with --browser omitted it auto-registers this host's installed
+// browsers when the registry has none, primes every registered local browser behind one
+// tap, and reports each warmed endpoint on stdout with per-browser skips on stderr.
 func runAuth(cmd *cobra.Command, browser, profile, reason, ttl string) error {
+	if cmd.Flags().Changed("profile") && browser == "" {
+		return errors.New("--profile requires --browser")
+	}
 	if ttl != "" {
 		d, err := state.ParseDuration(ttl)
 		if err != nil {
@@ -40,6 +51,9 @@ func runAuth(cmd *cobra.Command, browser, profile, reason, ttl string) error {
 		if err := state.New(paths.Config).SetAuthTTL(cmd.Context(), d); err != nil {
 			return err
 		}
+	}
+	if browser == "" {
+		return runAuthAll(cmd, reason)
 	}
 	params := map[string]any{"browser": browser, "profile": profile}
 	if reason != "" {
@@ -56,6 +70,115 @@ func runAuth(cmd *cobra.Command, browser, profile, reason, ttl string) error {
 	}
 	cmd.Printf("Authenticated %s.\n", result.Endpoint)
 	return nil
+}
+
+// runAuthAll auto-registers this host's installed browsers when the registry has no
+// local endpoint, then primes every registered local browser in one daemon call. It
+// prints each warmed endpoint id on stdout and each per-browser skip on stderr.
+func runAuthAll(cmd *cobra.Command, reason string) error {
+	if err := ensureLocalEndpoints(cmd.Context()); err != nil {
+		return err
+	}
+	params := map[string]any{}
+	if reason != "" {
+		params["reason"] = reason
+	}
+	if req := os.Getenv("COOKIESYNC_REQUESTOR"); req != "" {
+		params["requestor"] = req
+	}
+	var result struct {
+		Endpoints []string `json:"endpoints"`
+		Warnings  []string `json:"warnings"`
+	}
+	if err := rpc.CallJSON(cmd.Context(), "prime_auth", params, &result); err != nil {
+		return err
+	}
+	cmd.Printf("Authenticated %d endpoint(s):\n", len(result.Endpoints))
+	for _, id := range result.Endpoints {
+		cmd.Println(id)
+	}
+	for _, warning := range result.Warnings {
+		cmd.PrintErrln(warning)
+	}
+	return nil
+}
+
+// ensureLocalEndpoints registers this host's installed browsers when the convergent
+// registry holds no local endpoint for self: one primary profile per browser — "Default"
+// when its Cookies store exists, else the most-recently-modified profile among
+// Profiles() (which already drops Arc's system profile). A browser with no cookie store
+// is skipped, and when nothing registers it errors, since there is nothing to
+// authenticate.
+func ensureLocalEndpoints(ctx context.Context) error {
+	self, _, err := mesh.Resolve(ctx)
+	if err != nil {
+		return err
+	}
+	store := state.New(paths.Config)
+	st, err := store.Load(ctx)
+	if err != nil {
+		return err
+	}
+	for _, ep := range st.Endpoints() {
+		if ep.Host == self {
+			return nil
+		}
+	}
+	registry, err := cookie.Registry()
+	if err != nil {
+		return err
+	}
+	names := make([]cookie.BrowserName, 0, len(registry))
+	for name := range registry {
+		names = append(names, name)
+	}
+	sort.Slice(names, func(i, j int) bool { return names[i] < names[j] })
+	registered := false
+	for _, name := range names {
+		profile, err := primaryProfile(registry[name])
+		if err != nil {
+			return err
+		}
+		if profile == "" {
+			continue
+		}
+		endpoint := state.Endpoint{Host: self, Browser: string(name), Profile: profile}
+		if err := store.AddBrowser(ctx, self, endpoint); err != nil {
+			return err
+		}
+		registered = true
+	}
+	if !registered {
+		return errors.New("no installed browsers detected; run cookiesync browser add")
+	}
+	return nil
+}
+
+// primaryProfile picks the profile ensureLocalEndpoints tracks for a browser: "Default"
+// when its Cookies store exists, else the profile whose Cookies store has the newest
+// mtime among the browser's profiles. It returns "" when the browser has no store on
+// this host.
+func primaryProfile(browser cookie.Browser) (string, error) {
+	if _, err := os.Stat(browser.CookiesDB("Default")); err == nil {
+		return "Default", nil
+	}
+	profiles, err := browser.Profiles()
+	if err != nil {
+		return "", err
+	}
+	newest := ""
+	var newestMod time.Time
+	for _, p := range profiles {
+		info, err := os.Stat(browser.CookiesDB(p.Dir))
+		if err != nil {
+			return "", err
+		}
+		if newest == "" || info.ModTime().After(newestMod) {
+			newest = p.Dir
+			newestMod = info.ModTime()
+		}
+	}
+	return newest, nil
 }
 
 func newCookiesCmd() *cobra.Command {

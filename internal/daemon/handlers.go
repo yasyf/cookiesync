@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"time"
 
 	"github.com/yasyf/cookiesync/internal/cookie"
@@ -160,16 +161,18 @@ func (d *Daemon) handleWhoami(ctx context.Context, _ map[string]any) (any, error
 	return sessionSummary(ctx, d.probe)
 }
 
-// handlePrimeAuth obtains the Safe Storage key (behind one Touch ID tap when a session
-// is live, else by routing the gate to the active peer) and caches it under the
-// endpoint TTL. Emits the frozen {"primed": true, "endpoint": str}.
+// handlePrimeAuth obtains the Safe Storage key and caches it under the endpoint TTL. With
+// a "browser" param it primes that one endpoint — behind one Touch ID tap when a session
+// is live, else by routing the gate to the active peer — and emits the frozen
+// {"primed": true, "endpoint": str}. With no "browser" it primes every registered local
+// browser via primeAuthAll, emitting {"primed": true, "endpoints": [...], "warnings": [...]}.
 func (d *Daemon) handlePrimeAuth(ctx context.Context, params map[string]any) (any, error) {
-	browser, err := stringParam(params, "browser")
-	if err != nil {
-		return nil, err
+	reason := optionalString(params, "reason", consentReason)
+	browser := optionalString(params, "browser", "")
+	if browser == "" {
+		return d.primeAuthAll(ctx, requestorID(ctx, params), reason)
 	}
 	profile := optionalString(params, "profile", defaultProfile)
-	reason := optionalString(params, "reason", consentReason)
 	if _, err := d.primeAuth(ctx, requestorID(ctx, params), browser, profile, reason, releaseLocal); err != nil {
 		return nil, err
 	}
@@ -178,6 +181,118 @@ func (d *Daemon) handlePrimeAuth(ctx context.Context, params map[string]any) (an
 		return nil, err
 	}
 	return map[string]any{"primed": true, "endpoint": endpointID(self, browser, profile)}, nil
+}
+
+// primeAuthAll primes every registered local browser behind at most one Touch ID sheet,
+// looping the single-browser primeAuth over the distinct local browsers in sorted order.
+// A live session leads one batch flight whose releaseAllLocal covers every tracked local
+// browser, so any browser still cold after it was Missing or denied in that batch —
+// surfaced as a warning, never a second sheet. A cold session routes consent per browser
+// to a live peer (decision 1), caching each routed key under all of that browser's
+// tracked local endpoint ids, since every profile of a browser shares its Safe Storage
+// key. Zero tracked local browsers fails closed with AuthRequired — the CLI
+// auto-registers before calling, so this is the backstop; a loop that primes nothing
+// returns the first underlying error. Emits {"primed": true, "endpoints": [sorted ids],
+// "warnings": [...]}.
+func (d *Daemon) primeAuthAll(ctx context.Context, requestor, reason string) (map[string]any, error) {
+	self, err := meshSelf(ctx)
+	if err != nil {
+		return nil, err
+	}
+	st, err := d.state.Load(ctx)
+	if err != nil {
+		return nil, err
+	}
+	locals := make([]state.Endpoint, 0)
+	for _, ep := range st.Endpoints() {
+		if ep.Host == self {
+			locals = append(locals, ep)
+		}
+	}
+	if len(locals) == 0 {
+		return nil, &AuthRequired{Msg: "no local browsers are tracked; run cookiesync browser add"}
+	}
+	sort.Slice(locals, func(i, j int) bool { return locals[i].ID() < locals[j].ID() })
+
+	// Distinct browsers in id-sorted order (each with its first tracked profile) plus
+	// every browser's full set of tracked local endpoint ids — all profiles of a browser
+	// share one key, so a routed prime bulk-caches the others and the final scan reports
+	// them all.
+	type browserPrime struct{ browser, profile string }
+	var order []browserPrime
+	idsByBrowser := map[string][]string{}
+	for _, ep := range locals {
+		if _, seen := idsByBrowser[ep.Browser]; !seen {
+			order = append(order, browserPrime{browser: ep.Browser, profile: ep.Profile})
+		}
+		idsByBrowser[ep.Browser] = append(idsByBrowser[ep.Browser], string(ep.ID()))
+	}
+
+	routed, err := d.routesConsent(ctx, st)
+	if err != nil {
+		return nil, err
+	}
+
+	var warnings []string
+	var firstErr error
+	prompted := false
+	for _, bp := range order {
+		id := endpointID(self, bp.browser, bp.profile)
+		_, warm, err := d.cache.Get(ctx, id)
+		if err != nil {
+			return nil, err
+		}
+		if warm && d.granted(requestor, cookie.BrowserName(bp.browser)) {
+			continue
+		}
+		if !routed && prompted {
+			warnings = append(warnings, fmt.Sprintf("skip %s: not released by the one-tap batch (missing or denied)", bp.browser))
+			continue
+		}
+		key, err := d.primeAuth(ctx, requestor, bp.browser, bp.profile, reason, releaseLocal)
+		if !routed {
+			prompted = true
+		}
+		if err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			warnings = append(warnings, fmt.Sprintf("skip %s: %v", bp.browser, err))
+			continue
+		}
+		if routed {
+			ttl := d.effectiveTTL(st.Settings.AuthTTL)
+			for _, other := range idsByBrowser[bp.browser] {
+				if other == id {
+					continue
+				}
+				if err := d.cache.Put(ctx, other, []byte(key), ttl); err != nil {
+					return nil, err
+				}
+			}
+		}
+	}
+
+	endpoints := make([]string, 0, len(locals))
+	for _, ep := range locals {
+		id := string(ep.ID())
+		_, warm, err := d.cache.Get(ctx, id)
+		if err != nil {
+			return nil, err
+		}
+		if warm {
+			endpoints = append(endpoints, id)
+		}
+	}
+	if len(endpoints) == 0 {
+		return nil, firstErr
+	}
+	sort.Strings(endpoints)
+	reply := map[string]any{"primed": true, "endpoints": endpoints}
+	if len(warnings) > 0 {
+		reply["warnings"] = warnings
+	}
+	return reply, nil
 }
 
 // handleAuthStatus reports whether the endpoint's key is warm in the cache and whether
@@ -345,24 +460,38 @@ func (d *Daemon) releaseAndCacheKey(ctx context.Context, requestor, self, id, br
 // routed-consent cycle deadlocks.
 func (d *Daemon) releaseKey(ctx context.Context, st *state.State, requestor, self, id, browser, profile, reason string, mode releaseMode) (*batchResult, error) {
 	if mode == releaseLocal {
-		if st.ConsentRouteHard && st.ConsentRouteTo != "" {
-			live, err := d.peerIsLive(ctx, st.ConsentRouteTo)
-			if err != nil {
-				return nil, err
-			}
-			if live {
-				return d.routedBatch(ctx, st, requestor, id, browser, profile)
-			}
-		}
-		live, err := HasActiveSession(ctx, d.probe)
+		routed, err := d.routesConsent(ctx, st)
 		if err != nil {
 			return nil, err
 		}
-		if !live {
+		if routed {
 			return d.routedBatch(ctx, st, requestor, id, browser, profile)
 		}
 	}
 	return d.releaseAllLocal(ctx, st, requestor, self, id, browser, reason)
+}
+
+// routesConsent reports whether a releaseLocal prime routes the user-presence gate to a
+// peer instead of prompting Touch ID locally: a hard consent route (ConsentRouteHard) to
+// a live ConsentRouteTo peer wins outright — this host routes even when it looks locally
+// attended — and a cold local session routes to the active peer. It is the single
+// decision point releaseKey and primeAuthAll share, so the routed/local split can never
+// drift between the per-endpoint prime and the all-browser loop.
+func (d *Daemon) routesConsent(ctx context.Context, st *state.State) (bool, error) {
+	if st.ConsentRouteHard && st.ConsentRouteTo != "" {
+		live, err := d.peerIsLive(ctx, st.ConsentRouteTo)
+		if err != nil {
+			return false, err
+		}
+		if live {
+			return true, nil
+		}
+	}
+	live, err := HasActiveSession(ctx, d.probe)
+	if err != nil {
+		return false, err
+	}
+	return !live, nil
 }
 
 // routedBatch releases the requested browser's key through the routed-consent
