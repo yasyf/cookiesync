@@ -185,29 +185,41 @@ func newCookiesCmd() *cobra.Command {
 	var browser, profile, format string
 	cmd := &cobra.Command{
 		Use:   "cookies <url>...",
-		Short: "Stream the cookies for one or more URLS in the chosen format, merged into one document.",
-		Long: "Stream the cookies for one or more URLS in the chosen format, merged into one " +
+		Short: "Stream the cookies for one or more URLs in the chosen format, merged into one document; omit --browser to union every registered browser and host.",
+		Long: "Stream the cookies for one or more URLs in the chosen format, merged into one " +
 			"document.\n\nPass several hosts (e.g. an app and the API host it calls) to get a single " +
-			"storageState spanning them all — one cached-key decrypt, no extra Touch ID prompt.",
+			"storageState spanning them all — one cached-key decrypt, no extra Touch ID prompt.\n\n" +
+			"With --browser omitted the result is a best-effort union across every registered browser " +
+			"and host — local stores and remote peers over ssh — skipping any that fail with a stderr " +
+			"warning; --browser is the single-browser escape hatch.",
 		Args: cobra.MinimumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return runCookies(cmd, args, browser, profile, format)
 		},
 	}
-	cmd.Flags().StringVar(&browser, "browser", "chrome", "The browser to read cookies from.")
-	cmd.Flags().StringVar(&profile, "profile", "Default", "The profile to read cookies from.")
+	cmd.Flags().StringVar(&browser, "browser", "", "The browser to read cookies from; omitted unions every registered browser and host, skipping any that fail.")
+	cmd.Flags().StringVar(&profile, "profile", "Default", "The profile to read cookies from (requires --browser).")
 	cmd.Flags().StringVar(&format, "format", "playwright", "The output wire format (playwright|netscape|header|json).")
 	return cmd
 }
 
-// runCookies fetches the merged cookies for every url in one daemon call and renders
-// them in the chosen format. It sends the dual url/urls wire so an older resident
-// daemon still serves the first host. Mirrors the Python run_cookies.
+// runCookies renders the merged cookies for every url in the chosen format. With an
+// explicit --browser it fetches that one browser in a single daemon call, sending the
+// dual url/urls wire so an older resident daemon still serves the first host (the Python
+// run_cookies path). With --browser omitted it auto-registers this host's installed
+// browsers when the registry has none, then unions every registered endpoint — local and
+// remote — rendering the merged set on stdout with per-endpoint skips on stderr.
 func runCookies(cmd *cobra.Command, urls []string, browser, profile, format string) error {
 	switch cookie.OutputFormat(format) {
 	case cookie.FormatPlaywright, cookie.FormatNetscape, cookie.FormatHeader, cookie.FormatJSON:
 	default:
 		return fmt.Errorf("unknown format %q: want playwright, netscape, header, or json", format)
+	}
+	if cmd.Flags().Changed("profile") && browser == "" {
+		return errors.New("--profile requires --browser")
+	}
+	if browser == "" {
+		return runCookiesAll(cmd, urls, format)
 	}
 	params := map[string]any{
 		"url":     urls[0],
@@ -224,11 +236,46 @@ func runCookies(cmd *cobra.Command, urls []string, browser, profile, format stri
 	if err := rpc.CallJSON(cmd.Context(), "get_cookies", params, &result); err != nil {
 		return err
 	}
-	storage := cookie.StorageState{Cookies: fromWireCookies(result.Cookies)}
+	renderCookies(cmd, result.Cookies, format)
+	return nil
+}
+
+// runCookiesAll auto-registers this host's installed browsers when the registry has no
+// local endpoint, then unions the cookies for every url across every registered endpoint
+// in one daemon call. It sends the dual url/urls wire with no browser/profile, renders
+// the merged set on stdout, and writes each per-endpoint skip on stderr.
+func runCookiesAll(cmd *cobra.Command, urls []string, format string) error {
+	if err := ensureLocalEndpoints(cmd.Context()); err != nil {
+		return err
+	}
+	params := map[string]any{
+		"url":  urls[0],
+		"urls": asAnySlice(urls),
+	}
+	if req := os.Getenv("COOKIESYNC_REQUESTOR"); req != "" {
+		params["requestor"] = req
+	}
+	var result struct {
+		Cookies  []cookie.WireCookie `json:"cookies"`
+		Warnings []string            `json:"warnings"`
+	}
+	if err := rpc.CallJSON(cmd.Context(), "get_cookies", params, &result); err != nil {
+		return err
+	}
+	renderCookies(cmd, result.Cookies, format)
+	for _, warning := range result.Warnings {
+		cmd.PrintErrln(warning)
+	}
+	return nil
+}
+
+// renderCookies writes the wire cookies to stdout in the chosen format, one document
+// line per Println.
+func renderCookies(cmd *cobra.Command, wire []cookie.WireCookie, format string) {
+	storage := cookie.StorageState{Cookies: fromWireCookies(wire)}
 	for _, line := range cookie.Render(storage, cookie.OutputFormat(format)) {
 		cmd.Println(line)
 	}
-	return nil
 }
 
 func asAnySlice(in []string) []any {

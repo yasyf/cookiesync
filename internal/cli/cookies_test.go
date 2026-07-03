@@ -22,6 +22,20 @@ func writeCookieStore(t *testing.T, path string) {
 	}
 }
 
+// TestCookiesProfileWithoutBrowserErrors proves --profile without --browser fails fast,
+// before any daemon call (decision 5): the profile flag only means something for a
+// single browser.
+func TestCookiesProfileWithoutBrowserErrors(t *testing.T) {
+	cmd := newCookiesCmd()
+	cmd.SetArgs([]string{"--profile", "Work", "https://x.com"})
+	cmd.SilenceUsage = true
+	cmd.SilenceErrors = true
+	err := cmd.Execute()
+	if err == nil || !strings.Contains(err.Error(), "--profile requires --browser") {
+		t.Fatalf("cookies --profile without --browser = %v, want '--profile requires --browser'", err)
+	}
+}
+
 // TestEnsureLocalEndpointsRegistersInstalledBrowsers proves the auto-register picks one
 // primary profile per installed browser: Chrome with no Default but a "Profile 3" store
 // registers chrome:Profile 3, and Arc with a Default store registers arc:Default.

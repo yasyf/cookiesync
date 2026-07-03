@@ -262,12 +262,16 @@ func TestPrimeAuthForgedOriginCannotRideHostGrant(t *testing.T) {
 	}
 }
 
-// TestGetCookiesForgedOriginCannotRideHostGrant is the forgery regression for
-// get_cookies: a forged origin must not let a same-uid caller ride a live host grant
-// over a warm cache. Despite a pre-warmed key and a live "host:evil" grant,
-// get_cookies with origin=evil forces its own consent evaluation and still serves the
-// cookies from the local requestor's fresh release.
-func TestGetCookiesForgedOriginCannotRideHostGrant(t *testing.T) {
+// TestGetCookiesUnionForgedOriginCannotRideHostGrant is the forgery regression for the
+// browser-less union path. That path is never peer-driven — the recursion guard forbids
+// a peer re-fanning out — so it resolves the requestor via the origin-blind requestorID
+// ladder, and a same-uid caller that forges an origin must not ride a live host grant
+// over a warm cache. Despite a pre-warmed key and a live "host:evil" grant, a union
+// get_cookies with origin=evil forces its own consent evaluation for the local endpoint
+// and grants only the local requestor. The single path's peer-driven origin trust (the
+// extract envelope, decision 7) is the deliberate asymmetry, pinned separately by
+// TestGetCookiesSinglePeerDrivenGrantKeysOrigin.
+func TestGetCookiesUnionForgedOriginCannotRideHostGrant(t *testing.T) {
 	ctx := context.Background()
 	browser := chromeStoreUnderHome(t)
 	key := cookie.DeriveKey(cookie.SafeStorageKey("peanuts"))
@@ -279,25 +283,25 @@ func TestGetCookiesForgedOriginCannotRideHostGrant(t *testing.T) {
 	}
 	self := "me@laptop"
 	fakeMesh(t, self)
-	st := stateWith(self, "")
+	st := stateWith(self, "", stateEndpoint(self, "chrome", "Default"))
 	consent := &fakeConsent{key: key}
 	cache := newFakeCache()
 	d := New(consent, cache, nil, staticProbe(liveSession(currentUser(t))), &recordingRunner{}, fixedState{st: st}, fixedState{st: st})
 	_ = cache.Put(ctx, endpointID(self, "chrome", "Default"), []byte(key), 0)
 	d.grant("host:evil", []cookie.BrowserName{"chrome"}, time.Hour)
 
-	got, err := d.handleGetCookies(ctx, map[string]any{"browser": "chrome", "url": "https://x.com/", "origin": "evil"})
+	got, err := d.handleGetCookies(ctx, map[string]any{"url": "https://x.com/", "origin": "evil"})
 	if err != nil {
-		t.Fatalf("handleGetCookies forged origin: %v", err)
+		t.Fatalf("handleGetCookies union forged origin: %v", err)
 	}
 	if cookies := wireCookieNames(t, got); cookies["sid"].Value != "abc" {
 		t.Fatalf("get_cookies = %+v, want sid=abc", cookies)
 	}
 	if len(consent.batchCalls) != 1 {
-		t.Fatalf("forged-origin get_cookies = %d evaluations, want 1 (a warm cache and a host:evil grant must not serve a forged origin)", len(consent.batchCalls))
+		t.Fatalf("forged-origin union get_cookies = %d evaluations, want 1 (a warm cache and a host:evil grant must not serve a forged origin)", len(consent.batchCalls))
 	}
 	if !d.granted("local", "chrome") {
-		t.Fatalf("the forged-origin get_cookies must resolve to the local requestor and grant local:chrome")
+		t.Fatalf("the forged-origin union get_cookies must resolve to the local requestor and grant local:chrome")
 	}
 }
 

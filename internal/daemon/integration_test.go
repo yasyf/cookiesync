@@ -157,6 +157,282 @@ func TestGetCookiesHostFilters(t *testing.T) {
 	}
 }
 
+// TestGetCookiesUnionLocalAndRemote proves a browser-less get_cookies unions a warm
+// local endpoint with a remote one — the remote leg driving the peer's single-browser
+// get_cookies over ssh — into one merged set. The recorded ssh command carries the
+// recursion guard (--browser) and the origin tag, so the peer takes the single path and
+// never re-fans-out.
+func TestGetCookiesUnionLocalAndRemote(t *testing.T) {
+	ctx := context.Background()
+	browser := chromeStoreUnderHome(t)
+	key := cookie.DeriveKey(cookie.SafeStorageKey("peanuts"))
+	local := []cookie.Cookie{{HostKey: "x.com", Name: "loc", Value: "here", Path: "/", LastUpdateUTC: 13_350_000_000_000_000, SameSite: 2, IsSecure: true, SourceScheme: 2, SourcePort: 443}}
+	if _, err := cookie.Apply(ctx, local, browser, "Default", key); err != nil {
+		t.Fatalf("seed apply: %v", err)
+	}
+
+	self := "me@laptop"
+	fakeMesh(t, self, "you@desktop")
+	st := stateWith(self, "",
+		stateEndpoint(self, "chrome", "Default"),
+		stateEndpoint("you@desktop", "chrome", "Default"),
+	)
+	runner := &recordingRunner{byMethod: map[string]string{
+		"rpc get_cookies": peerExtractReply(t, cookie.Cookie{HostKey: "x.com", Name: "rem", Value: "there", Path: "/", LastUpdateUTC: 13_350_000_000_000_000, SameSite: 2, IsSecure: true, SourceScheme: 2, SourcePort: 443}),
+	}}
+	cache := newFakeCache()
+	consent := &fakeConsent{key: key}
+	d := New(consent, cache, nil, staticProbe(SessionSnapshot{}), runner, fixedState{st: st}, fixedState{st: st})
+	_ = cache.Put(ctx, endpointID(self, "chrome", "Default"), []byte(key), 0)
+	d.grant("local", []cookie.BrowserName{"chrome"}, time.Hour)
+
+	got, err := d.handleGetCookies(ctx, map[string]any{"url": "https://x.com/"})
+	if err != nil {
+		t.Fatalf("handleGetCookies union: %v", err)
+	}
+	cookies := wireCookieNames(t, got)
+	if len(cookies) != 2 || cookies["loc"].Value != "here" || cookies["rem"].Value != "there" {
+		t.Fatalf("union = %+v, want loc=here rem=there", cookies)
+	}
+	if len(consent.promptedReasons) != 0 {
+		t.Fatalf("a warm+granted local endpoint must not prompt, got %v", consent.promptedReasons)
+	}
+	remoteCmd := ""
+	for _, call := range runner.calls {
+		if strings.Contains(call.cmd, "rpc get_cookies") {
+			remoteCmd = call.cmd
+		}
+	}
+	if remoteCmd == "" {
+		t.Fatalf("the remote leg never drove rpc get_cookies; calls = %+v", runner.calls)
+	}
+	if !strings.Contains(remoteCmd, "rpc get_cookies --browser") || !strings.Contains(remoteCmd, "--origin") {
+		t.Fatalf("remote cmd = %q, want the single-path recursion guard (--browser) and --origin", remoteCmd)
+	}
+}
+
+// TestGetCookiesUnionLocalWinsTie proves the conflict rule: when a local and a remote
+// endpoint carry the same logical cookie with an equal last_update_utc but a different
+// value, MergeRanked keeps the LOCAL machine's value.
+func TestGetCookiesUnionLocalWinsTie(t *testing.T) {
+	ctx := context.Background()
+	browser := chromeStoreUnderHome(t)
+	key := cookie.DeriveKey(cookie.SafeStorageKey("peanuts"))
+	const stamp = 13_350_000_000_000_000
+	local := []cookie.Cookie{{HostKey: "x.com", Name: "sid", Value: "localwins", Path: "/", LastUpdateUTC: stamp, SameSite: 2, IsSecure: true, SourceScheme: 2, SourcePort: 443}}
+	if _, err := cookie.Apply(ctx, local, browser, "Default", key); err != nil {
+		t.Fatalf("seed apply: %v", err)
+	}
+
+	self := "me@laptop"
+	fakeMesh(t, self, "you@desktop")
+	st := stateWith(self, "",
+		stateEndpoint(self, "chrome", "Default"),
+		stateEndpoint("you@desktop", "chrome", "Default"),
+	)
+	runner := &recordingRunner{byMethod: map[string]string{
+		"rpc get_cookies": peerExtractReply(t, cookie.Cookie{HostKey: "x.com", Name: "sid", Value: "remotewins", Path: "/", LastUpdateUTC: stamp, SameSite: 2, IsSecure: true, SourceScheme: 2, SourcePort: 443}),
+	}}
+	cache := newFakeCache()
+	d := New(&fakeConsent{key: key}, cache, nil, staticProbe(SessionSnapshot{}), runner, fixedState{st: st}, fixedState{st: st})
+	_ = cache.Put(ctx, endpointID(self, "chrome", "Default"), []byte(key), 0)
+	d.grant("local", []cookie.BrowserName{"chrome"}, time.Hour)
+
+	got, err := d.handleGetCookies(ctx, map[string]any{"url": "https://x.com/"})
+	if err != nil {
+		t.Fatalf("handleGetCookies union: %v", err)
+	}
+	cookies := wireCookieNames(t, got)
+	if len(cookies) != 1 || cookies["sid"].Value != "localwins" {
+		t.Fatalf("tie union = %+v, want the local value 'localwins'", cookies)
+	}
+}
+
+// TestGetCookiesUnionColdLocalSkippedRemoteContributes proves the never-route rule: a
+// cold local endpoint on an unattended host is skipped with a warning (cookies never
+// routes consent — that is auth's job), the remote endpoint still contributes, and no
+// consent is ever evaluated.
+func TestGetCookiesUnionColdLocalSkippedRemoteContributes(t *testing.T) {
+	ctx := context.Background()
+	chromeStoreUnderHome(t)
+	self := "me@laptop"
+	fakeMesh(t, self, "you@desktop")
+	st := stateWith(self, "",
+		stateEndpoint(self, "chrome", "Default"),
+		stateEndpoint("you@desktop", "chrome", "Default"),
+	)
+	runner := &recordingRunner{byMethod: map[string]string{
+		"rpc get_cookies": peerExtractReply(t, cookie.Cookie{HostKey: "x.com", Name: "rem", Value: "there", Path: "/", LastUpdateUTC: 13_350_000_000_000_000, SameSite: 2, IsSecure: true, SourceScheme: 2, SourcePort: 443}),
+	}}
+	consent := &fakeConsent{key: cookie.DeriveKey(cookie.SafeStorageKey("peanuts"))}
+	cache := newFakeCache()
+	d := New(consent, cache, nil, staticProbe(SessionSnapshot{}), runner, fixedState{st: st}, fixedState{st: st})
+
+	got, err := d.handleGetCookies(ctx, map[string]any{"url": "https://x.com/"})
+	if err != nil {
+		t.Fatalf("handleGetCookies union: %v", err)
+	}
+	cookies := wireCookieNames(t, got)
+	if len(cookies) != 1 || cookies["rem"].Value != "there" {
+		t.Fatalf("union = %+v, want only the remote rem=there", cookies)
+	}
+	if len(consent.promptedReasons) != 0 || len(consent.batchCalls) != 0 {
+		t.Fatalf("cookies must never prompt or route a cold local endpoint, got prompts %v batches %v", consent.promptedReasons, consent.batchCalls)
+	}
+	warnings := decodeWarnings(t, got)
+	if len(warnings) != 1 || !strings.Contains(warnings[0], "skip cold") || !strings.Contains(warnings[0], endpointID(self, "chrome", "Default")) {
+		t.Fatalf("warnings = %v, want one 'skip cold' naming the local endpoint", warnings)
+	}
+}
+
+// TestGetCookiesUnionBrokenLocalStoreSkipped proves best-effort per endpoint: a
+// warm+granted local endpoint whose store cannot be read is skipped with a warning
+// instead of failing the whole union, and the remote endpoint still contributes.
+func TestGetCookiesUnionBrokenLocalStoreSkipped(t *testing.T) {
+	ctx := context.Background()
+	browser := chromeStoreUnderHome(t)
+	garbage := browser.CookiesDB("Ghost")
+	if err := os.MkdirAll(filepath.Dir(garbage), 0o750); err != nil {
+		t.Fatalf("mkdir ghost profile: %v", err)
+	}
+	if err := os.WriteFile(garbage, []byte("not a sqlite database"), 0o600); err != nil {
+		t.Fatalf("write ghost store: %v", err)
+	}
+
+	self := "me@laptop"
+	fakeMesh(t, self, "you@desktop")
+	st := stateWith(self, "",
+		stateEndpoint(self, "chrome", "Ghost"),
+		stateEndpoint("you@desktop", "chrome", "Default"),
+	)
+	runner := &recordingRunner{byMethod: map[string]string{
+		"rpc get_cookies": peerExtractReply(t, cookie.Cookie{HostKey: "x.com", Name: "rem", Value: "there", Path: "/", LastUpdateUTC: 13_350_000_000_000_000, SameSite: 2, IsSecure: true, SourceScheme: 2, SourcePort: 443}),
+	}}
+	key := cookie.DeriveKey(cookie.SafeStorageKey("peanuts"))
+	cache := newFakeCache()
+	d := New(&fakeConsent{key: key}, cache, nil, staticProbe(SessionSnapshot{}), runner, fixedState{st: st}, fixedState{st: st})
+	_ = cache.Put(ctx, endpointID(self, "chrome", "Ghost"), []byte(key), 0)
+	d.grant("local", []cookie.BrowserName{"chrome"}, time.Hour)
+
+	got, err := d.handleGetCookies(ctx, map[string]any{"url": "https://x.com/"})
+	if err != nil {
+		t.Fatalf("handleGetCookies union: %v", err)
+	}
+	cookies := wireCookieNames(t, got)
+	if len(cookies) != 1 || cookies["rem"].Value != "there" {
+		t.Fatalf("union = %+v, want only the remote rem=there", cookies)
+	}
+	warnings := decodeWarnings(t, got)
+	if len(warnings) != 1 || !strings.Contains(warnings[0], endpointID(self, "chrome", "Ghost")) {
+		t.Fatalf("warnings = %v, want one skip naming the broken local endpoint", warnings)
+	}
+}
+
+// TestGetCookiesUnionLiveLocalOneEvaluation proves decision 8: a browser-less get_cookies
+// over a live local session with nothing granted costs exactly ONE consent evaluation for
+// the whole call, then extraction proceeds with the released key.
+func TestGetCookiesUnionLiveLocalOneEvaluation(t *testing.T) {
+	ctx := context.Background()
+	browser := chromeStoreUnderHome(t)
+	key := cookie.DeriveKey(cookie.SafeStorageKey("peanuts"))
+	seed := []cookie.Cookie{{HostKey: "x.com", Name: "sid", Value: "abc", Path: "/", LastUpdateUTC: 13_350_000_000_000_000, SameSite: 2, IsSecure: true, SourceScheme: 2, SourcePort: 443}}
+	if _, err := cookie.Apply(ctx, seed, browser, "Default", key); err != nil {
+		t.Fatalf("seed apply: %v", err)
+	}
+
+	self := "me@laptop"
+	fakeMesh(t, self)
+	st := stateWith(self, "", stateEndpoint(self, "chrome", "Default"))
+	consent := &countingConsent{key: key}
+	cache := newFakeCache()
+	d := New(consent, cache, nil, staticProbe(liveSession(currentUser(t))), &recordingRunner{}, fixedState{st: st}, fixedState{st: st})
+
+	got, err := d.handleGetCookies(ctx, map[string]any{"url": "https://x.com/"})
+	if err != nil {
+		t.Fatalf("handleGetCookies union: %v", err)
+	}
+	if n := consent.calls.Load(); n != 1 {
+		t.Fatalf("consent evaluations = %d, want 1 (a live local union costs one tap)", n)
+	}
+	cookies := wireCookieNames(t, got)
+	if cookies["sid"].Value != "abc" {
+		t.Fatalf("union after the one tap = %+v, want sid=abc", cookies)
+	}
+}
+
+// TestGetCookiesUnionZeroContributorsErrors proves a total shutout — cold local skipped,
+// remote ssh down — fails with an error that suggests cookiesync auth, rather than
+// serving an empty document.
+func TestGetCookiesUnionZeroContributorsErrors(t *testing.T) {
+	ctx := context.Background()
+	chromeStoreUnderHome(t)
+	self := "me@laptop"
+	fakeMesh(t, self, "you@desktop")
+	st := stateWith(self, "",
+		stateEndpoint(self, "chrome", "Default"),
+		stateEndpoint("you@desktop", "chrome", "Default"),
+	)
+	runner := &recordingRunner{err: errors.New("ssh down")}
+	d := New(&fakeConsent{}, newFakeCache(), nil, staticProbe(SessionSnapshot{}), runner, fixedState{st: st}, fixedState{st: st})
+
+	_, err := d.handleGetCookies(ctx, map[string]any{"url": "https://x.com/"})
+	if err == nil || !strings.Contains(err.Error(), "cookiesync auth") {
+		t.Fatalf("union with no contributors = %v, want an error suggesting cookiesync auth", err)
+	}
+}
+
+// TestGetCookiesSinglePeerDrivenGrantKeysOrigin proves the frozen single path is
+// peer-driven: a get_cookies with an explicit browser and an origin resolves the grant
+// via peerRequestor ("host:"+origin), so a warm cache is served silently to the peer's
+// origin grant on a cold, unattended host where a fresh release would fail closed.
+func TestGetCookiesSinglePeerDrivenGrantKeysOrigin(t *testing.T) {
+	ctx := context.Background()
+	browser := chromeStoreUnderHome(t)
+	key := cookie.DeriveKey(cookie.SafeStorageKey("peanuts"))
+	seed := []cookie.Cookie{{HostKey: "x.com", Name: "sid", Value: "abc", Path: "/", LastUpdateUTC: 13_350_000_000_000_000, SameSite: 2, IsSecure: true, SourceScheme: 2, SourcePort: 443}}
+	if _, err := cookie.Apply(ctx, seed, browser, "Default", key); err != nil {
+		t.Fatalf("seed apply: %v", err)
+	}
+
+	self := "me@laptop"
+	fakeMesh(t, self)
+	st := stateWith(self, "", stateEndpoint(self, "chrome", "Default"))
+	consent := &fakeConsent{key: key}
+	cache := newFakeCache()
+	d := New(consent, cache, nil, staticProbe(SessionSnapshot{}), &recordingRunner{}, fixedState{st: st}, fixedState{st: st})
+	_ = cache.Put(ctx, endpointID(self, "chrome", "Default"), []byte(key), 0)
+	d.grant("host:you@desktop", []cookie.BrowserName{"chrome"}, time.Hour)
+
+	got, err := d.handleGetCookies(ctx, map[string]any{"browser": "chrome", "url": "https://x.com/", "origin": "you@desktop"})
+	if err != nil {
+		t.Fatalf("peer-driven single get_cookies: %v", err)
+	}
+	cookies := wireCookieNames(t, got)
+	if cookies["sid"].Value != "abc" {
+		t.Fatalf("peer-driven read = %+v, want sid=abc", cookies)
+	}
+	if len(consent.promptedReasons) != 0 {
+		t.Fatalf("the origin-keyed grant must serve the warm key silently, got prompts %v", consent.promptedReasons)
+	}
+}
+
+// decodeWarnings renders a handler result through the wire transport and returns its
+// "warnings" list, asserting the envelope decodes.
+func decodeWarnings(t *testing.T, result any) []string {
+	t.Helper()
+	data, err := json.Marshal(result)
+	if err != nil {
+		t.Fatalf("marshal result: %v", err)
+	}
+	var envelope struct {
+		Warnings []string `json:"warnings"`
+	}
+	if err := json.Unmarshal(data, &envelope); err != nil {
+		t.Fatalf("decode warnings: %v (%s)", err, data)
+	}
+	return envelope.Warnings
+}
+
 // TestExtractApplyRoundTripWireContract proves the peer-facing extract/apply pair: a
 // warm cache extract emits {"cookies": [...]} for the WHOLE profile (not host-filtered),
 // and an apply of a wire array writes the rows back and reports {"applied": n}. extract

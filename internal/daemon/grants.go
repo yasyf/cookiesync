@@ -32,9 +32,10 @@ func requestorID(ctx context.Context, params map[string]any) string {
 	return "local"
 }
 
-// peerRequestor is requestorID for the one method a remote peer drives: extract. A
-// peer forwards its mesh self as the origin param, which keys the grant ("host:" +
-// origin); with no origin it falls back to the local requestorID ladder.
+// peerRequestor is requestorID for the two methods a remote peer drives: extract and
+// the single-browser get_cookies. A peer forwards its mesh self as the origin param,
+// which keys the grant ("host:" + origin); with no origin it falls back to the local
+// requestorID ladder.
 func peerRequestor(ctx context.Context, params map[string]any) string {
 	if origin := optionalString(params, "origin", ""); origin != "" {
 		return "host:" + origin

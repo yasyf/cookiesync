@@ -17,6 +17,7 @@ func newRPCCmd() *cobra.Command {
 	}
 	cmd.AddCommand(
 		newRPCExtractCmd(),
+		newRPCGetCookiesCmd(),
 		newRPCApplyCmd(),
 		newRPCSyncCmd(),
 		newRPCReconcileCmd(),
@@ -73,6 +74,31 @@ func newRPCExtractCmd() *cobra.Command {
 	}
 	cmd.Flags().StringVar(&browser, "browser", "", "The browser to extract cookies from.")
 	cmd.Flags().StringVar(&profile, "profile", "Default", "The profile to extract cookies from.")
+	cmd.Flags().StringVar(&origin, "origin", "", "Anti-echo provenance tag from the notifying peer.")
+	_ = cmd.MarkFlagRequired("browser")
+	return cmd
+}
+
+func newRPCGetCookiesCmd() *cobra.Command {
+	var browser, profile, origin string
+	cmd := &cobra.Command{
+		Use:   "get_cookies <url>...",
+		Short: "Return this host's decrypted cookies for one or more urls as wire records (used by peers over ssh).",
+		Args:  cobra.MinimumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			// A passthrough to the resident daemon's single-browser path. --browser is
+			// required (MarkFlagRequired): the recursion guard so a peer daemon always
+			// takes the single path and never re-fans-out the union over ssh. origin keys
+			// the host grant like extract, so a union caller's first pull prompts the peer
+			// once and the grant window keeps the rest silent.
+			return rpcPassthrough(cmd, "get_cookies", map[string]any{
+				"browser": browser, "profile": profile, "origin": origin,
+				"url": args[0], "urls": asAnySlice(args),
+			})
+		},
+	}
+	cmd.Flags().StringVar(&browser, "browser", "", "The browser to read cookies from.")
+	cmd.Flags().StringVar(&profile, "profile", "Default", "The profile to read cookies from.")
 	cmd.Flags().StringVar(&origin, "origin", "", "Anti-echo provenance tag from the notifying peer.")
 	_ = cmd.MarkFlagRequired("browser")
 	return cmd

@@ -6,13 +6,20 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/yasyf/cookiesync/internal/cookie"
 	"github.com/yasyf/cookiesync/internal/engine"
 	"github.com/yasyf/cookiesync/internal/state"
+	"github.com/yasyf/synckit/hostregistry"
 	synckit "github.com/yasyf/synckit/rpc"
 )
+
+// unionSSHConcurrency bounds the concurrent ssh dials getCookiesAll's remote leg makes,
+// so a wide mesh does not open one ssh process per remote endpoint at once.
+const unionSSHConcurrency = 4
 
 // releaseMode selects the presence gates a prime may use. A local prime walks the
 // full ladder — hard consent route, local Touch ID, routed fallback. An approver
@@ -317,15 +324,35 @@ func (d *Daemon) handleAuthStatus(ctx context.Context, params map[string]any) (a
 	return map[string]any{"endpoint": id, "authenticated": ok, "degraded": d.cache.Degraded()}, nil
 }
 
-// handleGetCookies renders one or more urls' cookies, merged into one set, behind the
-// per-requestor consent gate: a warm cached key is served silently only inside the
-// requestor's live grant; otherwise the release runs — one Touch ID evaluation with a
-// live session, else the routed gate, failing closed with AuthRequired on a cold
-// unattended mesh. New CLIs send "urls" (one or more hosts); older ones send a single
-// "url" — both are accepted, and every host is decrypted with the same released key
-// (one prime covers them all) and unioned by logical identity. Emits the frozen
-// {"cookies": [...]}.
+// handleGetCookies renders cookies for one or more urls, merged into one set. With a
+// "browser" param it reads that one endpoint via getCookiesSingle — the frozen
+// {"cookies": [...]} path a peer's ssh leg drives. With no "browser" it unions every
+// registered endpoint — local browsers and remote hosts over ssh — via getCookiesAll,
+// emitting {"cookies": [...], "warnings": [...]}. The recursion guard lives in the CLI:
+// the remote leg always sends --browser, so a peer daemon takes the single path and
+// never re-fans-out the union over ssh.
 func (d *Daemon) handleGetCookies(ctx context.Context, params map[string]any) (any, error) {
+	if optionalString(params, "browser", "") == "" {
+		urls, err := urlsParam(params)
+		if err != nil {
+			return nil, err
+		}
+		return d.getCookiesAll(ctx, requestorID(ctx, params), urls)
+	}
+	return d.getCookiesSingle(ctx, params)
+}
+
+// getCookiesSingle renders one browser's cookies for every url, merged into one set,
+// behind the per-requestor consent gate: a warm cached key is served silently only
+// inside the requestor's live grant; otherwise the release runs — one Touch ID
+// evaluation with a live session, else the routed gate, failing closed with AuthRequired
+// on a cold unattended mesh. The requestor resolves via peerRequestor, so the remote
+// union leg's grant keys "host:"+origin exactly like extract; a local caller sends no
+// origin and its behavior is unchanged. New CLIs send "urls" (one or more hosts); older
+// ones send a single "url" — both are accepted, and every host is decrypted with the
+// same released key (one prime covers them all) and unioned by logical identity. Emits
+// the frozen {"cookies": [...]}.
+func (d *Daemon) getCookiesSingle(ctx context.Context, params map[string]any) (any, error) {
 	browser, err := stringParam(params, "browser")
 	if err != nil {
 		return nil, err
@@ -335,7 +362,7 @@ func (d *Daemon) handleGetCookies(ctx context.Context, params map[string]any) (a
 	if err != nil {
 		return nil, err
 	}
-	key, err := d.primeAuth(ctx, requestorID(ctx, params), browser, profile, consentReason, releaseLocal)
+	key, err := d.primeAuth(ctx, peerRequestor(ctx, params), browser, profile, consentReason, releaseLocal)
 	if err != nil {
 		return nil, err
 	}
@@ -354,6 +381,170 @@ func (d *Daemon) handleGetCookies(ctx context.Context, params map[string]any) (a
 		sets = append(sets, extracted.Cookies)
 	}
 	return cookiesPayload(cookie.Merge(sets...)), nil
+}
+
+// getCookiesAll unions the cookies for every url across every registered endpoint —
+// local browsers and remote hosts — best-effort: an endpoint that fails is skipped with
+// a per-endpoint warning, and only a total shutout is an error. Zero endpoints at all is
+// the AuthRequired backstop (the CLI auto-registers locals first). The local leg runs
+// sequentially behind at most one Touch ID sheet (decision 8): a warm+granted endpoint
+// serves from cache; else, only when a live local session would prompt here rather than
+// route (cookies never initiates routed consent — that is auth's job) and no sheet has
+// fired this call, one primeAuth releases and grants the whole local batch, so later
+// local browsers ride that one tap; anything still cold is a "skip cold" warning. The
+// remote leg fans out in parallel over a bounded ssh semaphore — never errgroup, whose
+// first-error cancel would abort the best-effort union. Deliberate asymmetry: the all
+// path keys grants by the local requestor ladder — it is never peer-driven, since the
+// recursion guard forbids a peer re-fanning out — where only the single path is
+// peer-driven and origin-keyed. MergeRanked breaks last_update_utc ties for the local
+// machine. Emits {"cookies": [...], "warnings": [...]}.
+func (d *Daemon) getCookiesAll(ctx context.Context, requestor string, urls []string) (any, error) {
+	self, err := meshSelf(ctx)
+	if err != nil {
+		return nil, err
+	}
+	st, err := d.state.Load(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var locals, remotes []state.Endpoint
+	for _, ep := range st.Endpoints() {
+		if ep.Host == self {
+			locals = append(locals, ep)
+			continue
+		}
+		remotes = append(remotes, ep)
+	}
+	if len(locals)+len(remotes) == 0 {
+		return nil, &AuthRequired{Msg: "no browsers are tracked; run cookiesync browser add"}
+	}
+
+	routed, err := d.routesConsent(ctx, st)
+	if err != nil {
+		return nil, err
+	}
+
+	var sets []cookie.RankedSet
+	var warnings []string
+
+	// LOCAL leg: sequential, at most one Touch ID sheet for the whole call.
+	prompted := false
+	for _, ep := range locals {
+		id := string(ep.ID())
+		name := cookie.BrowserName(ep.Browser)
+		cached, warm, err := d.cache.Get(ctx, id)
+		if err != nil {
+			return nil, err
+		}
+		var key cookie.AesKey
+		switch {
+		case warm && d.granted(requestor, name):
+			key = cookie.AesKey(cached)
+		case !routed && !prompted:
+			released, err := d.primeAuth(ctx, requestor, ep.Browser, ep.Profile, consentReason, releaseLocal)
+			prompted = true
+			if err != nil {
+				warnings = append(warnings, fmt.Sprintf("skip %s: %v", id, err))
+				continue
+			}
+			key = released
+		default:
+			warnings = append(warnings, fmt.Sprintf("skip cold %s: run cookiesync auth", id))
+			continue
+		}
+		b, err := cookie.Lookup(name)
+		if err != nil {
+			warnings = append(warnings, fmt.Sprintf("skip %s: %v", id, err))
+			continue
+		}
+		urlSets := make([][]cookie.Cookie, 0, len(urls))
+		for _, url := range urls {
+			// fallback=false: only the released key, never the cross-browser sweep — same
+			// as the single path.
+			extracted, err := cookie.Extract(ctx, url, b, key, ep.Profile, false, false)
+			if err != nil {
+				urlSets = nil
+				warnings = append(warnings, fmt.Sprintf("skip %s: %v", id, err))
+				break
+			}
+			urlSets = append(urlSets, extracted.Cookies)
+		}
+		if urlSets == nil {
+			continue
+		}
+		sets = append(sets, cookie.RankedSet{Cookies: cookie.Merge(urlSets...), Local: true})
+	}
+
+	// REMOTE leg: parallel over a bounded semaphore, best-effort.
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, unionSSHConcurrency)
+	for _, ep := range remotes {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			cookies, err := d.remoteGetCookies(ctx, ep.Host, ep.Browser, ep.Profile, urls)
+			mu.Lock()
+			defer mu.Unlock()
+			if err != nil {
+				warnings = append(warnings, fmt.Sprintf("skip %s: %v", ep.ID(), err))
+				return
+			}
+			sets = append(sets, cookie.RankedSet{Cookies: cookies, Local: false})
+		}()
+	}
+	wg.Wait()
+
+	if len(sets) == 0 {
+		return nil, errors.New("no endpoint contributed cookies; run cookiesync auth")
+	}
+	reply := cookiesPayload(cookie.MergeRanked(sets...))
+	if len(warnings) > 0 {
+		reply["warnings"] = warnings
+	}
+	return reply, nil
+}
+
+// remoteGetCookies drives a peer's single-browser get_cookies over ssh and parses the
+// wire cookies it streams back, mirroring routedRelease's runner precedent. --browser is
+// always sent so the peer daemon takes the single path (the recursion guard), and origin
+// is this host's mesh self so the peer's grant keys "host:"+self like extract — the
+// first union pull prompts the peer once, then its grant window keeps the rest silent.
+// The call gets the extract-style window (DispatchTimeout - 30s): a peer may hold a Touch
+// ID sheet open, so a short I/O timeout would kill a legitimate prompt.
+func (d *Daemon) remoteGetCookies(ctx context.Context, host, browser, profile string, urls []string) ([]cookie.Cookie, error) {
+	self, err := meshSelf(ctx)
+	if err != nil {
+		return nil, err
+	}
+	quoted := make([]string, len(urls))
+	for i, url := range urls {
+		quoted[i] = hostregistry.ShellQuote(url)
+	}
+	cmd := fmt.Sprintf(
+		"cookiesync rpc get_cookies --browser %s --profile %s --origin %s %s",
+		hostregistry.ShellQuote(browser), hostregistry.ShellQuote(profile),
+		hostregistry.ShellQuote(self), strings.Join(quoted, " "),
+	)
+	rctx, cancel := context.WithTimeout(ctx, synckit.DispatchTimeout-30*time.Second)
+	defer cancel()
+	out, err := d.runner.Run(rctx, host, cmd, nil)
+	if err != nil {
+		return nil, err
+	}
+	var payload struct {
+		Cookies []cookie.WireCookie `json:"cookies"`
+	}
+	if err := json.Unmarshal([]byte(out), &payload); err != nil {
+		return nil, fmt.Errorf("parse rpc get_cookies from %s: %w", host, err)
+	}
+	cookies := make([]cookie.Cookie, len(payload.Cookies))
+	for i, w := range payload.Cookies {
+		cookies[i] = cookie.FromWire(w)
+	}
+	return cookies, nil
 }
 
 // primeAuth obtains the Safe Storage key for requestor via the presence gate

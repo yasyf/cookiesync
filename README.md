@@ -20,7 +20,7 @@ Driving with an agent? Paste this:
 ```text
 Install cookiesync: `brew install yasyf/tap/cookiesync`, then run `cookiesync install` and verify with `cookiesync doctor`.
 Track my Chrome profile against my other Mac: `cookiesync browser add <host> chrome`.
-Prove the sync works by streaming a logged-in session with one Touch ID tap: `cookiesync cookies https://github.com --browser chrome --format header`.
+Prove the sync works by streaming a logged-in session with one Touch ID tap: `cookiesync cookies https://github.com --format header`.
 ```
 
 ---
@@ -43,10 +43,10 @@ The next reconcile pass pulls your desk's Chrome store over SSH, merges the two 
 An agent that needs your GitHub session shouldn't hold your GitHub password. Stream the cookies it needs, on demand:
 
 ```bash
-cookiesync cookies https://github.com --browser chrome --format header
+cookiesync cookies https://github.com --format header
 ```
 
-One Touch ID tap approves the requestor, and the command prints a ready-to-paste `Cookie` header — the one output this README deliberately doesn't screenshot. Pass several URLs (an app plus the API host it calls) to get a single Playwright `storageState` spanning them all, off one cached-key decrypt.
+One Touch ID tap approves the requestor, and the command prints a ready-to-paste `Cookie` header — the one output this README deliberately doesn't screenshot. It unions every registered browser and host by default; add `--browser chrome` to pin one. Pass several URLs (an app plus the API host it calls) to get a single Playwright `storageState` spanning them all, off one cached-key decrypt.
 
 ### Keep 2FA and SSO logins alive on every machine
 
@@ -79,8 +79,8 @@ Every listed endpoint converges continuously. The daemon watches each cookie sto
 | `doctor` | Check the key helper, resident helper, synckit mesh and manifest, and state. |
 | `browser add/ls/rm` | Track, list, and untrack the browser profiles synced across hosts. |
 | `browser profiles <browser>` | List this host's profiles for a browser that hold a cookie store. |
-| `auth` | Release the Safe Storage key behind one Touch ID tap and cache it for a short window. |
-| `cookies <url>...` | Stream cookies for one or more URLs as `playwright`, `netscape`, `header`, or `json`. |
+| `auth` | Release the Safe Storage key behind one Touch ID tap and cache it for a short window; omit `--browser` to prime every registered browser at once. |
+| `cookies <url>...` | Stream cookies for one or more URLs as `playwright`, `netscape`, `header`, or `json`; omit `--browser` to union every registered browser and host. |
 | `route-consent <target>` | Route the consent gate to a host that already has a live, unlocked session. |
 | `self` | Print this host's SSH target, as the synckit host mesh reports it. |
 | `rpc <method>` | Low-level RPC client for the resident daemon (extract, apply, sync, reconcile). |
