@@ -38,6 +38,19 @@ type mergeRank struct {
 	contentHash   string
 }
 
+type localRank struct {
+	lastUpdateUTC ChromeMicros
+	local         bool
+	contentHash   string
+}
+
+// RankedSet is one endpoint's cookies tagged local/remote so MergeRanked can break
+// last_update_utc ties in favor of the local machine.
+type RankedSet struct {
+	Cookies []Cookie
+	Local   bool
+}
+
 func keyOf(c Cookie) mergeKey {
 	return mergeKey{
 		hostKey:              c.HostKey,
@@ -76,9 +89,23 @@ func rankOf(c Cookie) mergeRank {
 	return mergeRank{lastUpdateUTC: c.LastUpdateUTC, contentHash: ContentHash(c)}
 }
 
+func localRankOf(c Cookie, local bool) localRank {
+	return localRank{lastUpdateUTC: c.LastUpdateUTC, local: local, contentHash: ContentHash(c)}
+}
+
 func (r mergeRank) less(other mergeRank) bool {
 	if r.lastUpdateUTC != other.lastUpdateUTC {
 		return r.lastUpdateUTC < other.lastUpdateUTC
+	}
+	return r.contentHash < other.contentHash
+}
+
+func (r localRank) less(other localRank) bool {
+	if r.lastUpdateUTC != other.lastUpdateUTC {
+		return r.lastUpdateUTC < other.lastUpdateUTC
+	}
+	if r.local != other.local {
+		return !r.local && other.local
 	}
 	return r.contentHash < other.contentHash
 }
@@ -95,6 +122,28 @@ func Merge(sources ...[]Cookie) []Cookie {
 			key := keyOf(cookie)
 			if existing, ok := winners[key]; !ok || rankOf(existing).less(rankOf(cookie)) {
 				winners[key] = cookie
+			}
+		}
+	}
+	out := make([]Cookie, 0, len(winners))
+	for _, cookie := range winners {
+		out = append(out, cookie)
+	}
+	return out
+}
+
+// MergeRanked unions ranked sources newest-wins; on an equal last_update_utc a LOCAL
+// source beats a remote one, and a remaining tie falls to the content hash.
+func MergeRanked(sources ...RankedSet) []Cookie {
+	winners := map[mergeKey]Cookie{}
+	ranks := map[mergeKey]localRank{}
+	for _, source := range sources {
+		for _, cookie := range source.Cookies {
+			key := keyOf(cookie)
+			rank := localRankOf(cookie, source.Local)
+			if best, ok := ranks[key]; !ok || best.less(rank) {
+				winners[key] = cookie
+				ranks[key] = rank
 			}
 		}
 	}

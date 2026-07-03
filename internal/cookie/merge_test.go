@@ -216,6 +216,71 @@ func TestMergeOrderIndependentForLargeShuffle(t *testing.T) {
 	}
 }
 
+func TestMergeRanked(t *testing.T) {
+	const ts = ChromeMicros(13_350_000_000_000_000)
+	cases := []struct {
+		name      string
+		a, b      RankedSet
+		wantValue string
+	}{
+		{
+			"newest last_update wins over local preference",
+			RankedSet{Cookies: []Cookie{mergeCookie(value("localold"), lastUpdate(13_300_000_000_000_000))}, Local: true},
+			RankedSet{Cookies: []Cookie{mergeCookie(value("remotenew"), lastUpdate(13_399_000_000_000_000))}, Local: false},
+			"remotenew",
+		},
+		{
+			"equal last_update: local beats remote",
+			RankedSet{Cookies: []Cookie{mergeCookie(value("localval"), lastUpdate(ts))}, Local: true},
+			RankedSet{Cookies: []Cookie{mergeCookie(value("remoteval"), lastUpdate(ts))}, Local: false},
+			"localval",
+		},
+		{
+			"equal last_update, both local: greater content hash wins",
+			RankedSet{Cookies: []Cookie{mergeCookie(value("alpha"), lastUpdate(ts))}, Local: true},
+			RankedSet{Cookies: []Cookie{mergeCookie(value("omega"), lastUpdate(ts))}, Local: true},
+			"omega",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			forward := MergeRanked(tc.a, tc.b)
+			reverse := MergeRanked(tc.b, tc.a)
+			if len(forward) != 1 || len(reverse) != 1 {
+				t.Fatalf("forward=%d reverse=%d, want 1 each", len(forward), len(reverse))
+			}
+			if forward[0].Value != tc.wantValue || reverse[0].Value != tc.wantValue {
+				t.Fatalf("forward=%q reverse=%q, want %q in both orders", forward[0].Value, reverse[0].Value, tc.wantValue)
+			}
+		})
+	}
+
+	t.Run("all-remote parity with Merge", func(t *testing.T) {
+		cookies := []Cookie{
+			mergeCookie(host(".a.com"), name("s"), value("a1"), lastUpdate(13_310_000_000_000_000)),
+			mergeCookie(host(".a.com"), name("s"), value("a2"), lastUpdate(13_320_000_000_000_000)),
+			mergeCookie(host(".b.com"), name("t"), value("b1"), lastUpdate(13_330_000_000_000_000)),
+			mergeCookie(host(".c.com"), name("u"), value("c1")),
+		}
+		merged := canonical(Merge([]Cookie{cookies[0], cookies[2]}, []Cookie{cookies[1], cookies[3]}))
+		ranked := canonical(MergeRanked(
+			RankedSet{Cookies: []Cookie{cookies[0], cookies[2]}, Local: false},
+			RankedSet{Cookies: []Cookie{cookies[1], cookies[3]}, Local: false},
+		))
+		if len(merged) != 3 {
+			t.Fatalf("len merged = %d, want 3", len(merged))
+		}
+		if len(ranked) != len(merged) {
+			t.Fatalf("len ranked=%d merged=%d", len(ranked), len(merged))
+		}
+		for i := range merged {
+			if ranked[i] != merged[i] {
+				t.Fatalf("parity mismatch at %d: ranked=%+v merged=%+v", i, ranked[i], merged[i])
+			}
+		}
+	})
+}
+
 func canonical(cookies []Cookie) []Cookie {
 	sort.Slice(cookies, func(i, j int) bool {
 		if cookies[i].HostKey != cookies[j].HostKey {
