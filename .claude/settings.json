@@ -65,6 +65,16 @@
     "captain-hook@captain-hook": true
   },
   "hooks": {
+    "PermissionRequest": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "uvx capt-hook run PermissionRequest"
+          }
+        ]
+      }
+    ],
     "PostToolUse": [
       {
         "hooks": [
@@ -101,6 +111,17 @@
           {
             "type": "command",
             "command": "uvx capt-hook review run",
+            "async": true
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "uvx capt-hook run SessionStart --async",
             "async": true
           }
         ]
