@@ -22,15 +22,23 @@ import (
 const unionSSHConcurrency = 4
 
 // releaseMode selects the presence gates a prime may use. A local prime walks the
-// full ladder — hard consent route, local Touch ID, routed fallback. An approver
-// prime (an inbound request_consent) is the routed gate's terminus: it only ever
-// releases locally, so routedRelease is structurally unreachable and a 3+ mesh can
-// never loop an approval back out.
+// full ladder — hard consent route, local Touch ID, routed fallback — re-deriving the
+// routed/local split itself. An approver prime (an inbound request_consent) is the
+// routed gate's terminus: it only ever releases locally, so routedRelease is
+// structurally unreachable and a 3+ mesh can never loop an approval back out. The
+// no-route and route-only modes let a caller that already decided the split pin it, so
+// releaseKey honors the decision instead of re-deriving it and a mid-call presence flip
+// cannot make the release diverge from the caller's intent: no-route prompts locally
+// when a session is live and fails closed otherwise (a browser-less cookies read, and a
+// peer-driven get_cookies, which must never route onward); route-only always routes the
+// gate to a peer (a browser-less auth on a cold host, primed per browser).
 type releaseMode string
 
 const (
-	releaseLocal    releaseMode = "local"
-	releaseApprover releaseMode = "approver"
+	releaseLocal     releaseMode = "local"
+	releaseApprover  releaseMode = "approver"
+	releaseNoRoute   releaseMode = "no-route"
+	releaseRouteOnly releaseMode = "route-only"
 )
 
 // batchResult is one batchFlight flight's outcome: the per-browser outcome for every
@@ -235,9 +243,19 @@ func (d *Daemon) primeAuthAll(ctx context.Context, requestor, reason string) (ma
 		idsByBrowser[ep.Browser] = append(idsByBrowser[ep.Browser], string(ep.ID()))
 	}
 
+	// The routed/local strategy is decided once and pinned into the release mode, so a
+	// mid-call presence flip cannot make one browser prompt locally while another routes:
+	// a cold host routes every browser to a live peer (releaseRouteOnly), while a live
+	// host releases the whole batch behind one sheet (releaseNoRoute) and every later
+	// browser rides that grant. A flip only ever degrades a browser to a fail-closed
+	// skip, never a second sheet or a surprise route.
 	routed, err := d.routesConsent(ctx, st)
 	if err != nil {
 		return nil, err
+	}
+	mode := releaseNoRoute
+	if routed {
+		mode = releaseRouteOnly
 	}
 
 	var warnings []string
@@ -256,7 +274,7 @@ func (d *Daemon) primeAuthAll(ctx context.Context, requestor, reason string) (ma
 			warnings = append(warnings, fmt.Sprintf("skip %s: not released by the one-tap batch (missing or denied)", bp.browser))
 			continue
 		}
-		key, err := d.primeAuth(ctx, requestor, bp.browser, bp.profile, reason, releaseLocal)
+		key, err := d.primeAuth(ctx, requestor, bp.browser, bp.profile, reason, mode)
 		if !routed {
 			prompted = true
 		}
@@ -344,14 +362,16 @@ func (d *Daemon) handleGetCookies(ctx context.Context, params map[string]any) (a
 
 // getCookiesSingle renders one browser's cookies for every url, merged into one set,
 // behind the per-requestor consent gate: a warm cached key is served silently only
-// inside the requestor's live grant; otherwise the release runs — one Touch ID
-// evaluation with a live session, else the routed gate, failing closed with AuthRequired
-// on a cold unattended mesh. The requestor resolves via peerRequestor, so the remote
-// union leg's grant keys "host:"+origin exactly like extract; a local caller sends no
-// origin and its behavior is unchanged. New CLIs send "urls" (one or more hosts); older
-// ones send a single "url" — both are accepted, and every host is decrypted with the
-// same released key (one prime covers them all) and unioned by logical identity. Emits
-// the frozen {"cookies": [...]}.
+// inside the requestor's live grant; otherwise the release runs. A local caller sends no
+// origin and keeps today's frozen behavior — one Touch ID evaluation with a live session,
+// else the routed gate, failing closed with AuthRequired on a cold unattended mesh. A
+// peer-driven read (origin set, so peerRequestor keys the grant "host:"+origin exactly
+// like extract) prompts one local sheet naming the origin when a session is live and
+// fails closed otherwise — it never routes the gate onward, so a union pull against a
+// cold peer is a caller-side skip rather than a surprise sheet on the very Mac that
+// asked. New CLIs send "urls" (one or more hosts); older ones send a single "url" — both
+// are accepted, and every host is decrypted with the same released key (one prime covers
+// them all) and unioned by logical identity. Emits the frozen {"cookies": [...]}.
 func (d *Daemon) getCookiesSingle(ctx context.Context, params map[string]any) (any, error) {
 	browser, err := stringParam(params, "browser")
 	if err != nil {
@@ -362,7 +382,13 @@ func (d *Daemon) getCookiesSingle(ctx context.Context, params map[string]any) (a
 	if err != nil {
 		return nil, err
 	}
-	key, err := d.primeAuth(ctx, peerRequestor(ctx, params), browser, profile, consentReason, releaseLocal)
+	mode := releaseLocal
+	reason := consentReason
+	if origin := optionalString(params, "origin", ""); origin != "" {
+		mode = releaseNoRoute
+		reason = fmt.Sprintf("send them to %s", origin)
+	}
+	key, err := d.primeAuth(ctx, peerRequestor(ctx, params), browser, profile, reason, mode)
 	if err != nil {
 		return nil, err
 	}
@@ -419,15 +445,15 @@ func (d *Daemon) getCookiesAll(ctx context.Context, requestor string, urls []str
 		return nil, &AuthRequired{Msg: "no browsers are tracked; run cookiesync browser add"}
 	}
 
-	routed, err := d.routesConsent(ctx, st)
-	if err != nil {
-		return nil, err
-	}
-
 	var sets []cookie.RankedSet
 	var warnings []string
 
-	// LOCAL leg: sequential, at most one Touch ID sheet for the whole call.
+	// LOCAL leg: sequential, at most one Touch ID sheet for the whole call. The prime
+	// runs in releaseNoRoute mode — a live session prompts once and grants the whole
+	// batch (later browsers ride the grant), a cold session fails closed, and consent is
+	// never routed to a peer: routing is auth's job, and the routed/local split is
+	// decided inside the one flight rather than a per-call snapshot that a mid-call
+	// presence flip could stale out.
 	prompted := false
 	for _, ep := range locals {
 		id := string(ep.ID())
@@ -440,11 +466,11 @@ func (d *Daemon) getCookiesAll(ctx context.Context, requestor string, urls []str
 		switch {
 		case warm && d.granted(requestor, name):
 			key = cookie.AesKey(cached)
-		case !routed && !prompted:
-			released, err := d.primeAuth(ctx, requestor, ep.Browser, ep.Profile, consentReason, releaseLocal)
+		case !prompted:
+			released, err := d.primeAuth(ctx, requestor, ep.Browser, ep.Profile, consentReason, releaseNoRoute)
 			prompted = true
 			if err != nil {
-				warnings = append(warnings, fmt.Sprintf("skip %s: %v", id, err))
+				warnings = append(warnings, fmt.Sprintf("skip cold %s: run cookiesync auth (%v)", id, err))
 				continue
 			}
 			key = released
@@ -523,8 +549,13 @@ func (d *Daemon) remoteGetCookies(ctx context.Context, host, browser, profile st
 	for i, url := range urls {
 		quoted[i] = hostregistry.ShellQuote(url)
 	}
+	// The "--" end-of-flags marker fences the urls off from the peer's flag parser: a url
+	// is untrusted CLI input, and one shaped like a flag (e.g. "--browser=") would
+	// otherwise be parsed as one on the peer — defeating the recursion guard or
+	// overriding the origin the peer keys its grant on. After "--" every url is a
+	// positional, whatever its spelling.
 	cmd := fmt.Sprintf(
-		"cookiesync rpc get_cookies --browser %s --profile %s --origin %s %s",
+		"cookiesync rpc get_cookies --browser %s --profile %s --origin %s -- %s",
 		hostregistry.ShellQuote(browser), hostregistry.ShellQuote(profile),
 		hostregistry.ShellQuote(self), strings.Join(quoted, " "),
 	)
@@ -643,20 +674,35 @@ func (d *Daemon) releaseAndCacheKey(ctx context.Context, requestor, self, id, br
 // releaseLocal mode a hard consent route (ConsentRouteHard) to a live ConsentRouteTo
 // peer wins outright — this host routes the gate even when it looks locally attended —
 // and a cold local session routes the gate to the active peer; a routed approval
-// releases just the requested browser's key. Otherwise — and always in releaseApprover
-// mode, where this host is the routed gate's terminus and must never route onward —
-// the whole local batch releases behind one Touch ID evaluation in releaseAllLocal.
-// The prompt gate is never held across routedRelease: an inbound request_consent must
-// stay promptable while this host's own outbound route is in flight, or the same-host
-// routed-consent cycle deadlocks.
+// releases just the requested browser's key. releaseRouteOnly always routes, and
+// releaseNoRoute never does — it releases the local batch when a session is live and
+// fails closed with AuthRequired otherwise, so a browser-less cookies read and a
+// peer-driven get_cookies prompt at most one local sheet and never route the gate to a
+// third Mac (or back to the very caller asking). Otherwise — and always in
+// releaseApprover mode, where this host is the routed gate's terminus and must never
+// route onward — the whole local batch releases behind one Touch ID evaluation in
+// releaseAllLocal. The prompt gate is never held across routedRelease: an inbound
+// request_consent must stay promptable while this host's own outbound route is in
+// flight, or the same-host routed-consent cycle deadlocks.
 func (d *Daemon) releaseKey(ctx context.Context, st *state.State, requestor, self, id, browser, profile, reason string, mode releaseMode) (*batchResult, error) {
-	if mode == releaseLocal {
+	switch mode {
+	case releaseLocal:
 		routed, err := d.routesConsent(ctx, st)
 		if err != nil {
 			return nil, err
 		}
 		if routed {
 			return d.routedBatch(ctx, st, requestor, id, browser, profile)
+		}
+	case releaseRouteOnly:
+		return d.routedBatch(ctx, st, requestor, id, browser, profile)
+	case releaseNoRoute:
+		live, err := HasActiveSession(ctx, d.probe)
+		if err != nil {
+			return nil, err
+		}
+		if !live {
+			return nil, &AuthRequired{Msg: fmt.Sprintf("no live session on %s to release %s cookies", self, browser)}
 		}
 	}
 	return d.releaseAllLocal(ctx, st, requestor, self, id, browser, reason)

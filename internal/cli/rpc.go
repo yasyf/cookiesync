@@ -87,10 +87,15 @@ func newRPCGetCookiesCmd() *cobra.Command {
 		Args:  cobra.MinimumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			// A passthrough to the resident daemon's single-browser path. --browser is
-			// required (MarkFlagRequired): the recursion guard so a peer daemon always
-			// takes the single path and never re-fans-out the union over ssh. origin keys
-			// the host grant like extract, so a union caller's first pull prompts the peer
-			// once and the grant window keeps the rest silent.
+			// required and must be non-empty: the recursion guard so a peer daemon always
+			// takes the single path and never re-fans-out the union over ssh
+			// (MarkFlagRequired only proves the flag was set, so a bare "" would slip past
+			// it into the union branch). origin keys the host grant like extract, so a
+			// union caller's first pull prompts the peer once and the grant window keeps
+			// the rest silent.
+			if browser == "" {
+				return fmt.Errorf("--browser must not be empty")
+			}
 			return rpcPassthrough(cmd, "get_cookies", map[string]any{
 				"browser": browser, "profile": profile, "origin": origin,
 				"url": args[0], "urls": asAnySlice(args),

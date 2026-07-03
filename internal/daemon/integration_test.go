@@ -416,6 +416,108 @@ func TestGetCookiesSinglePeerDrivenGrantKeysOrigin(t *testing.T) {
 	}
 }
 
+// TestGetCookiesSinglePeerDrivenColdFailsClosed proves a peer-driven read (origin set)
+// on a cold host fails closed with AuthRequired instead of routing the consent gate back
+// out: a union pull against a locked peer must be a caller-side skip, never a surprise
+// Touch ID sheet on the Mac that asked. The runner must see no request_consent.
+func TestGetCookiesSinglePeerDrivenColdFailsClosed(t *testing.T) {
+	ctx := context.Background()
+	chromeStoreUnderHome(t)
+	self := "me@desktop"
+	fakeMesh(t, self, "you@laptop")
+	st := stateWith(self, "", stateEndpoint(self, "chrome", "Default"))
+	runner := &recordingRunner{}
+	consent := &fakeConsent{key: cookie.DeriveKey(cookie.SafeStorageKey("peanuts"))}
+	d := New(consent, newFakeCache(), nil, staticProbe(SessionSnapshot{}), runner, fixedState{st: st}, fixedState{st: st})
+
+	_, err := d.handleGetCookies(ctx, map[string]any{"browser": "chrome", "url": "https://x.com/", "origin": "you@laptop"})
+	var authErr *AuthRequired
+	if !errors.As(err, &authErr) {
+		t.Fatalf("peer-driven cold read = %v, want *AuthRequired", err)
+	}
+	if len(runner.calls) != 0 {
+		t.Fatalf("a peer-driven read must never route onward, got runner calls %+v", runner.calls)
+	}
+	if len(consent.promptedReasons) != 0 {
+		t.Fatalf("a cold peer must not prompt, got %v", consent.promptedReasons)
+	}
+}
+
+// TestGetCookiesSinglePeerDrivenLivePromptsAndGrantsOrigin proves that when the peer is
+// live it releases the batch behind ONE local sheet naming the origin, grants that origin
+// the browser, and never routes (no request_consent over ssh). A repeat pull then rides
+// the grant silently.
+func TestGetCookiesSinglePeerDrivenLivePromptsAndGrantsOrigin(t *testing.T) {
+	ctx := context.Background()
+	browser := chromeStoreUnderHome(t)
+	key := cookie.DeriveKey(cookie.SafeStorageKey("peanuts"))
+	seed := []cookie.Cookie{{HostKey: "x.com", Name: "sid", Value: "abc", Path: "/", LastUpdateUTC: 13_350_000_000_000_000, SameSite: 2, IsSecure: true, SourceScheme: 2, SourcePort: 443}}
+	if _, err := cookie.Apply(ctx, seed, browser, "Default", key); err != nil {
+		t.Fatalf("seed apply: %v", err)
+	}
+
+	self := "me@desktop"
+	fakeMesh(t, self)
+	st := stateWith(self, "", stateEndpoint(self, "chrome", "Default"))
+	runner := &recordingRunner{}
+	consent := &fakeConsent{key: key}
+	d := New(consent, newFakeCache(), nil, staticProbe(liveSession(currentUser(t))), runner, fixedState{st: st}, fixedState{st: st})
+
+	got, err := d.handleGetCookies(ctx, map[string]any{"browser": "chrome", "url": "https://x.com/", "origin": "you@laptop"})
+	if err != nil {
+		t.Fatalf("peer-driven live read: %v", err)
+	}
+	if cookies := wireCookieNames(t, got); cookies["sid"].Value != "abc" {
+		t.Fatalf("peer-driven live read = %+v, want sid=abc", cookies)
+	}
+	if len(runner.calls) != 0 {
+		t.Fatalf("a live peer prompts locally and must not route, got runner calls %+v", runner.calls)
+	}
+	if len(consent.promptedReasons) != 1 || !strings.Contains(consent.promptedReasons[0], "you@laptop") {
+		t.Fatalf("prompts = %v, want exactly one naming the origin you@laptop", consent.promptedReasons)
+	}
+	if !d.granted("host:you@laptop", "chrome") {
+		t.Fatal("the local sheet must grant the origin its browser for the TTL")
+	}
+}
+
+// TestRemoteGetCookiesFencesFlagShapedURL proves the union's remote leg fences untrusted
+// urls behind an end-of-flags "--": a url spelled like a flag reaches the peer as a
+// positional after "--", so it can neither flip the peer off its single path (the
+// recursion guard) nor override the origin the peer keys its grant on.
+func TestRemoteGetCookiesFencesFlagShapedURL(t *testing.T) {
+	ctx := context.Background()
+	chromeStoreUnderHome(t)
+	self := "me@laptop"
+	fakeMesh(t, self, "you@desktop")
+	st := stateWith(self, "", stateEndpoint("you@desktop", "chrome", "Default"))
+	runner := &recordingRunner{byMethod: map[string]string{
+		"rpc get_cookies": peerExtractReply(t, cookie.Cookie{HostKey: "x.com", Name: "rem", Value: "there", Path: "/", LastUpdateUTC: 13_350_000_000_000_000, SameSite: 2, IsSecure: true, SourceScheme: 2, SourcePort: 443}),
+	}}
+	d := New(&fakeConsent{}, newFakeCache(), nil, staticProbe(SessionSnapshot{}), runner, fixedState{st: st}, fixedState{st: st})
+
+	if _, err := d.handleGetCookies(ctx, map[string]any{"urls": []any{"https://x.com/", "--browser="}}); err != nil {
+		t.Fatalf("union with a flag-shaped url: %v", err)
+	}
+	remoteCmd := ""
+	for _, call := range runner.calls {
+		if strings.Contains(call.cmd, "rpc get_cookies") {
+			remoteCmd = call.cmd
+		}
+	}
+	dash := strings.Index(remoteCmd, " -- ")
+	if dash < 0 {
+		t.Fatalf("remote cmd = %q, want an end-of-flags -- before the urls", remoteCmd)
+	}
+	flags, positionals := remoteCmd[:dash], remoteCmd[dash:]
+	if !strings.Contains(flags, "--browser ") || strings.Contains(flags, "--browser=") {
+		t.Fatalf("the flag-shaped url leaked into the peer's flags: %q", remoteCmd)
+	}
+	if !strings.Contains(positionals, "--browser=") {
+		t.Fatalf("the flag-shaped url must ride after -- as a positional: %q", remoteCmd)
+	}
+}
+
 // decodeWarnings renders a handler result through the wire transport and returns its
 // "warnings" list, asserting the envelope decodes.
 func decodeWarnings(t *testing.T, result any) []string {
