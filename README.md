@@ -1,79 +1,90 @@
-# cookiesync
+# ![cookiesync](docs/assets/readme-banner.webp)
 
-![cookiesync banner](https://github.com/yasyf/cookiesync/raw/main/docs/assets/readme-banner.webp)
+**Your other Mac already did the 2FA.** cookiesync converges browser cookie stores across your Macs over SSH, so the login and 2FA you did at your desk are already live on your laptop.
 
-[![PyPI](https://img.shields.io/pypi/v/cookiesync-cli.svg)](https://pypi.org/project/cookiesync-cli/)
-[![Python](https://img.shields.io/pypi/pyversions/cookiesync-cli.svg)](https://pypi.org/project/cookiesync-cli/)
-[![License: PolyForm Noncommercial 1.0.0](https://img.shields.io/badge/License-PolyForm--Noncommercial--1.0.0-blue.svg)](https://github.com/yasyf/cookiesync/blob/main/LICENSE)
+[![CI](https://github.com/yasyf/cookiesync/actions/workflows/ci.yml/badge.svg)](https://github.com/yasyf/cookiesync/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/yasyf/cookiesync)](https://github.com/yasyf/cookiesync/releases)
+[![License: PolyForm Noncommercial 1.0.0](https://img.shields.io/badge/license-PolyForm--Noncommercial--1.0.0-blue)](LICENSE)
 
-Sync your browser cookies across machines — land on a new laptop already logged in.
-
-cookiesync copies the cookies your browser already holds on one machine and replays
-them on another, reusing your live session instead of asking for passwords again — so
-logins, 2FA, and SSO state carry over without re-authenticating. It's browser-agnostic,
-and you pick which machines and which sites it touches. Automation can borrow a
-logged-in session too: hand a CI job or an agent the cookies it needs, never a password.
-
-> **macOS only.** cookiesync keeps your browser's Safe Storage key behind a Touch ID
-> prompt and a Secure Enclave–bound daemon, so decrypted cookies never land on disk.
-> The key helper is a Developer-ID-signed, notarized `.app`.
-
-## Install
-
-Install the `cookiesync` command with [uv](https://docs.astral.sh/uv/):
+## Get started
 
 ```bash
-uv tool install cookiesync-cli
-cookiesync --help
+brew install yasyf/tap/cookiesync
+cookiesync install
 ```
 
-## Quickstart
+<img src="docs/assets/demo.png" alt="Terminal running 'cookiesync doctor' — seven OK lines: signed key helper, live helper socket, Secure-Enclave-wrapped key cache, healthy mesh and manifest, three tracked browsers" width="700">
+
+Driving with an agent? Paste this:
+
+```text
+Install cookiesync: `brew install yasyf/tap/cookiesync`, then run `cookiesync install` and verify with `cookiesync doctor`.
+Track my Chrome profile against my other Mac: `cookiesync browser add <host> chrome`.
+Prove the sync works by streaming a logged-in session with one Touch ID tap: `cookiesync cookies https://github.com --browser chrome --format header`.
+```
+
+---
+
+## Use cases
+
+### Set up a new Mac without re-authenticating anything
+
+A fresh Mac means a day of password resets, 2FA prompts, and SSO dances — for accounts you're already signed into three feet away. Track both Chrome profiles instead:
 
 ```bash
-# Fetch the signed key helper and install the LaunchAgents (one time)
-$ cookiesync install
-Installing the signed key helper via Homebrew (brew install yasyf/tap/cookiesync-keyhelper)…
-Installed and verified key helper: /Applications/cookiesync-keyhelper.app
-Installed cookiesync agents.
-
-# Track a browser to sync between this Mac and another host
-$ cookiesync browser add other-host chrome
-Tracking other-host/chrome/Default
-
-# Hand a logged-in session to a script — no password
-$ cookiesync cookies https://example.com --browser chrome
+cookiesync browser add "$(cookiesync self)" chrome
+cookiesync browser add your-desk chrome
 ```
 
-Once a browser is tracked, the resident daemon watches its cookie store and converges
-it across your hosts. Run `cookiesync reconcile` to force a full pass.
+The next reconcile pass pulls your desk's Chrome store over SSH, merges the two row sets, and writes the union back to both. Open Chrome: GitHub, Gmail, and the SSO portal are already signed in.
+
+### Hand an AI agent your logged-in session, never a password
+
+An agent that needs your GitHub session shouldn't hold your GitHub password. Stream the cookies it needs, on demand:
+
+```bash
+cookiesync cookies https://github.com --browser chrome --format header
+```
+
+One Touch ID tap approves the requestor, and the command prints a ready-to-paste `Cookie` header — the one output this README deliberately doesn't screenshot. Pass several URLs (an app plus the API host it calls) to get a single Playwright `storageState` spanning them all, off one cached-key decrypt.
+
+### Keep 2FA and SSO logins alive on every machine
+
+Your SSO session expires on whichever Mac you weren't using, so every morning starts with a re-auth somewhere. Check what's tracked:
+
+```bash
+cookiesync browser ls
+```
+
+```text
+yasyf@yasyf-home:chrome:Default
+yasyf@yasyf:arc:Default
+yasyf@yasyf:chrome:Profile 3
+```
+
+Every listed endpoint converges continuously. The daemon watches each cookie store, holds a three-second settle window, then replays the refreshed session tokens onto your other hosts. The morning Okta dance happens once, on whichever Mac you're at.
+
+## How it works
+
+`cookiesync install` notes the signed key helper and registers a manifest with [synckit](https://github.com/yasyf/synckit), the sync substrate cookiesync shares with [reposync](https://github.com/yasyf/reposync). The resident supervisor, `synckitd` (`brew install yasyf/tap/synckitd && synckitd install`), reads that manifest, watches each tracked browser's cookie store, and on a change converges that browser's group across your hosts over SSH: extract on the host that changed, merge the union, re-apply everywhere. Decryption needs the browser's Safe Storage key, which a Developer-ID-signed, notarized helper app releases only behind a Touch ID tap and caches Secure-Enclave-wrapped for a short window.
+
+> **macOS only.** Safe Storage, Touch ID, the Secure Enclave, and launchd don't exist off darwin. Decrypted cookies and keys never land on disk, and you pick exactly which machines and which browser profiles cookiesync touches.
 
 ## Commands
 
 | Command | What it does |
 | --- | --- |
-| `install` | Fetch the signed key helper, then install the LaunchAgents (watch daemon + reconcile tick). |
-| `uninstall` | Remove the cookiesync LaunchAgents. |
-| `doctor` | Check that the key helper is installed and Developer-ID signed. |
-| `browser add/ls/rm` | Track, list, and untrack the browser profiles cookiesync syncs across hosts. |
-| `watch` | Run the resident sync daemon: watch local stores and serve the RPC socket. |
-| `sync --browser <name>` | Converge one browser group across this host and its peers. |
-| `reconcile` | Run a full reconcile pass over every tracked browser group. |
+| `cookiesync` (bare) | Open the TUI: tracked browsers with per-profile presence, plus the host mesh. |
+| `install` / `uninstall` | Register (or remove) cookiesync's synckit manifest and note the signed key helper. |
+| `doctor` | Check the key helper, resident helper, synckit mesh and manifest, and state. |
+| `browser add/ls/rm` | Track, list, and untrack the browser profiles synced across hosts. |
+| `browser profiles <browser>` | List this host's profiles for a browser that hold a cookie store. |
 | `auth` | Release the Safe Storage key behind one Touch ID tap and cache it for a short window. |
-| `cookies <url>` | Stream a URL's cookies in the chosen format (Playwright by default). |
-| `self` | Print this host's SSH target, as reposync reports it. |
-| `rpc <method>` | Low-level RPC client for the resident daemon. |
+| `cookies <url>...` | Stream cookies for one or more URLs as `playwright`, `netscape`, `header`, or `json`. |
+| `route-consent <target>` | Route the consent gate to a host that already has a live, unlocked session. |
+| `self` | Print this host's SSH target, as the synckit host mesh reports it. |
+| `rpc <method>` | Low-level RPC client for the resident daemon (extract, apply, sync, reconcile). |
 
-Run `cookiesync --help`, or `cookiesync <command> --help`, for the full reference.
+Run `cookiesync <command> --help` for every flag.
 
-## How it works
-
-`cookiesync install` fetches the notarized key helper and starts a resident daemon. The
-daemon watches each tracked browser's cookie store, and on a change it converges that
-group across your hosts over SSH — extracting and re-applying cookies through the same
-RPC the peers speak. Decryption needs the browser's Safe Storage key, which the helper
-releases only behind a Touch ID tap (`cookiesync auth`) and caches in the
-Secure-Enclave-bound daemon for a short window, never on disk.
-
-## License
-
-PolyForm Noncommercial 1.0.0 — see [LICENSE](https://github.com/yasyf/cookiesync/blob/main/LICENSE).
+Licensed under [PolyForm Noncommercial 1.0.0](LICENSE).
