@@ -232,8 +232,10 @@ func TestHandleRequestConsentUnavailableWithoutSession(t *testing.T) {
 // {"status":"denied"} with no nonce or endpoint echo.
 func TestHandleRequestConsentDeniedOnDecline(t *testing.T) {
 	me := currentUser(t)
+	fakeMesh(t, "me@laptop")
+	st := stateWith("me@laptop", "")
 	consent := &fakeConsent{obtainErr: &cookie.ConsentError{Msg: "Touch ID authentication was cancelled or denied"}}
-	d := New(consent, newFakeCache(), nil, staticProbe(liveSession(me)), &recordingRunner{}, fixedState{}, fixedState{})
+	d := New(consent, newFakeCache(), nil, staticProbe(liveSession(me)), &recordingRunner{}, fixedState{st: st}, fixedState{st: st})
 
 	got, err := d.handleRequestConsent(context.Background(), map[string]any{
 		"browser": "chrome", "nonce": "n", "endpoint": "e",
@@ -246,12 +248,39 @@ func TestHandleRequestConsentDeniedOnDecline(t *testing.T) {
 	}
 }
 
+// TestHandleRequestConsentKeybagLockedIsUnavailable proves a keybag-locked release —
+// the screen locked between the session probe and the tap — yields
+// {"status":"unavailable"}, the retryable reply, never "denied".
+func TestHandleRequestConsentKeybagLockedIsUnavailable(t *testing.T) {
+	me := currentUser(t)
+	fakeMesh(t, "me@laptop")
+	st := stateWith("me@laptop", "")
+	consent := &fakeConsent{obtainErr: &cookie.ConsentError{
+		Msg: "the keychain keybag is locked (screen locked or no user present); retry after unlock",
+		Err: cookie.ErrKeybagLocked,
+	}}
+	d := New(consent, newFakeCache(), nil, staticProbe(liveSession(me)), &recordingRunner{}, fixedState{st: st}, fixedState{st: st})
+
+	got, err := d.handleRequestConsent(context.Background(), map[string]any{
+		"browser": "chrome", "nonce": "n", "endpoint": "e",
+	})
+	if err != nil {
+		t.Fatalf("handleRequestConsent: %v", err)
+	}
+	if marshalResult(t, got) != `{"status":"unavailable"}` {
+		t.Fatalf("keybag locked = %s, want unavailable", marshalResult(t, got))
+	}
+}
+
 // TestHandleRequestConsentApprovedEchoesExactly proves an approved prompt echoes the
-// requester's nonce and endpoint VERBATIM, binding the approval to that one request.
+// requester's nonce and endpoint VERBATIM, binding the approval to that one request —
+// the approver's own endpoint ids stay cache keys and never enter the reply.
 func TestHandleRequestConsentApprovedEchoesExactly(t *testing.T) {
 	me := currentUser(t)
+	fakeMesh(t, "me@laptop")
+	st := stateWith("me@laptop", "")
 	consent := &fakeConsent{key: cookie.DeriveKey(cookie.SafeStorageKey("peanuts"))}
-	d := New(consent, newFakeCache(), nil, staticProbe(liveSession(me)), &recordingRunner{}, fixedState{}, fixedState{})
+	d := New(consent, newFakeCache(), nil, staticProbe(liveSession(me)), &recordingRunner{}, fixedState{st: st}, fixedState{st: st})
 
 	nonce := "nonce-xyz-123"
 	endpoint := "them@host:chrome:Work"
@@ -268,6 +297,105 @@ func TestHandleRequestConsentApprovedEchoesExactly(t *testing.T) {
 	// The prompt names the exact requesting endpoint.
 	if len(consent.promptedReasons) != 1 || consent.promptedReasons[0] != "sync them to "+endpoint {
 		t.Fatalf("prompt reason = %v, want [sync them to %s]", consent.promptedReasons, endpoint)
+	}
+}
+
+// TestRoutedApprovalWarmsApproverCache proves an approval joins the prime path: the
+// approving tap caches this host's own key under the REQUESTED browser+profile — the
+// profile threaded from the requester's params, not the default — and grants the
+// requesting host a consent window, so a repeat routed request from that host is
+// approved silently. The grant is the requesting host's alone: a following LOCAL
+// prime over the same warm cache still prompts.
+func TestRoutedApprovalWarmsApproverCache(t *testing.T) {
+	ctx := context.Background()
+	me := currentUser(t)
+	self := "me@laptop"
+	fakeMesh(t, self)
+	st := stateWith(self, "")
+	consent := &fakeConsent{key: cookie.DeriveKey(cookie.SafeStorageKey("peanuts"))}
+	cache := newFakeCache()
+	d := New(consent, cache, nil, staticProbe(liveSession(me)), &recordingRunner{}, fixedState{st: st}, fixedState{st: st})
+
+	got, err := d.handleRequestConsent(ctx, map[string]any{
+		"browser": "chrome", "profile": "Work", "nonce": "n1", "endpoint": "them@host:chrome:Work",
+	})
+	if err != nil {
+		t.Fatalf("handleRequestConsent: %v", err)
+	}
+	if marshalResult(t, got) != `{"endpoint":"them@host:chrome:Work","nonce":"n1","status":"approved"}` {
+		t.Fatalf("approved = %s", marshalResult(t, got))
+	}
+	if len(consent.batchCalls) != 1 || consent.batchCalls[0].reason != "sync them to them@host:chrome:Work" {
+		t.Fatalf("batch calls = %+v, want one with the requesting endpoint's reason", consent.batchCalls)
+	}
+	// The threaded profile decides the cache key: Work is warm, Default stays cold.
+	if _, ok, _ := cache.Get(ctx, endpointID(self, "chrome", "Work")); !ok {
+		t.Fatalf("the approval must warm the approver's own chrome:Work endpoint")
+	}
+	if _, ok, _ := cache.Get(ctx, endpointID(self, "chrome", "Default")); ok {
+		t.Fatalf("the approval warmed chrome:Default — the requester's profile was dropped")
+	}
+
+	// A repeat routed request from the SAME host rides its grant: approved, no new
+	// consent evaluation.
+	again, err := d.handleRequestConsent(ctx, map[string]any{
+		"browser": "chrome", "profile": "Work", "nonce": "n2", "endpoint": "them@host:chrome:Work",
+	})
+	if err != nil {
+		t.Fatalf("repeat handleRequestConsent: %v", err)
+	}
+	if marshalResult(t, again) != `{"endpoint":"them@host:chrome:Work","nonce":"n2","status":"approved"}` {
+		t.Fatalf("repeat approval = %s", marshalResult(t, again))
+	}
+	if len(consent.batchCalls) != 1 {
+		t.Fatalf("consent evaluations = %d, want 1 (the requesting host's grant must approve silently)", len(consent.batchCalls))
+	}
+
+	// A following local prime is a DIFFERENT requestor: the warm cache alone must not
+	// serve it — it prompts its own evaluation.
+	res, err := d.handlePrimeAuth(ctx, map[string]any{"browser": "chrome", "profile": "Work"})
+	if err != nil {
+		t.Fatalf("handlePrimeAuth after approval: %v", err)
+	}
+	if marshalResult(t, res) != `{"endpoint":"me@laptop:chrome:Work","primed":true}` {
+		t.Fatalf("prime after approval = %s", marshalResult(t, res))
+	}
+	if len(consent.batchCalls) != 2 {
+		t.Fatalf("consent evaluations = %d, want 2 (the requesting host's grant must not cover a local prime)", len(consent.batchCalls))
+	}
+	if consent.unpromptedCalled != 0 {
+		t.Fatalf("an approver-side prime must never use the unprompted release, got %d", consent.unpromptedCalled)
+	}
+}
+
+// TestApproverPrimeNeverRoutesUnderHardRoute proves the approver-mode prime skips the
+// whole routing ladder: even with ConsentRouteHard set to a peer, an inbound
+// request_consent releases locally and never dials ssh — the transport double fails
+// the test on any dial, closing the 3+ mesh routing-loop hazard.
+func TestApproverPrimeNeverRoutesUnderHardRoute(t *testing.T) {
+	me := currentUser(t)
+	self := "me@laptop"
+	peer := "you@desktop"
+	fakeMesh(t, self, peer)
+	st := stateWith(self, peer, stateEndpoint(peer, "chrome", "Default"))
+	st.ConsentRouteHard = true
+	consent := &fakeConsent{key: cookie.DeriveKey(cookie.SafeStorageKey("peanuts"))}
+	d := New(consent, newFakeCache(), nil, staticProbe(liveSession(me)), &forbiddenRunner{t: t}, fixedState{st: st}, fixedState{st: st})
+
+	got, err := d.handleRequestConsent(context.Background(), map[string]any{
+		"browser": "chrome", "nonce": "n", "endpoint": "them@host:chrome:Default",
+	})
+	if err != nil {
+		t.Fatalf("handleRequestConsent: %v", err)
+	}
+	if marshalResult(t, got) != `{"endpoint":"them@host:chrome:Default","nonce":"n","status":"approved"}` {
+		t.Fatalf("approved = %s", marshalResult(t, got))
+	}
+	if len(consent.batchCalls) != 1 {
+		t.Fatalf("consent evaluations = %d, want 1 local batch", len(consent.batchCalls))
+	}
+	if consent.unpromptedCalled != 0 {
+		t.Fatalf("an approver-mode prime must never release via the routed unprompted path")
 	}
 }
 
@@ -338,6 +466,7 @@ func TestHandleRequestConsentIgnoresConsentRouteTo(t *testing.T) {
 	self := "me@laptop"
 	routeTo := "elsewhere@box"
 	me := currentUser(t)
+	fakeMesh(t, self, routeTo)
 	st := stateWith(self, routeTo, stateEndpoint(routeTo, "chrome", "Default"))
 
 	tests := []struct {

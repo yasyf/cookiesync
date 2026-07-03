@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -55,7 +56,14 @@ type fakeConsent struct {
 
 	mu               sync.Mutex
 	promptedReasons  []string
+	batchCalls       []consentBatchCall
 	unpromptedCalled int
+}
+
+// consentBatchCall is one recorded fakeConsent.ObtainKeys invocation.
+type consentBatchCall struct {
+	browsers []cookie.BrowserName
+	reason   string
 }
 
 func (c *fakeConsent) ObtainKey(_ context.Context, _ cookie.Browser, reason string) (cookie.AesKey, error) {
@@ -66,6 +74,23 @@ func (c *fakeConsent) ObtainKey(_ context.Context, _ cookie.Browser, reason stri
 		return nil, c.obtainErr
 	}
 	return c.key, nil
+}
+
+func (c *fakeConsent) ObtainKeys(_ context.Context, browsers []cookie.Browser, reason string) ([]cookie.KeyOutcome, error) {
+	names := make([]cookie.BrowserName, len(browsers))
+	outcomes := make([]cookie.KeyOutcome, len(browsers))
+	for i, b := range browsers {
+		names[i] = b.Name
+		outcomes[i] = cookie.KeyOutcome{Browser: b, Key: c.key}
+	}
+	c.mu.Lock()
+	c.promptedReasons = append(c.promptedReasons, reason)
+	c.batchCalls = append(c.batchCalls, consentBatchCall{browsers: names, reason: reason})
+	c.mu.Unlock()
+	if c.obtainErr != nil {
+		return nil, c.obtainErr
+	}
+	return outcomes, nil
 }
 
 func (c *fakeConsent) ObtainKeyUnprompted(_ context.Context, _ cookie.Browser) (cookie.AesKey, error) {
@@ -97,8 +122,67 @@ func (c *gateConsent) ObtainKey(ctx context.Context, _ cookie.Browser, _ string)
 	}
 }
 
+func (c *gateConsent) ObtainKeys(ctx context.Context, browsers []cookie.Browser, reason string) ([]cookie.KeyOutcome, error) {
+	outcomes := make([]cookie.KeyOutcome, len(browsers))
+	for i, b := range browsers {
+		key, err := c.ObtainKey(ctx, b, reason)
+		if err != nil {
+			return nil, err
+		}
+		outcomes[i] = cookie.KeyOutcome{Browser: b, Key: key}
+	}
+	return outcomes, nil
+}
+
 func (c *gateConsent) ObtainKeyUnprompted(_ context.Context, _ cookie.Browser) (cookie.AesKey, error) {
 	panic("gateConsent: unexpected unprompted release")
+}
+
+// partialGateConsent gates the batch like gateConsent — the leader blocks in
+// ObtainKeys while a waiter joins its flight — and reports one named browser as failed
+// (Missing, or Err when failErr is set) while every other browser releases OK. It is
+// the double for the F5 waiter path: a waiter for a distinct browser rides the same
+// single evaluation as a leader whose own browser is denied. batches counts ObtainKeys
+// invocations, so a regression that re-leads instead of sharing the flight trips it. A
+// canceled flight ctx is a whole-batch failure, returned as ctx.Err().
+type partialGateConsent struct {
+	key     cookie.AesKey
+	failFor cookie.BrowserName
+	failErr error
+
+	entered chan struct{}
+	release chan struct{}
+	batches atomic.Int32
+}
+
+func (c *partialGateConsent) ObtainKey(_ context.Context, _ cookie.Browser, _ string) (cookie.AesKey, error) {
+	panic("partialGateConsent: unexpected single ObtainKey")
+}
+
+func (c *partialGateConsent) ObtainKeys(ctx context.Context, browsers []cookie.Browser, _ string) ([]cookie.KeyOutcome, error) {
+	c.batches.Add(1)
+	c.entered <- struct{}{}
+	select {
+	case <-c.release:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	outcomes := make([]cookie.KeyOutcome, len(browsers))
+	for i, b := range browsers {
+		switch {
+		case b.Name != c.failFor:
+			outcomes[i] = cookie.KeyOutcome{Browser: b, Key: c.key}
+		case c.failErr != nil:
+			outcomes[i] = cookie.KeyOutcome{Browser: b, Err: c.failErr}
+		default:
+			outcomes[i] = cookie.KeyOutcome{Browser: b, Missing: true}
+		}
+	}
+	return outcomes, nil
+}
+
+func (c *partialGateConsent) ObtainKeyUnprompted(_ context.Context, _ cookie.Browser) (cookie.AesKey, error) {
+	panic("partialGateConsent: unexpected unprompted release")
 }
 
 // countingConsent tracks the peak number of concurrent ObtainKey prompts, holding
@@ -126,24 +210,38 @@ func (c *countingConsent) ObtainKey(_ context.Context, _ cookie.Browser, _ strin
 	return c.key, nil
 }
 
+func (c *countingConsent) ObtainKeys(ctx context.Context, browsers []cookie.Browser, reason string) ([]cookie.KeyOutcome, error) {
+	outcomes := make([]cookie.KeyOutcome, len(browsers))
+	for i, b := range browsers {
+		key, err := c.ObtainKey(ctx, b, reason)
+		if err != nil {
+			return nil, err
+		}
+		outcomes[i] = cookie.KeyOutcome{Browser: b, Key: key}
+	}
+	return outcomes, nil
+}
+
 func (c *countingConsent) ObtainKeyUnprompted(_ context.Context, _ cookie.Browser) (cookie.AesKey, error) {
 	panic("countingConsent: unexpected unprompted release")
 }
 
 // fakeCache is an in-memory key cache double: it stores raw keys without wrapping, so
-// the handler logic is exercised without the Secure Enclave. It records Put calls and
-// counts Gets, so a concurrency test can tell when every caller has probed the cache.
+// the handler logic is exercised without the Secure Enclave. It records Put calls with
+// their TTLs and counts Gets, so a concurrency test can tell when every caller has
+// probed the cache and a TTL test can assert the effective derivation.
 type fakeCache struct {
 	degraded bool
 
 	mu      sync.Mutex
 	entries map[string][]byte
 	puts    []string
+	ttls    map[string]time.Duration
 	gets    int
 }
 
 func newFakeCache() *fakeCache {
-	return &fakeCache{entries: map[string][]byte{}}
+	return &fakeCache{entries: map[string][]byte{}, ttls: map[string]time.Duration{}}
 }
 
 func (c *fakeCache) Get(_ context.Context, id string) ([]byte, bool, error) {
@@ -154,12 +252,19 @@ func (c *fakeCache) Get(_ context.Context, id string) ([]byte, bool, error) {
 	return key, ok, nil
 }
 
-func (c *fakeCache) Put(_ context.Context, id string, key []byte, _ time.Duration) error {
+func (c *fakeCache) Put(_ context.Context, id string, key []byte, ttl time.Duration) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.entries[id] = key
 	c.puts = append(c.puts, id)
+	c.ttls[id] = ttl
 	return nil
+}
+
+func (c *fakeCache) putTTL(id string) time.Duration {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.ttls[id]
 }
 
 func (c *fakeCache) getCalls() int {
@@ -176,6 +281,28 @@ func (c *fakeCache) putCalls() int {
 
 func (c *fakeCache) Degraded() bool {
 	return c.degraded
+}
+
+// raceEvictCache drops every entry once, right after the Put for evictOn lands —
+// the concurrent heal-EvictAll race the requested-endpoint-last verify re-Put in
+// releaseAllLocal guards against.
+type raceEvictCache struct {
+	*fakeCache
+	evictOn string
+	fired   bool
+}
+
+func (c *raceEvictCache) Put(ctx context.Context, id string, key []byte, ttl time.Duration) error {
+	if err := c.fakeCache.Put(ctx, id, key, ttl); err != nil {
+		return err
+	}
+	if id == c.evictOn && !c.fired {
+		c.fired = true
+		c.mu.Lock()
+		clear(c.entries)
+		c.mu.Unlock()
+	}
+	return nil
 }
 
 // fixedState is a StateLoader and RegistryLoader returning a fixed snapshot. Its
@@ -233,6 +360,17 @@ func (r *recordingRunner) Run(_ context.Context, target, cmd string, _ []byte) (
 		}
 	}
 	return "", nil
+}
+
+// forbiddenRunner fails the test on any ssh dial — the transport double for paths
+// that must never route, like an approver-mode prime under ConsentRouteHard.
+type forbiddenRunner struct {
+	t *testing.T
+}
+
+func (r *forbiddenRunner) Run(_ context.Context, target, cmd string, _ []byte) (string, error) {
+	r.t.Errorf("unexpected ssh dial to %s: %s", target, cmd)
+	return "", fmt.Errorf("forbidden ssh dial to %s", target)
 }
 
 // staticProbe returns a fixed session snapshot.

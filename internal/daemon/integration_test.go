@@ -5,15 +5,20 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	_ "modernc.org/sqlite" // register the sqlite driver for the test store
 
+	"github.com/yasyf/cookiesync/internal/cache"
 	"github.com/yasyf/cookiesync/internal/cookie"
 	"github.com/yasyf/cookiesync/internal/engine"
+	"github.com/yasyf/cookiesync/internal/helper"
+	"github.com/yasyf/cookiesync/internal/paths"
 	"github.com/yasyf/cookiesync/internal/state"
 )
 
@@ -102,6 +107,7 @@ func TestGetCookiesMergesURLsFromCachedKey(t *testing.T) {
 	fakeMesh(t, "me@laptop")
 	d := New(&fakeConsent{}, cache, nil, staticProbe(SessionSnapshot{}), &recordingRunner{}, fixedState{st: st}, fixedState{st: st})
 	_ = cache.Put(ctx, endpointID("me@laptop", "chrome", "Default"), []byte(key), 0)
+	d.grant("local", []cookie.BrowserName{"chrome"}, time.Hour)
 
 	got, err := d.handleGetCookies(ctx, map[string]any{
 		"browser": "chrome",
@@ -136,6 +142,7 @@ func TestGetCookiesHostFilters(t *testing.T) {
 	fakeMesh(t, "me@laptop")
 	d := New(&fakeConsent{}, cache, nil, staticProbe(SessionSnapshot{}), &recordingRunner{}, fixedState{st: stateWith("me@laptop", "")}, fixedState{st: stateWith("me@laptop", "")})
 	_ = cache.Put(ctx, endpointID("me@laptop", "chrome", "Default"), []byte(key), 0)
+	d.grant("local", []cookie.BrowserName{"chrome"}, time.Hour)
 
 	got, err := d.handleGetCookies(ctx, map[string]any{"browser": "chrome", "url": "https://x.com/"})
 	if err != nil {
@@ -163,6 +170,7 @@ func TestExtractApplyRoundTripWireContract(t *testing.T) {
 	st := stateWith("me@laptop", "")
 	fakeMesh(t, "me@laptop")
 	d := New(&fakeConsent{key: key}, cache, newRealEngine(t, cache), staticProbe(liveSession(currentUser(t))), &recordingRunner{}, fixedState{st: st}, fixedState{st: st})
+	d.grant("local", []cookie.BrowserName{"chrome"}, time.Hour)
 
 	// Apply two cookies via the frozen wire array.
 	in := []cookie.WireCookie{
@@ -462,7 +470,8 @@ func TestColdExtractsSingleFlightOneConsent(t *testing.T) {
 // TestPrimeAuthStragglerAfterWarmCacheDoesNotReprompt proves a fresh flight over an
 // already-warm cache returns the cached key without prompting or re-putting — the
 // cache re-probe that closes the double-prompt window a straggler opens by starting
-// its flight just after the previous one completed.
+// its flight just after the previous one completed. The straggler is served silently
+// only because its requestor holds a live grant; warmth alone never suffices.
 func TestPrimeAuthStragglerAfterWarmCacheDoesNotReprompt(t *testing.T) {
 	ctx := context.Background()
 	fakeMesh(t, "me@laptop")
@@ -471,8 +480,9 @@ func TestPrimeAuthStragglerAfterWarmCacheDoesNotReprompt(t *testing.T) {
 	cache := newFakeCache()
 	d := New(consent, cache, nil, staticProbe(liveSession(currentUser(t))), &recordingRunner{}, fixedState{st: st}, fixedState{st: st})
 	_ = cache.Put(ctx, endpointID("me@laptop", "chrome", "Default"), []byte(consent.key), 0)
+	d.grant("local", []cookie.BrowserName{"chrome"}, time.Hour)
 
-	key, err := d.primeAuth(ctx, "chrome", "Default", consentReason)
+	key, err := d.primeAuth(ctx, "local", "chrome", "Default", consentReason, releaseLocal)
 	if err != nil {
 		t.Fatalf("primeAuth: %v", err)
 	}
@@ -505,14 +515,14 @@ func TestPrimeAuthFlightSurvivesLeaderCancel(t *testing.T) {
 	leaderCtx, cancelLeader := context.WithCancel(context.Background())
 	leaderDone := make(chan error, 1)
 	go func() {
-		_, err := d.primeAuth(leaderCtx, "chrome", "Default", consentReason)
+		_, err := d.primeAuth(leaderCtx, "local", "chrome", "Default", consentReason, releaseLocal)
 		leaderDone <- err
 	}()
 	<-consent.entered
 
 	waiterDone := make(chan error, 1)
 	go func() {
-		key, err := d.primeAuth(context.Background(), "chrome", "Default", consentReason)
+		key, err := d.primeAuth(context.Background(), "local", "chrome", "Default", consentReason, releaseLocal)
 		if err == nil && string(key) != string(consent.key) {
 			err = errors.New("waiter got the wrong key")
 		}
@@ -557,7 +567,7 @@ func TestPrimeAuthCanceledWaiterReturnsWhileFlightContinues(t *testing.T) {
 
 	leaderDone := make(chan error, 1)
 	go func() {
-		_, err := d.primeAuth(context.Background(), "chrome", "Default", consentReason)
+		_, err := d.primeAuth(context.Background(), "local", "chrome", "Default", consentReason, releaseLocal)
 		leaderDone <- err
 	}()
 	<-consent.entered
@@ -566,7 +576,7 @@ func TestPrimeAuthCanceledWaiterReturnsWhileFlightContinues(t *testing.T) {
 	cancelWaiter()
 	waiterDone := make(chan error, 1)
 	go func() {
-		_, err := d.primeAuth(waiterCtx, "chrome", "Default", consentReason)
+		_, err := d.primeAuth(waiterCtx, "local", "chrome", "Default", consentReason, releaseLocal)
 		waiterDone <- err
 	}()
 	select {
@@ -590,36 +600,330 @@ func TestPrimeAuthCanceledWaiterReturnsWhileFlightContinues(t *testing.T) {
 	}
 }
 
-// TestDistinctEndpointPrimesSerializeThePrompt proves promptGate: N concurrent cold
-// primes for DISTINCT endpoints each prompt once, but at most one consent sheet is in
-// flight at a time — the cross-endpoint serialization the old global dispatch mutex
-// provided, now scoped to just the interactive prompt.
-func TestDistinctEndpointPrimesSerializeThePrompt(t *testing.T) {
-	fakeMesh(t, "me@laptop")
-	st := stateWith("me@laptop", "")
-	consent := &countingConsent{key: cookie.DeriveKey(cookie.SafeStorageKey("peanuts")), hold: 20 * time.Millisecond}
+// TestColdPrimeWarmsAllLocalEndpointsInOneEvaluation proves the batch prime: one cold
+// prime for one endpoint runs ONE consent evaluation covering every tracked local
+// browser — the requested browser leading — and caches the released keys under every
+// tracked local endpoint id (each profile of a browser shares its Safe Storage key),
+// with the requested endpoint id put LAST. Peer endpoints never join the batch.
+func TestColdPrimeWarmsAllLocalEndpointsInOneEvaluation(t *testing.T) {
+	ctx := context.Background()
+	self := "me@laptop"
+	fakeMesh(t, self)
+	st := stateWith(self, "",
+		stateEndpoint(self, "chrome", "Default"),
+		stateEndpoint(self, "chrome", "Work"),
+		stateEndpoint(self, "arc", "Default"),
+		stateEndpoint("you@desktop", "chrome", "Default"),
+	)
+	consent := &fakeConsent{key: cookie.DeriveKey(cookie.SafeStorageKey("peanuts"))}
 	cache := newFakeCache()
 	d := New(consent, cache, nil, staticProbe(liveSession(currentUser(t))), &recordingRunner{}, fixedState{st: st}, fixedState{st: st})
 
-	profiles := []string{"Default", "Work", "P3", "P4"}
-	done := make(chan error, len(profiles))
-	for _, profile := range profiles {
-		go func() {
-			_, err := d.primeAuth(context.Background(), "chrome", profile, consentReason)
-			done <- err
-		}()
+	got, err := d.handlePrimeAuth(ctx, map[string]any{"browser": "chrome"})
+	if err != nil {
+		t.Fatalf("handlePrimeAuth: %v", err)
 	}
-	for range profiles {
-		if err := <-done; err != nil {
-			t.Errorf("primeAuth: %v", err)
+	if marshalResult(t, got) != `{"endpoint":"me@laptop:chrome:Default","primed":true}` {
+		t.Fatalf("prime_auth = %s", marshalResult(t, got))
+	}
+	if len(consent.batchCalls) != 1 {
+		t.Fatalf("consent evaluations = %d, want 1 batch for the whole local set", len(consent.batchCalls))
+	}
+	call := consent.batchCalls[0]
+	if call.reason != consentReason {
+		t.Fatalf("batch reason = %q, want %q", call.reason, consentReason)
+	}
+	if len(call.browsers) != 2 || call.browsers[0] != "chrome" || call.browsers[1] != "arc" {
+		t.Fatalf("batch browsers = %v, want the requested chrome leading arc", call.browsers)
+	}
+	requested := endpointID(self, "chrome", "Default")
+	for _, id := range []string{requested, endpointID(self, "chrome", "Work"), endpointID(self, "arc", "Default")} {
+		if _, ok, _ := cache.Get(ctx, id); !ok {
+			t.Errorf("local endpoint %s not warmed by the batch prime", id)
 		}
 	}
-	if got := int(consent.calls.Load()); got != len(profiles) {
-		t.Errorf("consent prompts = %d, want %d (one per distinct endpoint)", got, len(profiles))
+	if _, ok, _ := cache.Get(ctx, endpointID("you@desktop", "chrome", "Default")); ok {
+		t.Errorf("a peer endpoint must never be cached by a local prime")
+	}
+	if len(cache.puts) != 3 || cache.puts[2] != requested {
+		t.Fatalf("cache puts = %v, want 3 with the requested endpoint %s last", cache.puts, requested)
+	}
+}
+
+// TestConcurrentDistinctEndpointPrimesCollapseToOneEvaluation proves batchFlight:
+// two concurrent cold primes for DISTINCT endpoints cost ONE Touch ID evaluation —
+// the second either joins the in-flight batch or finds its endpoint already warmed
+// by it — where the old per-endpoint flights prompted once each.
+func TestConcurrentDistinctEndpointPrimesCollapseToOneEvaluation(t *testing.T) {
+	self := "me@laptop"
+	fakeMesh(t, self)
+	st := stateWith(self, "",
+		stateEndpoint(self, "chrome", "Default"),
+		stateEndpoint(self, "chrome", "Work"),
+	)
+	consent := &gateConsent{
+		key:     cookie.DeriveKey(cookie.SafeStorageKey("peanuts")),
+		entered: make(chan struct{}, 2),
+		release: make(chan struct{}),
+	}
+	cache := newFakeCache()
+	d := New(consent, cache, nil, staticProbe(liveSession(currentUser(t))), &recordingRunner{}, fixedState{st: st}, fixedState{st: st})
+
+	leaderDone := make(chan error, 1)
+	go func() {
+		_, err := d.primeAuth(context.Background(), "local", "chrome", "Default", consentReason, releaseLocal)
+		leaderDone <- err
+	}()
+	<-consent.entered
+
+	waiterDone := make(chan error, 1)
+	go func() {
+		_, err := d.primeAuth(context.Background(), "local", "chrome", "Work", consentReason, releaseLocal)
+		waiterDone <- err
+	}()
+
+	close(consent.release)
+	if err := <-leaderDone; err != nil {
+		t.Fatalf("leader prime: %v", err)
+	}
+	if err := <-waiterDone; err != nil {
+		t.Fatalf("waiter prime: %v", err)
+	}
+	if got := consent.calls.Load(); got != 1 {
+		t.Errorf("consent evaluations = %d, want 1 (distinct-endpoint primes must collapse into one batch)", got)
+	}
+	for _, id := range []string{endpointID(self, "chrome", "Default"), endpointID(self, "chrome", "Work")} {
+		if _, ok, _ := cache.Get(context.Background(), id); !ok {
+			t.Errorf("endpoint %s not warmed by the collapsed prime", id)
+		}
+	}
+	if got := cache.putCalls(); got != 2 {
+		t.Errorf("cache puts = %d, want 2 (one per tracked local endpoint, no re-seeding)", got)
+	}
+}
+
+// TestPrimeAuthPartialBatchServesWaiterWhileLeaderBrowserDenied proves the F5 waiter
+// path: one requestor primes two DISTINCT browsers concurrently — the leader's browser
+// is denied (Missing) while the waiter's releases OK — and they share ONE consent
+// evaluation. The leader fails with its own browser's ConsentError; the waiter still
+// gets its key. The distinct-PROFILE collapse test never reaches this, since there
+// every browser in the batch resolves to one shared outcome.
+func TestPrimeAuthPartialBatchServesWaiterWhileLeaderBrowserDenied(t *testing.T) {
+	self := "me@laptop"
+	fakeMesh(t, self)
+	st := stateWith(self, "",
+		stateEndpoint(self, "chrome", "Default"),
+		stateEndpoint(self, "arc", "Default"),
+	)
+	consent := &partialGateConsent{
+		key:     cookie.DeriveKey(cookie.SafeStorageKey("peanuts")),
+		failFor: "chrome",
+		entered: make(chan struct{}, 2),
+		release: make(chan struct{}),
+	}
+	cache := newFakeCache()
+	d := New(consent, cache, nil, staticProbe(liveSession(currentUser(t))), &recordingRunner{}, fixedState{st: st}, fixedState{st: st})
+
+	leaderDone := make(chan error, 1)
+	go func() {
+		_, err := d.primeAuth(context.Background(), "sid:1", "chrome", "Default", consentReason, releaseLocal)
+		leaderDone <- err
+	}()
+	<-consent.entered
+
+	waiterDone := make(chan error, 1)
+	go func() {
+		key, err := d.primeAuth(context.Background(), "sid:1", "arc", "Default", consentReason, releaseLocal)
+		if err == nil && string(key) != string(consent.key) {
+			err = errors.New("waiter got the wrong key")
+		}
+		waiterDone <- err
+	}()
+
+	close(consent.release)
+
+	var declined *cookie.ConsentError
+	if leaderErr := <-leaderDone; !errors.As(leaderErr, &declined) {
+		t.Fatalf("leader prime for the denied browser = %v, want *cookie.ConsentError", leaderErr)
+	}
+	if err := <-waiterDone; err != nil {
+		t.Fatalf("waiter prime for the released browser: %v", err)
+	}
+	if got := consent.batches.Load(); got != 1 {
+		t.Errorf("consent evaluations = %d, want 1 (the waiter must ride the leader's batch, not re-lead)", got)
+	}
+	if _, ok, _ := cache.Get(context.Background(), endpointID(self, "arc", "Default")); !ok {
+		t.Errorf("the waiter's browser must be warmed by the shared batch")
+	}
+	if _, ok, _ := cache.Get(context.Background(), endpointID(self, "chrome", "Default")); ok {
+		t.Errorf("the denied browser must not be cached")
+	}
+}
+
+// TestLocalPrimeAndInboundConsentSerializeThePrompt proves promptGate across flights:
+// a local prime and an inbound request_consent each evaluate consent once, but at
+// most one Touch ID sheet is in flight at a time.
+func TestLocalPrimeAndInboundConsentSerializeThePrompt(t *testing.T) {
+	self := "me@laptop"
+	fakeMesh(t, self)
+	st := stateWith(self, "")
+	consent := &countingConsent{key: cookie.DeriveKey(cookie.SafeStorageKey("peanuts")), hold: 20 * time.Millisecond}
+	d := New(consent, newFakeCache(), nil, staticProbe(liveSession(currentUser(t))), &recordingRunner{}, fixedState{st: st}, fixedState{st: st})
+
+	done := make(chan error, 2)
+	go func() {
+		_, err := d.primeAuth(context.Background(), "local", "chrome", "Default", consentReason, releaseLocal)
+		done <- err
+	}()
+	go func() {
+		got, err := d.handleRequestConsent(context.Background(), map[string]any{
+			"browser": "chrome", "profile": "Work", "nonce": "n", "endpoint": "them@host:chrome:Work",
+		})
+		if err == nil && marshalResult(t, got) != `{"endpoint":"them@host:chrome:Work","nonce":"n","status":"approved"}` {
+			err = errors.New("inbound consent did not approve: " + marshalResult(t, got))
+		}
+		done <- err
+	}()
+	for range 2 {
+		if err := <-done; err != nil {
+			t.Errorf("prime/consent: %v", err)
+		}
+	}
+	if got := consent.calls.Load(); got != 2 {
+		t.Errorf("consent prompts = %d, want 2 (one per flight mode)", got)
 	}
 	if got := consent.peak.Load(); got != 1 {
-		t.Errorf("peak concurrent prompts = %d, want 1 (distinct-endpoint primes must serialize the sheet)", got)
+		t.Errorf("peak concurrent prompts = %d, want 1 (flights must serialize the sheet)", got)
 	}
+}
+
+// TestRequestedEndpointRePutSurvivesEvictAllRace proves the verify-and-re-Put tail of
+// releaseAllLocal: when an EvictAll races in right after the requested endpoint's Put
+// (a concurrent Put healing the degraded wrapper mid-batch), the requested endpoint
+// is re-Put and ends warm — the one endpoint the prime was for never comes out cold.
+func TestRequestedEndpointRePutSurvivesEvictAllRace(t *testing.T) {
+	ctx := context.Background()
+	self := "me@laptop"
+	fakeMesh(t, self)
+	requested := endpointID(self, "chrome", "Default")
+	st := stateWith(self, "",
+		stateEndpoint(self, "chrome", "Default"),
+		stateEndpoint(self, "chrome", "Work"),
+	)
+	consent := &fakeConsent{key: cookie.DeriveKey(cookie.SafeStorageKey("peanuts"))}
+	cache := &raceEvictCache{fakeCache: newFakeCache(), evictOn: requested}
+	d := New(consent, cache, nil, staticProbe(liveSession(currentUser(t))), &recordingRunner{}, fixedState{st: st}, fixedState{st: st})
+
+	key, err := d.primeAuth(ctx, "local", "chrome", "Default", consentReason, releaseLocal)
+	if err != nil {
+		t.Fatalf("primeAuth: %v", err)
+	}
+	if string(key) != string(consent.key) {
+		t.Fatalf("primeAuth returned the wrong key")
+	}
+	work := endpointID(self, "chrome", "Work")
+	wantPuts := []string{work, requested, requested}
+	if len(cache.puts) != len(wantPuts) {
+		t.Fatalf("cache puts = %v, want %v (bulk, requested last, re-Put after the evict)", cache.puts, wantPuts)
+	}
+	for i, want := range wantPuts {
+		if cache.puts[i] != want {
+			t.Fatalf("cache puts = %v, want %v (bulk, requested last, re-Put after the evict)", cache.puts, wantPuts)
+		}
+	}
+	if _, ok, _ := cache.Get(ctx, requested); !ok {
+		t.Fatalf("the requested endpoint must be re-Put after the racing EvictAll")
+	}
+}
+
+// TestRequestedEndpointLastSurvivesRealCacheHeal pins the requested-last Put ordering
+// against the REAL key cache: a KeyCache opened degraded (keybag locked) heals on the
+// requested endpoint's Put — the last of the batch — whose swap runs EvictAll. The
+// bulk Puts before it are dropped by the heal, but the requested endpoint, being
+// last, survives Enclave-wrapped; were it put any earlier, the prime's own endpoint
+// would come out cold.
+func TestRequestedEndpointLastSurvivesRealCacheHeal(t *testing.T) {
+	ctx := context.Background()
+	self := "me@laptop"
+	fakeMesh(t, self)
+	// One open probe + two bulk Puts stay degraded; the fourth probe — the requested
+	// endpoint's Put — heals.
+	binary := writeHealingCacheHelper(t, 4)
+	restore := paths.SetHelperBinaryForTest(binary)
+	t.Cleanup(restore)
+
+	wrapper, err := cache.OpenWrapper(ctx, helper.Bridge{})
+	if !errors.Is(err, cache.ErrSEPresenceUnavailable) {
+		t.Fatalf("OpenWrapper = %v, want ErrSEPresenceUnavailable", err)
+	}
+	keyCache := cache.NewKeyCache(wrapper)
+	t.Cleanup(func() { _ = wrapper.Close(context.Background()) })
+
+	st := stateWith(self, "",
+		stateEndpoint(self, "chrome", "Default"),
+		stateEndpoint(self, "chrome", "Work"),
+		stateEndpoint(self, "arc", "Default"),
+	)
+	consent := &fakeConsent{key: cookie.DeriveKey(cookie.SafeStorageKey("peanuts"))}
+	d := New(consent, keyCache, nil, staticProbe(liveSession(currentUser(t))), &recordingRunner{}, fixedState{st: st}, fixedState{st: st})
+
+	requested := endpointID(self, "chrome", "Default")
+	key, err := d.primeAuth(ctx, "local", "chrome", "Default", consentReason, releaseLocal)
+	if err != nil {
+		t.Fatalf("primeAuth: %v", err)
+	}
+	if string(key) != string(consent.key) {
+		t.Fatalf("primeAuth returned the wrong key")
+	}
+	if keyCache.Degraded() {
+		t.Fatalf("the cache must have healed on the requested endpoint's Put")
+	}
+	got, ok, err := keyCache.Get(ctx, requested)
+	if err != nil || !ok {
+		t.Fatalf("requested endpoint after the heal = %q, %v, %v, want the warm key", got, ok, err)
+	}
+	if string(got) != string(consent.key) {
+		t.Fatalf("requested endpoint key = %q, want %q", got, consent.key)
+	}
+	for _, dropped := range []string{endpointID(self, "chrome", "Work"), endpointID(self, "arc", "Default")} {
+		if _, ok, _ := keyCache.Get(ctx, dropped); ok {
+			t.Errorf("bulk endpoint %s survived the heal EvictAll — the requested endpoint was not put last", dropped)
+		}
+	}
+}
+
+// writeHealingCacheHelper writes a fake cookiesync-keyhelper whose cache-newkey
+// refuses with the presence code (exit 3) until its healAt'th invocation, then
+// succeeds — so a KeyCache opened degraded heals on the Put that makes the healAt'th
+// probe. cache-wrap/cache-unwrap XOR stdin to stdout; cache-dropkey is a no-op.
+func writeHealingCacheHelper(t *testing.T, healAt int) string {
+	t.Helper()
+	dir := t.TempDir()
+	binary := filepath.Join(dir, "cookiesync-keyhelper")
+	countPath := filepath.Join(dir, "newkey.count")
+	body := fmt.Sprintf(`#!/bin/sh
+case "$1" in
+cache-newkey)
+  echo x >> %q
+  if [ "$(grep -c x %q)" -lt %d ]; then exit 3; fi
+  exit 0
+  ;;
+cache-dropkey)
+  exit 0
+  ;;
+cache-wrap|cache-unwrap)
+  exec /usr/bin/perl -0777 -pe 's/(.)/chr(ord($1)^0x5A)/ges'
+  ;;
+*)
+  echo "unexpected verb $1" >&2
+  exit 99
+  ;;
+esac
+`, countPath, countPath, healAt)
+	if err := os.WriteFile(binary, []byte(body), 0o755); err != nil { //nolint:gosec // test fixture script must be executable.
+		t.Fatalf("write healing cache helper: %v", err)
+	}
+	return binary
 }
 
 // TestRequestConsentAnswersWhileRoutedReleaseInFlight is the same-host routed-consent
@@ -647,7 +951,7 @@ func TestRequestConsentAnswersWhileRoutedReleaseInFlight(t *testing.T) {
 
 	primeDone := make(chan error, 1)
 	go func() {
-		_, err := d.primeAuth(context.Background(), "chrome", "Default", consentReason)
+		_, err := d.primeAuth(context.Background(), "local", "chrome", "Default", consentReason, releaseLocal)
 		primeDone <- err
 	}()
 	<-runner.arrived

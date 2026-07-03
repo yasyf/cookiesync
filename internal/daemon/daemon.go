@@ -8,14 +8,18 @@
 // reconcile runs a full pass, extract returns this host's decrypted cookies as wire
 // records (priming auth if the key is cold), apply ingests a merged wire set, and
 // whoami reports this host's console session. Local methods are terminal and carry no
-// origin — what the CLI on this box invokes: prime_auth obtains the Safe Storage key
-// (behind one Touch ID tap when a session is live, else by routing the user-presence
-// gate to the active peer and then releasing this host's own key non-interactively)
-// and caches it; get_cookies renders one or more urls' cookies from the cached key,
-// merged into one set; auth_status reports cache warmth and Secure-Enclave
-// degradation; request_consent shows the
-// Touch ID prompt for the named browser to the person at this machine and echoes the
-// requester's nonce + endpoint to bind the approval — the key never crosses hosts.
+// origin — what the CLI on this box invokes: prime_auth obtains the Safe Storage keys
+// (behind one Touch ID evaluation covering every tracked local browser when a session
+// is live, else by routing the user-presence gate to the active peer and then
+// releasing this host's own key non-interactively) and caches them; get_cookies
+// renders one or more urls' cookies, merged into one set, behind the same gate.
+// Authorization is per requesting principal, not global cache warmth: a warm key is
+// served silently only while the requestor holds a live consent grant for the
+// browser, and a release grants its requestor every browser it covered;
+// auth_status reports cache warmth and Secure-Enclave degradation; request_consent
+// shows the Touch ID prompt for the named browser to the person at this machine,
+// warms this host's own cache off the same tap, and echoes the requester's nonce +
+// endpoint to bind the approval — the key never crosses hosts.
 //
 // Every collaborator (consent gate, key cache, sync engine, session probe, ssh
 // runner, state store, and the clock) is injected behind a seam, so the whole
@@ -98,17 +102,27 @@ type Daemon struct {
 	state    StateLoader
 	registry RegistryLoader
 
-	// primeFlight collapses concurrent primeAuth calls for the same endpoint into
-	// one flight, so a burst of cold extracts costs one consent prompt — the
-	// serialization the transport's old global dispatch mutex used to provide,
-	// scoped to the endpoint.
-	primeFlight singleflight.Group
+	// batchFlight collapses concurrent primeAuth calls into one flight per release
+	// mode and requestor, so a burst of cold primes from one principal — same
+	// endpoint or distinct — costs one consent evaluation covering every tracked
+	// local browser, while distinct principals each face their own tap. The mode
+	// key keeps an approver's release (an inbound request_consent) off the local
+	// flight, so an inbound approval never parks behind this host's own outbound
+	// routed prime (the same-host routed-consent cycle).
+	batchFlight singleflight.Group
 
-	// promptGate serializes the interactive Touch ID prompts across endpoints —
-	// distinct cold primes and inbound request_consents never stack two consent
-	// sheets. It is held only around a consent.ObtainKey call, never across
-	// routedRelease or any outbound ssh, so the same-host routed-consent cycle
-	// cannot deadlock on it.
+	// grants authorizes requestors per browser: requestor + ":" + browser name →
+	// expiry. A release grants the flight's requestor every browser it covered; a
+	// warm cached key is served silently only inside a live grant — cache warmth
+	// alone never authorizes a new principal. Guarded by grantMu, pruned on read.
+	grantMu sync.Mutex
+	grants  map[string]time.Time
+
+	// promptGate serializes the interactive Touch ID sheets across flights — a
+	// local prime and an inbound approval never stack two consent sheets. It is
+	// held only around the consent.ObtainKeys call inside releaseAllLocal, never
+	// across routedRelease or any outbound ssh, so the same-host routed-consent
+	// cycle cannot deadlock on it.
 	promptGate sync.Mutex
 
 	// newNonce mints a fresh routed-consent nonce. It is a field so a test can pin
@@ -163,6 +177,7 @@ func New(consent cookie.Consent, c Cache, eng *engine.Engine, probe Probe, runne
 		runner:   runner,
 		state:    st,
 		registry: reg,
+		grants:   map[string]time.Time{},
 		newNonce: newNonce,
 	}
 }
@@ -177,8 +192,8 @@ func New(consent cookie.Consent, c Cache, eng *engine.Engine, probe Probe, runne
 // routed-consent cycle). The shared in-process state behind the concurrent handlers
 // (key cache, digest recorder) locks internally; handleApply serializes per endpoint
 // via the engine's apply lock — shared with a converge pass's local writes — primeAuth
-// single-flights per endpoint via primeFlight, and the interactive Touch ID prompt
-// serializes across endpoints behind promptGate.
+// single-flights per release mode and requestor via batchFlight, and the interactive
+// Touch ID sheet serializes across flights behind promptGate.
 func (d *Daemon) Dispatcher() *synckit.Dispatcher {
 	dispatcher := synckit.NewDispatcher()
 	// The typed sync contract synckitd drives: svc.capabilities/list/reconcile/sync/

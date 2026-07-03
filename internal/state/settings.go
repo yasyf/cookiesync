@@ -18,14 +18,15 @@ type Settings struct {
 }
 
 // DefaultSettings returns the cadence defaults: a 15m reconcile interval, a 5m idle
-// threshold, a 3s watch debounce, and a 5m key-cache TTL — the same defaults as the
-// Python Settings dataclass.
+// threshold, a 3s watch debounce, and a 1h key-cache TTL (the daemon caps it to 5m
+// while the key cache is degraded to process memory). A host with an explicit stored
+// auth_ttl keeps it.
 func DefaultSettings() Settings {
 	return Settings{
 		Interval:      15 * time.Minute,
 		IdleThreshold: 5 * time.Minute,
 		WatchDebounce: 3 * time.Second,
-		AuthTTL:       5 * time.Minute,
+		AuthTTL:       time.Hour,
 	}
 }
 

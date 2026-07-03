@@ -3,15 +3,19 @@ package helper
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"testing"
 
 	"github.com/yasyf/cookiesync/internal/paths"
 )
+
+const staleHelperUnknownSubcommandStderr = "keyhelper: unknown subcommand 'vault-batch-retrieve'\n"
 
 // writeScript writes an executable shell script at a temp path and returns it.
 func writeScript(t *testing.T, body string) string {
@@ -89,6 +93,184 @@ func TestCacheWrapUnwrapAreBinarySafe(t *testing.T) {
 	}
 	if !bytes.Equal(unwrapped.Stdout, plaintext) {
 		t.Fatalf("round-trip = %x, want %x", unwrapped.Stdout, plaintext)
+	}
+}
+
+func TestVaultBatchRetrieveArgsAndReason(t *testing.T) {
+	// The fake echoes argv to stdout and the reason env var to stderr, proving the
+	// bridge flattens items into repeated <vault> <safe-storage> pairs and threads
+	// reason through COOKIESYNC_TOUCHID_REASON like VaultRetrieve.
+	script := writeScript(t, `printf '%s\n' "$@"`+"\n"+`printf '%s' "$COOKIESYNC_TOUCHID_REASON" >&2`+"\n")
+	items := []VaultItem{
+		{Vault: "cookiesync-vault-chrome", SafeStorageService: "Chrome Safe Storage"},
+		{Vault: "cookiesync-vault-brave", SafeStorageService: "Brave Safe Storage"},
+	}
+	res, err := Bridge{Binary: script}.VaultBatchRetrieve(context.Background(), items, "unlock 2 browsers to sync")
+	if err != nil {
+		t.Fatalf("VaultBatchRetrieve: %v", err)
+	}
+	wantArgs := "vault-batch-retrieve\ncookiesync-vault-chrome\nChrome Safe Storage\ncookiesync-vault-brave\nBrave Safe Storage\n"
+	if got := string(res.Stdout); got != wantArgs {
+		t.Fatalf("argv = %q, want %q", got, wantArgs)
+	}
+	if got := string(res.Stderr); got != "unlock 2 browsers to sync" {
+		t.Fatalf("reason env = %q, want %q", got, "unlock 2 browsers to sync")
+	}
+}
+
+func TestParseBatchLines(t *testing.T) {
+	secret := []byte{0x00, 0xFF, 'a', '\t', '\n'}
+	b64 := base64.StdEncoding.EncodeToString(secret)
+	tests := []struct {
+		name    string
+		stdout  string
+		want    []BatchLine
+		wantErr string
+	}{
+		{
+			name:   "ok line decodes the base64 secret",
+			stdout: "0\tok\t" + b64 + "\n",
+			want:   []BatchLine{{Index: 0, Status: BatchOK, Payload: secret}},
+		},
+		{
+			name:   "missing line",
+			stdout: "1\tmissing\t-\n",
+			want:   []BatchLine{{Index: 1, Status: BatchMissing}},
+		},
+		{
+			name:   "error line carries the OSStatus",
+			stdout: "2\terror\t-25293\n",
+			want:   []BatchLine{{Index: 2, Status: BatchError, OSStatus: -25293}},
+		},
+		{
+			name:   "multiline batch keeps order and count",
+			stdout: "0\tok\t" + b64 + "\n1\tmissing\t-\n2\terror\t-25308\n",
+			want: []BatchLine{
+				{Index: 0, Status: BatchOK, Payload: secret},
+				{Index: 1, Status: BatchMissing},
+				{Index: 2, Status: BatchError, OSStatus: -25308},
+			},
+		},
+		{
+			name:   "empty stdout is zero lines",
+			stdout: "",
+			want:   nil,
+		},
+		{
+			name:    "two fields is malformed",
+			stdout:  "0\tok\n",
+			wantErr: "3 tab-separated fields",
+		},
+		{
+			name:    "non-numeric index is malformed",
+			stdout:  "x\tok\t" + b64 + "\n",
+			wantErr: `index "x"`,
+		},
+		{
+			name:    "bad base64 in an ok line is malformed",
+			stdout:  "0\tok\t!!!\n",
+			wantErr: `ok payload "!!!"`,
+		},
+		{
+			name:    "unknown status is malformed",
+			stdout:  "0\tdenied\t-\n",
+			wantErr: `unknown status "denied"`,
+		},
+		{
+			name:    "missing payload must be a dash",
+			stdout:  "0\tmissing\tnope\n",
+			wantErr: `want "-"`,
+		},
+		{
+			name:    "error payload must be a decimal OSStatus",
+			stdout:  "0\terror\tboom\n",
+			wantErr: `error payload "boom"`,
+		},
+		{
+			name:    "malformed second line names its index",
+			stdout:  "0\tok\t" + b64 + "\ngarbage\n",
+			wantErr: "batch line 1",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := ParseBatchLines(tt.stdout)
+			if tt.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+					t.Fatalf("err = %v, want it to contain %q", err, tt.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("ParseBatchLines: %v", err)
+			}
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Fatalf("lines = %#v, want %#v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestIsUnknownSubcommand(t *testing.T) {
+	tests := []struct {
+		name string
+		res  Result
+		want bool
+	}{
+		{
+			name: "stale helper rejection",
+			res:  Result{Code: 2, Stderr: []byte(staleHelperUnknownSubcommandStderr)},
+			want: true,
+		},
+		{
+			name: "exit 2 with a different diagnostic",
+			res:  Result{Code: 2, Stderr: []byte("keyhelper: unavailable: no biometrics or passcode\n")},
+			want: false,
+		},
+		{
+			name: "matching stderr but exit 1",
+			res:  Result{Code: 1, Stderr: []byte(staleHelperUnknownSubcommandStderr)},
+			want: false,
+		},
+		{
+			name: "matching stderr but exit 0",
+			res:  Result{Code: 0, Stderr: []byte(staleHelperUnknownSubcommandStderr)},
+			want: false,
+		},
+		{
+			name: "missing trailing newline",
+			res:  Result{Code: 2, Stderr: []byte("keyhelper: unknown subcommand 'vault-batch-retrieve'")},
+			want: false,
+		},
+		{
+			name: "extra trailing output",
+			res:  Result{Code: 2, Stderr: []byte(staleHelperUnknownSubcommandStderr + "keyhelper: usage\n")},
+			want: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := IsUnknownSubcommand(tt.res); got != tt.want {
+				t.Fatalf("IsUnknownSubcommand = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestVaultBatchRetrieveStaleHelperSniff(t *testing.T) {
+	// End-to-end through the real exec path: a fake that mimics a <= v0.7.0
+	// helper's unknown-subcommand rejection must be recognized as stale.
+	script := writeScript(t, `printf '%s\n' "keyhelper: unknown subcommand 'vault-batch-retrieve'" >&2`+"\nexit 2\n")
+	res, err := Bridge{Binary: script}.VaultBatchRetrieve(
+		context.Background(),
+		[]VaultItem{{Vault: "cookiesync-vault-chrome", SafeStorageService: "Chrome Safe Storage"}},
+		"unlock 1 browser to sync",
+	)
+	if err != nil {
+		t.Fatalf("VaultBatchRetrieve: %v", err)
+	}
+	if !IsUnknownSubcommand(res) {
+		t.Fatalf("IsUnknownSubcommand = false for Code=%d Stderr=%q", res.Code, res.Stderr)
 	}
 }
 

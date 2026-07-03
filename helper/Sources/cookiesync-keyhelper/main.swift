@@ -17,6 +17,15 @@
 //   Consent vault (biometry-or-passcode-bound Safe Storage password):
 //     vault-enroll   <vault-service> <safe-storage-service>
 //     vault-retrieve <vault-service>
+//     vault-batch-retrieve <vault-service> <safe-storage-service> [<vault-service> <safe-storage-service> ...]
+//                    one auth sheet for the whole batch, then one stdout line per
+//                    item: <index>\t<ok|missing|error>\t<payload>, where payload is
+//                    the base64 secret (ok), "-" (missing: no vault item and no
+//                    Safe Storage source to enroll from), or the failing OSStatus
+//                    in decimal (error). A vault item that is missing or invalidated
+//                    (auth-failed: the fingerprint set changed) with a readable Safe
+//                    Storage password is re-enrolled under the already-authenticated
+//                    context and reported ok — no second sheet.
 //     vault-status   <vault-service>
 //
 //   Secure-Enclave cache (per-boot ephemeral P-256 ECIES wrapper):
@@ -26,13 +35,14 @@
 //     cache-dropkey  <label>   delete the SE key
 //
 // Exit codes (shared across both families):
-//   0 = ok
+//   0 = ok — for vault-batch-retrieve: the one auth sheet was approved; per-item
+//       failures are carried in the stdout lines, never the exit code
 //   1 = cancelled / denied / operation failed (key missing, decrypt failed, bad input)
 //   2 = unavailable (no biometrics + no passcode, no Secure Enclave, not found,
 //       non-interactive, key generation misconfigured)
 //   3 = presence unavailable: the data-protection keybag refused the operation with
 //       errSecInteractionNotAllowed (-25308) — screen locked / no user present;
-//       retry after unlock
+//       retry after unlock. Aborts a vault-batch-retrieve mid-batch.
 
 import Foundation
 import LocalAuthentication
@@ -53,6 +63,17 @@ func failSec(_ operation: String, _ error: Unmanaged<CFError>?, otherwise: Int32
     let nsError = error!.takeRetainedValue() as Error as NSError
     fail("\(operation) failed: \(nsError.localizedDescription) (OSStatus \(nsError.code))")
     if nsError.domain == NSOSStatusErrorDomain, nsError.code == Int(errSecInteractionNotAllowed) {
+        return 3
+    }
+    return otherwise
+}
+
+// failSec (OSStatus overload) reports a failed SecItem call and applies the same
+// classification: errSecInteractionNotAllowed exits 3, anything else exits
+// `otherwise`.
+func failSec(_ operation: String, _ status: OSStatus, otherwise: Int32) -> Int32 {
+    fail("\(operation) failed: \(SecCopyErrorMessageString(status, nil) as String? ?? "\(status)") (OSStatus \(status))")
+    if status == errSecInteractionNotAllowed {
         return 3
     }
     return otherwise
@@ -90,12 +111,16 @@ func vaultEnroll(vaultService: String, safeStorageService: String) -> Int32 {
         fail("could not build access control: \(acError?.takeRetainedValue().localizedDescription ?? "unknown")")
         return 2
     }
-    SecItemDelete([
+    let deleteStatus = SecItemDelete([
         kSecClass as String: kSecClassGenericPassword,
         kSecAttrService as String: vaultService,
         kSecAttrAccessGroup as String: KEYCHAIN_ACCESS_GROUP,
         kSecUseDataProtectionKeychain as String: true,
+        kSecUseAuthenticationUI as String: kSecUseAuthenticationUIFail,
     ] as CFDictionary)
+    if deleteStatus == errSecInteractionNotAllowed {
+        return failSec("SecItemDelete", deleteStatus, otherwise: 1)
+    }
     let add: [String: Any] = [
         kSecClass as String: kSecClassGenericPassword,
         kSecAttrService as String: vaultService,
@@ -113,8 +138,11 @@ func vaultEnroll(vaultService: String, safeStorageService: String) -> Int32 {
     return 0
 }
 
-func vaultRetrieve(vaultService: String) -> Int32 {
-    let context = LAContext()
+// evaluateVaultPolicy runs the single deviceOwnerAuthentication sheet behind every
+// vault read, with COOKIESYNC_TOUCHID_REASON as the prompt text. Returns nil when
+// the user approved, otherwise the exit code (2 = evaluation unavailable, 1 =
+// denied/cancelled).
+func evaluateVaultPolicy(_ context: LAContext) -> Int32? {
     var policyError: NSError?
     guard context.canEvaluatePolicy(.deviceOwnerAuthentication, error: &policyError) else {
         fail("unavailable: \(policyError?.localizedDescription ?? "no biometrics or passcode")")
@@ -133,16 +161,24 @@ func vaultRetrieve(vaultService: String) -> Int32 {
     }
     semaphore.wait()
 
-    guard approved else {
-        if let laError = evalError as? LAError {
-            switch laError.code {
-            case .notInteractive, .invalidContext, .biometryNotAvailable, .passcodeNotSet:
-                return 2
-            default:
-                return 1
-            }
+    if approved {
+        return nil
+    }
+    if let laError = evalError as? LAError {
+        switch laError.code {
+        case .notInteractive, .invalidContext, .biometryNotAvailable, .passcodeNotSet:
+            return 2
+        default:
+            return 1
         }
-        return 1
+    }
+    return 1
+}
+
+func vaultRetrieve(vaultService: String) -> Int32 {
+    let context = LAContext()
+    if let code = evaluateVaultPolicy(context) {
+        return code
     }
 
     let query: [String: Any] = [
@@ -178,19 +214,116 @@ func vaultRetrieve(vaultService: String) -> Int32 {
     }
 }
 
+func emitBatchLine(_ index: Int, _ status: String, _ payload: String) {
+    FileHandle.standardOutput.write(Data("\(index)\t\(status)\t\(payload)\n".utf8))
+}
+
+// vaultBatchRetrieve reads every vault item under one auth sheet, emitting one
+// batch line per item. errSecInteractionNotAllowed anywhere aborts the whole
+// batch through the failSec classification (exit 3).
+func vaultBatchRetrieve(items: [(vault: String, safeStorage: String)]) -> Int32 {
+    let context = LAContext()
+    if let code = evaluateVaultPolicy(context) {
+        return code
+    }
+
+    for (index, item) in items.enumerated() {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: item.vault,
+            kSecAttrAccessGroup as String: KEYCHAIN_ACCESS_GROUP,
+            kSecReturnData as String: true,
+            kSecMatchLimit as String: kSecMatchLimitOne,
+            kSecUseDataProtectionKeychain as String: true,
+            kSecUseAuthenticationContext as String: context,
+        ]
+        var found: CFTypeRef?
+        let status = SecItemCopyMatching(query as CFDictionary, &found)
+        switch status {
+        case errSecSuccess:
+            emitBatchLine(index, "ok", (found as! Data).base64EncodedString())
+        case errSecItemNotFound, errSecAuthFailed:
+            if let code = batchEnroll(context: context, index: index, vaultService: item.vault, safeStorageService: item.safeStorage) {
+                return code
+            }
+        case errSecInteractionNotAllowed:
+            return failSec("SecItemCopyMatching", status, otherwise: 1)
+        default:
+            emitBatchLine(index, "error", "\(status)")
+        }
+    }
+    return 0
+}
+
+// batchEnroll re-creates a missing vault item from the browser's Safe Storage
+// password under the already-authenticated context — no second sheet — and emits
+// the item's batch line. Returns nil to continue the batch, or the exit code that
+// aborts it.
+func batchEnroll(context: LAContext, index: Int, vaultService: String, safeStorageService: String) -> Int32? {
+    guard let password = readSafeStorage(safeStorageService) else {
+        emitBatchLine(index, "missing", "-")
+        return nil
+    }
+    var acError: Unmanaged<CFError>?
+    guard let access = SecAccessControlCreateWithFlags(
+        kCFAllocatorDefault,
+        kSecAttrAccessibleWhenUnlockedThisDeviceOnly,
+        [.biometryCurrentSet, .or, .devicePasscode],
+        &acError
+    ) else {
+        return failSec("SecAccessControlCreateWithFlags", acError, otherwise: 2)
+    }
+    let deleteStatus = SecItemDelete([
+        kSecClass as String: kSecClassGenericPassword,
+        kSecAttrService as String: vaultService,
+        kSecAttrAccessGroup as String: KEYCHAIN_ACCESS_GROUP,
+        kSecUseDataProtectionKeychain as String: true,
+        kSecUseAuthenticationUI as String: kSecUseAuthenticationUIFail,
+    ] as CFDictionary)
+    if deleteStatus == errSecInteractionNotAllowed {
+        return failSec("SecItemDelete", deleteStatus, otherwise: 1)
+    }
+    let add: [String: Any] = [
+        kSecClass as String: kSecClassGenericPassword,
+        kSecAttrService as String: vaultService,
+        kSecValueData as String: password,
+        kSecAttrAccessControl as String: access,
+        kSecAttrAccessGroup as String: KEYCHAIN_ACCESS_GROUP,
+        kSecUseDataProtectionKeychain as String: true,
+        kSecAttrSynchronizable as String: false,
+        kSecUseAuthenticationContext as String: context,
+    ]
+    let addStatus = SecItemAdd(add as CFDictionary, nil)
+    switch addStatus {
+    case errSecSuccess:
+        emitBatchLine(index, "ok", password.base64EncodedString())
+        return nil
+    case errSecInteractionNotAllowed:
+        return failSec("SecItemAdd", addStatus, otherwise: 1)
+    default:
+        emitBatchLine(index, "error", "\(addStatus)")
+        return nil
+    }
+}
+
 func vaultStatus(vaultService: String) -> Int32 {
     let context = LAContext()
     var policyError: NSError?
     let biometry = context.canEvaluatePolicy(.deviceOwnerAuthenticationWithBiometrics, error: nil)
     let deviceAuth = context.canEvaluatePolicy(.deviceOwnerAuthentication, error: &policyError)
-    let exists = SecItemCopyMatching([
+    let status = SecItemCopyMatching([
         kSecClass as String: kSecClassGenericPassword,
         kSecAttrService as String: vaultService,
         kSecAttrAccessGroup as String: KEYCHAIN_ACCESS_GROUP,
         kSecUseDataProtectionKeychain as String: true,
         kSecReturnAttributes as String: true,
         kSecMatchLimit as String: kSecMatchLimitOne,
-    ] as CFDictionary, nil) == errSecSuccess
+        kSecUseAuthenticationUI as String: kSecUseAuthenticationUIFail,
+    ] as CFDictionary, nil)
+    // kSecUseAuthenticationUIFail keeps this probe UI-free: instead of macOS
+    // raising its own generic auth sheet ahead of the real consent prompt, an
+    // auth-gated read reports errSecInteractionNotAllowed — the item exists.
+    let exists = status == errSecSuccess || status == errSecInteractionNotAllowed
     let report = "biometry=\(biometry) passcode=\(deviceAuth) vault=\(exists)"
     FileHandle.standardOutput.write(Data("\(report)\n".utf8))
     guard deviceAuth else { return 2 }
@@ -342,6 +475,7 @@ guard arguments.count >= 3 else {
     fail("usage: cookiesync-keyhelper <subcommand> <arg> [arg]")
     fail("  vault-enroll <vault-service> <safe-storage-service>")
     fail("  vault-retrieve <vault-service>")
+    fail("  vault-batch-retrieve <vault-service> <safe-storage-service> [<vault-service> <safe-storage-service> ...]")
     fail("  vault-status <vault-service>")
     fail("  cache-newkey|cache-wrap|cache-unwrap|cache-dropkey <label>")
     exit(2)
@@ -356,6 +490,14 @@ case "vault-enroll":
     exit(vaultEnroll(vaultService: arguments[2], safeStorageService: arguments[3]))
 case "vault-retrieve":
     exit(vaultRetrieve(vaultService: arguments[2]))
+case "vault-batch-retrieve":
+    let rest = Array(arguments.dropFirst(2))
+    guard rest.count % 2 == 0 else {
+        fail("vault-batch-retrieve requires repeated <vault-service> <safe-storage-service> pairs")
+        exit(2)
+    }
+    let items = stride(from: 0, to: rest.count, by: 2).map { (vault: rest[$0], safeStorage: rest[$0 + 1]) }
+    exit(vaultBatchRetrieve(items: items))
 case "vault-status":
     exit(vaultStatus(vaultService: arguments[2]))
 case "cache-newkey":

@@ -270,7 +270,7 @@ func TestDefaultSettingsSerialize(t *testing.T) {
 		Interval:      "15m",
 		IdleThreshold: "5m",
 		WatchDebounce: "3s",
-		AuthTTL:       "5m",
+		AuthTTL:       "1h",
 	}
 	if got != want {
 		t.Fatalf("default settings JSON = %+v, want %+v", got, want)

@@ -1,9 +1,8 @@
 // Package helper bridges cookiesync to the installed, Developer-ID-signed
 // Secure-Enclave key helper (cookiesync-keyhelper.app). It shells the helper's
-// seven subcommands identically to the original Python: the read-only vault probe
-// (vault-status), the biometric vault (vault-retrieve / vault-enroll), and the
-// per-boot Enclave key cache (cache-newkey / cache-wrap / cache-unwrap /
-// cache-dropkey).
+// subcommands: the read-only vault probe (vault-status), the biometric vault
+// (vault-retrieve / vault-batch-retrieve / vault-enroll), and the per-boot
+// Enclave key cache (cache-newkey / cache-wrap / cache-unwrap / cache-dropkey).
 //
 // The bridge fails closed: a missing helper surfaces a *paths.HelperError rather
 // than degrading to an unsigned fallback, since an ad-hoc helper is SIGKILLed at
@@ -17,9 +16,12 @@ package helper
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"os/exec"
+	"strconv"
+	"strings"
 
 	"github.com/yasyf/cookiesync/internal/paths"
 )
@@ -35,6 +37,22 @@ const reasonEnvVar = "COOKIESYNC_TOUCHID_REASON"
 // a genuine misconfiguration) so callers can degrade instead of failing.
 const CodePresenceUnavailable = 3
 
+// unknownSubcommandStderr is the exact stderr a helper that predates
+// vault-batch-retrieve (<= v0.7.0) writes when handed the verb, paired with exit
+// code 2. IsUnknownSubcommand sniffs it to tell a stale installed helper apart
+// from a genuine unavailable failure, which shares the exit code.
+const unknownSubcommandStderr = "keyhelper: unknown subcommand 'vault-batch-retrieve'\n"
+
+// BatchStatus is the status column of one vault-batch-retrieve stdout line.
+type BatchStatus string
+
+// The three per-item outcomes of a vault-batch-retrieve line.
+const (
+	BatchOK      BatchStatus = "ok"
+	BatchMissing BatchStatus = "missing"
+	BatchError   BatchStatus = "error"
+)
+
 // Result is the outcome of one helper subcommand: the raw exit code and the bytes
 // the helper wrote to stdout and stderr. On a non-zero exit, Stderr carries the
 // helper's diagnostic line (the failing operation and its numeric OSStatus) so
@@ -43,6 +61,25 @@ type Result struct {
 	Code   int
 	Stdout []byte
 	Stderr []byte
+}
+
+// VaultItem is one entry in a VaultBatchRetrieve request: the vault service the
+// biometry-bound secret lives under, and the login-keychain Safe Storage service
+// the helper enrolls from when the vault item is missing.
+type VaultItem struct {
+	Vault              string
+	SafeStorageService string
+}
+
+// BatchLine is one parsed vault-batch-retrieve stdout line. Index is the
+// zero-based position of the item in the request. Payload holds the decoded
+// secret for BatchOK and is nil otherwise; OSStatus holds the failing Security
+// status for BatchError and is zero otherwise.
+type BatchLine struct {
+	Index    int
+	Status   BatchStatus
+	Payload  []byte
+	OSStatus int32
 }
 
 // Bridge invokes the signed key helper. The zero value resolves the installed
@@ -77,6 +114,22 @@ func (b Bridge) VaultStatus(ctx context.Context, vault string) (Result, error) {
 // is success, 1 is cancelled/denied, 2 is an invalidated ACL or no biometry.
 func (b Bridge) VaultRetrieve(ctx context.Context, vault, reason string) (Result, error) {
 	return b.run(ctx, nil, []string{reasonEnvVar + "=" + reason}, "vault-retrieve", vault)
+}
+
+// VaultBatchRetrieve prompts for Touch ID once and retrieves every item's vault
+// secret under that single authentication, enrolling a missing vault item from
+// its Safe Storage service without a second prompt. Exit 0 means the sheet was
+// approved and the per-item outcomes are the stdout lines ParseBatchLines
+// decodes; 1 is cancelled/denied, 2 is no biometry/passcode — or a stale
+// pre-batch helper, see IsUnknownSubcommand — and CodePresenceUnavailable is a
+// locked keybag, which aborts the whole batch.
+func (b Bridge) VaultBatchRetrieve(ctx context.Context, items []VaultItem, reason string) (Result, error) {
+	args := make([]string, 0, 1+2*len(items))
+	args = append(args, "vault-batch-retrieve")
+	for _, item := range items {
+		args = append(args, item.Vault, item.SafeStorageService)
+	}
+	return b.run(ctx, nil, []string{reasonEnvVar + "=" + reason}, args...)
 }
 
 // VaultEnroll stores the Safe Storage password (read from safeStorageService in
@@ -156,4 +209,65 @@ func (b Bridge) run(ctx context.Context, stdin []byte, extraEnv []string, args .
 func isExit(err error) bool {
 	var exitErr *exec.ExitError
 	return errors.As(err, &exitErr) && exitErr.ExitCode() >= 0
+}
+
+// ParseBatchLines decodes vault-batch-retrieve stdout: one
+// "<index>\t<status>\t<payload>" line per requested item, where payload is the
+// base64 secret (ok), "-" (missing), or the failing OSStatus in decimal (error).
+// Any malformed line fails the whole parse.
+func ParseBatchLines(stdout string) ([]BatchLine, error) {
+	trimmed := strings.TrimSuffix(stdout, "\n")
+	if trimmed == "" {
+		return nil, nil
+	}
+	raw := strings.Split(trimmed, "\n")
+	lines := make([]BatchLine, len(raw))
+	for i, line := range raw {
+		parsed, err := parseBatchLine(line)
+		if err != nil {
+			return nil, fmt.Errorf("batch line %d: %w", i, err)
+		}
+		lines[i] = parsed
+	}
+	return lines, nil
+}
+
+func parseBatchLine(line string) (BatchLine, error) {
+	fields := strings.Split(line, "\t")
+	if len(fields) != 3 {
+		return BatchLine{}, fmt.Errorf("want 3 tab-separated fields in %q, got %d", line, len(fields))
+	}
+	index, err := strconv.Atoi(fields[0])
+	if err != nil {
+		return BatchLine{}, fmt.Errorf("index %q: %w", fields[0], err)
+	}
+	switch status := BatchStatus(fields[1]); status {
+	case BatchOK:
+		payload, err := base64.StdEncoding.DecodeString(fields[2])
+		if err != nil {
+			return BatchLine{}, fmt.Errorf("ok payload %q: %w", fields[2], err)
+		}
+		return BatchLine{Index: index, Status: BatchOK, Payload: payload}, nil
+	case BatchMissing:
+		if fields[2] != "-" {
+			return BatchLine{}, fmt.Errorf(`missing payload %q, want "-"`, fields[2])
+		}
+		return BatchLine{Index: index, Status: BatchMissing}, nil
+	case BatchError:
+		osStatus, err := strconv.ParseInt(fields[2], 10, 32)
+		if err != nil {
+			return BatchLine{}, fmt.Errorf("error payload %q: %w", fields[2], err)
+		}
+		return BatchLine{Index: index, Status: BatchError, OSStatus: int32(osStatus)}, nil
+	default:
+		return BatchLine{}, fmt.Errorf("unknown status %q in %q", fields[1], line)
+	}
+}
+
+// IsUnknownSubcommand reports whether res is a stale installed helper (one that
+// predates vault-batch-retrieve) rejecting the verb: exit code 2 with exactly the
+// unknown-subcommand diagnostic on stderr. Callers use it to fall back to
+// per-item vault-retrieve instead of treating the exit as a real failure.
+func IsUnknownSubcommand(res Result) bool {
+	return res.Code == 2 && string(res.Stderr) == unknownSubcommandStderr
 }

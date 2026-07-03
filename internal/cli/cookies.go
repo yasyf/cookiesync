@@ -2,6 +2,7 @@ package cli
 
 import (
 	"fmt"
+	"os"
 
 	"github.com/spf13/cobra"
 
@@ -43,6 +44,9 @@ func runAuth(cmd *cobra.Command, browser, profile, reason, ttl string) error {
 	params := map[string]any{"browser": browser, "profile": profile}
 	if reason != "" {
 		params["reason"] = reason
+	}
+	if req := os.Getenv("COOKIESYNC_REQUESTOR"); req != "" {
+		params["requestor"] = req
 	}
 	var result struct {
 		Endpoint string `json:"endpoint"`
@@ -87,6 +91,9 @@ func runCookies(cmd *cobra.Command, urls []string, browser, profile, format stri
 		"urls":    asAnySlice(urls),
 		"browser": browser,
 		"profile": profile,
+	}
+	if req := os.Getenv("COOKIESYNC_REQUESTOR"); req != "" {
+		params["requestor"] = req
 	}
 	var result struct {
 		Cookies []cookie.WireCookie `json:"cookies"`

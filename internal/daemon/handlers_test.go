@@ -264,8 +264,9 @@ func TestHandlePrimeAuthSoftRouteDoesNotOverrideLocalSession(t *testing.T) {
 	}
 }
 
-// TestHandleGetCookiesColdCacheFailsClosed proves get_cookies fails closed with
-// AuthRequired when no key is cached, rather than prompting or returning an empty set.
+// TestHandleGetCookiesColdCacheFailsClosed proves get_cookies on a cold, unattended
+// host with no live peer fails closed with AuthRequired, rather than returning an
+// empty set.
 func TestHandleGetCookiesColdCacheFailsClosed(t *testing.T) {
 	fakeMesh(t, "me@laptop")
 	d := New(&fakeConsent{}, newFakeCache(), nil, staticProbe(SessionSnapshot{}), &recordingRunner{}, fixedState{st: stateWith("me@laptop", "")}, fixedState{st: stateWith("me@laptop", "")})

@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/yasyf/cookiesync/internal/cookie"
 	"github.com/yasyf/cookiesync/internal/mesh"
@@ -127,15 +128,21 @@ func (d *Daemon) peerIsLive(ctx context.Context, peer string) (bool, error) {
 }
 
 // handleRequestConsent shows the Touch ID prompt to the person at this machine for the
-// requesting endpoint and echoes the requester's nonce + endpoint to bind the approval
-// — no key crosses the wire. Returns {"status": "approved", "nonce", "endpoint"} on a
-// live tap, {"status": "denied"} when declined, or {"status": "unavailable"} when this
-// host has no live session to prompt. Mirrors the Python request_consent.
+// requesting endpoint and echoes the requester's nonce + endpoint VERBATIM to bind the
+// approval — no key crosses the wire. The approval runs the approver-mode prime for
+// the requested browser+profile on behalf of the requesting endpoint's host, so the
+// same tap warms this host's own cache and grants that host a consent window — a
+// repeat routed request inside it is approved silently; the approver's own endpoint
+// ids are cache keys only, never in the reply. Returns {"status": "approved",
+// "nonce", "endpoint"} on a live tap, {"status": "denied"} when declined, or
+// {"status": "unavailable"} when this host has no live session to prompt or its
+// keybag is locked. Mirrors the Python request_consent.
 func (d *Daemon) handleRequestConsent(ctx context.Context, params map[string]any) (any, error) {
 	browserID, err := stringParam(params, "browser")
 	if err != nil {
 		return nil, err
 	}
+	profile := optionalString(params, "profile", defaultProfile)
 	nonce, err := stringParam(params, "nonce")
 	if err != nil {
 		return nil, err
@@ -151,14 +158,12 @@ func (d *Daemon) handleRequestConsent(ctx context.Context, params map[string]any
 	if !live {
 		return map[string]any{"status": "unavailable"}, nil
 	}
-	b, err := cookie.Lookup(cookie.BrowserName(browserID))
-	if err != nil {
-		return nil, err
-	}
-	d.promptGate.Lock()
-	_, err = d.consent.ObtainKey(ctx, b, fmt.Sprintf("sync them to %s", endpoint))
-	d.promptGate.Unlock()
-	if err != nil {
+	host, _, _ := strings.Cut(endpoint, ":")
+	if _, err := d.primeAuth(ctx, "host:"+host, browserID, profile, fmt.Sprintf("sync them to %s", endpoint), releaseApprover); err != nil {
+		var authErr *AuthRequired
+		if errors.Is(err, cookie.ErrKeybagLocked) || errors.As(err, &authErr) {
+			return map[string]any{"status": "unavailable"}, nil
+		}
 		var declined *cookie.ConsentError
 		if errors.As(err, &declined) {
 			return map[string]any{"status": "denied"}, nil
