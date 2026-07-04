@@ -33,6 +33,11 @@ type Engine struct {
 	runner   SSHRunner
 	recorder cookie.Recorder
 
+	// status is the converge transition tracker: it lives for the resident helper's
+	// process life so an unreachable peer logs once per outage across passes rather
+	// than on every pass, and its recovery reports the outage duration.
+	status *converge.PeerStatus
+
 	// applyLocks serializes writes to one endpoint's local store: the daemon's apply
 	// handler and a converge pass's local applies hold the same per-endpoint mutex, so
 	// the anti-echo digest is always recorded against the store's final content.
@@ -41,7 +46,7 @@ type Engine struct {
 
 // New builds the sync engine over the state store and the injected collaborators.
 func New(store Store, cache KeyCache, runner SSHRunner, recorder cookie.Recorder) *Engine {
-	return &Engine{store: store, cache: cache, runner: runner, recorder: recorder}
+	return &Engine{store: store, cache: cache, runner: runner, recorder: recorder, status: converge.NewPeerStatus()}
 }
 
 // Recorder is the anti-echo ledger the engine records applied digests through; the
@@ -98,7 +103,7 @@ func (e *Engine) run(ctx context.Context, origin string) ([]Result, error) {
 		LockFor:     e.ApplyLock,
 	}
 	driver := NewDriver(e.store, self, deps)
-	items, err := converge.Reconcile(ctx, e.store.WithLock, driver, newFetcher(), peers, origin)
+	items, err := converge.Reconcile(ctx, e.store.WithLock, driver, newFetcher(), e.status, peers, origin)
 	if err != nil {
 		return nil, err
 	}

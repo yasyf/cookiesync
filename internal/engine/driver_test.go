@@ -181,7 +181,7 @@ func TestReconcilePassConvergesWarmLocalSkipsRemote(t *testing.T) {
 	}
 	driver := NewDriver(store, self, deps)
 
-	results, err := converge.Reconcile(ctx, store.WithLock, driver, fetcher, []string{peerHost}, "")
+	results, err := converge.Reconcile(ctx, store.WithLock, driver, fetcher, converge.NewPeerStatus(), []string{peerHost}, "")
 	if err != nil {
 		t.Fatalf("converge.Reconcile: %v", err)
 	}
@@ -240,7 +240,7 @@ func TestReconcileSkipsColdLocal(t *testing.T) {
 	}
 	driver := NewDriver(store, self, deps)
 
-	results, err := converge.Reconcile(ctx, store.WithLock, driver, &fakeFetcher{}, nil, "")
+	results, err := converge.Reconcile(ctx, store.WithLock, driver, &fakeFetcher{}, converge.NewPeerStatus(), nil, "")
 	if err != nil {
 		t.Fatalf("converge.Reconcile: %v", err)
 	}

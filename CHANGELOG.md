@@ -6,6 +6,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- Converge logs an unreachable peer once per outage instead of warning on every pass, and notes the
+  outage duration on recovery.
+
 ## [0.6.2] - 2026-06-27
 
 ### Added
