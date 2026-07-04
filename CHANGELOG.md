@@ -6,9 +6,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-07-03
+
 ### Changed
 - Converge logs an unreachable peer once per outage instead of warning on every pass, and notes the
   outage duration on recovery.
+- Bump synckit to v0.8.0 (from v0.7.1): ssh peer targets pin to tailscale MagicDNS FQDNs; after re-adding a host to the mesh, re-track that host's browser endpoints (cookiesync browser rm/add) so their registry keys carry the new host string.
 
 ## [0.6.2] - 2026-06-27
 
@@ -76,7 +79,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `synckitd install` now owns the agents. The host mesh is read from the shared
   `~/.config/synckit`.
 
-[Unreleased]: https://github.com/yasyf/cookiesync/compare/v0.6.2...HEAD
+[Unreleased]: https://github.com/yasyf/cookiesync/compare/v0.9.0...HEAD
+[0.9.0]: https://github.com/yasyf/cookiesync/releases/tag/v0.9.0
 [0.6.2]: https://github.com/yasyf/cookiesync/releases/tag/v0.6.2
 [0.6.1]: https://github.com/yasyf/cookiesync/releases/tag/v0.6.1
 [0.6.0]: https://github.com/yasyf/cookiesync/releases/tag/v0.6.0
