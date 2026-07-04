@@ -237,6 +237,7 @@ func (c *countingConsent) ObtainKeyUnprompted(_ context.Context, _ cookie.Browse
 // probed the cache and a TTL test can assert the effective derivation.
 type fakeCache struct {
 	degraded bool
+	getErr   error
 
 	mu      sync.Mutex
 	entries map[string][]byte
@@ -253,6 +254,9 @@ func (c *fakeCache) Get(_ context.Context, id string) ([]byte, bool, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.gets++
+	if c.getErr != nil {
+		return nil, false, c.getErr
+	}
 	key, ok := c.entries[id]
 	return key, ok, nil
 }

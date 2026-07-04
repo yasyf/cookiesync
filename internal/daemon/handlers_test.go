@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/yasyf/cookiesync/internal/cache"
 	"github.com/yasyf/cookiesync/internal/cookie"
 	"github.com/yasyf/cookiesync/internal/state"
 )
@@ -70,50 +71,157 @@ func TestHandleWhoamiWireShape(t *testing.T) {
 	}
 }
 
-// TestHandleAuthStatusWireShape proves auth_status reports cache warmth under the
-// frozen {"endpoint", "authenticated", "degraded"} shape: authenticated once a key is
-// cached for the endpoint, degraded while the cache is memory-wrapped.
+// TestHandleAuthStatusWireShape proves auth_status reports cache warmth, degradation, and
+// keybag availability under the frozen {"endpoint", "authenticated", "degraded", "locked"}
+// shape (alphabetical keys): authenticated once a key is cached, degraded over a
+// memory-wrapped cache, and locked whenever the daemon user's keybag is unavailable — the
+// screen locked, no console session, or another user on console via fast user switching.
+// The incident rows: a warm key whose cache-unwrap refuses (ErrSEPresenceUnavailable)
+// while the keybag is unavailable reports authenticated:false with no error, across a
+// locked screen, fast user switching, and a session-absent console alike.
 func TestHandleAuthStatusWireShape(t *testing.T) {
-	cache := newFakeCache()
-	st := stateWith("me@laptop", "")
 	fakeMesh(t, "me@laptop")
-	d := New(&fakeConsent{}, cache, nil, staticProbe(SessionSnapshot{}), &recordingRunner{}, fixedState{st: st}, fixedState{st: st})
+	st := stateWith("me@laptop", "")
 	id := endpointID("me@laptop", "chrome", "Default")
+	me := currentUser(t)
+	attended := liveSession(me)
+	lockedScreen := SessionSnapshot{OnConsole: true, Locked: true}
+	otherUser := SessionSnapshot{OnConsole: true, Locked: false, ConsoleUser: me + "-other"}
 
-	cold, err := d.handleAuthStatus(context.Background(), map[string]any{"browser": "chrome"})
-	if err != nil {
-		t.Fatalf("auth_status cold: %v", err)
+	tests := []struct {
+		name     string
+		warm     bool
+		degraded bool
+		getErr   error
+		snap     SessionSnapshot
+		want     string
+	}{
+		{
+			name: "attended cold healthy",
+			snap: attended,
+			want: `{"authenticated":false,"degraded":false,"endpoint":"me@laptop:chrome:Default","keybag_locked":false}`,
+		},
+		{
+			name: "attended warm healthy",
+			warm: true,
+			snap: attended,
+			want: `{"authenticated":true,"degraded":false,"endpoint":"me@laptop:chrome:Default","keybag_locked":false}`,
+		},
+		{
+			name:     "attended warm degraded",
+			warm:     true,
+			degraded: true,
+			snap:     attended,
+			want:     `{"authenticated":true,"degraded":true,"endpoint":"me@laptop:chrome:Default","keybag_locked":false}`,
+		},
+		{
+			name: "warm healthy locked screen",
+			warm: true,
+			snap: lockedScreen,
+			want: `{"authenticated":true,"degraded":false,"endpoint":"me@laptop:chrome:Default","keybag_locked":true}`,
+		},
+		{
+			name:     "degraded locked screen",
+			degraded: true,
+			snap:     lockedScreen,
+			want:     `{"authenticated":false,"degraded":true,"endpoint":"me@laptop:chrome:Default","keybag_locked":true}`,
+		},
+		{
+			name:   "locked screen unwrap refused reports unauthenticated without error",
+			warm:   true,
+			getErr: cache.ErrSEPresenceUnavailable,
+			snap:   lockedScreen,
+			want:   `{"authenticated":false,"degraded":false,"endpoint":"me@laptop:chrome:Default","keybag_locked":true}`,
+		},
+		{
+			name:   "fast user switching unwrap refused reports locked without error",
+			warm:   true,
+			getErr: cache.ErrSEPresenceUnavailable,
+			snap:   otherUser,
+			want:   `{"authenticated":false,"degraded":false,"endpoint":"me@laptop:chrome:Default","keybag_locked":true}`,
+		},
+		{
+			name:   "session-absent unwrap refused reports locked without error",
+			warm:   true,
+			getErr: cache.ErrSEPresenceUnavailable,
+			snap:   SessionSnapshot{},
+			want:   `{"authenticated":false,"degraded":false,"endpoint":"me@laptop:chrome:Default","keybag_locked":true}`,
+		},
 	}
-	if got := marshalResult(t, cold); got != `{"authenticated":false,"degraded":false,"endpoint":"me@laptop:chrome:Default"}` {
-		t.Fatalf("cold auth_status = %s", got)
-	}
-
-	_ = cache.Put(context.Background(), id, []byte("k"), 0)
-	warm, err := d.handleAuthStatus(context.Background(), map[string]any{"browser": "chrome", "profile": "Default"})
-	if err != nil {
-		t.Fatalf("auth_status warm: %v", err)
-	}
-	if got := marshalResult(t, warm); got != `{"authenticated":true,"degraded":false,"endpoint":"me@laptop:chrome:Default"}` {
-		t.Fatalf("warm auth_status = %s", got)
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			c := newFakeCache()
+			c.degraded = tc.degraded
+			c.getErr = tc.getErr
+			if tc.warm {
+				_ = c.Put(context.Background(), id, []byte("k"), 0)
+			}
+			d := New(&fakeConsent{}, c, nil, staticProbe(tc.snap), &recordingRunner{}, fixedState{st: st}, fixedState{st: st})
+			got, err := d.handleAuthStatus(context.Background(), map[string]any{"browser": "chrome"})
+			if err != nil {
+				t.Fatalf("handleAuthStatus: %v", err)
+			}
+			if marshalResult(t, got) != tc.want {
+				t.Fatalf("auth_status = %s, want %s", marshalResult(t, got), tc.want)
+			}
+		})
 	}
 }
 
-// TestHandleAuthStatusReportsDegradedCache proves auth_status surfaces the cache's
-// degradation state: degraded=true over a memory-wrapped cache, independent of warmth.
-func TestHandleAuthStatusReportsDegradedCache(t *testing.T) {
-	cache := newFakeCache()
-	cache.degraded = true
-	st := stateWith("me@laptop", "")
+// TestHandleAuthStatusPropagatesGetErrors proves the swallow is narrow: only a presence
+// refusal while the keybag is unavailable is reported as unauthenticated. A presence
+// sentinel on an attended console (this user, unlocked — a genuinely broken key) and any
+// non-presence error while locked both propagate raw.
+func TestHandleAuthStatusPropagatesGetErrors(t *testing.T) {
 	fakeMesh(t, "me@laptop")
-	d := New(&fakeConsent{}, cache, nil, staticProbe(SessionSnapshot{}), &recordingRunner{}, fixedState{st: st}, fixedState{st: st})
-	_ = cache.Put(context.Background(), endpointID("me@laptop", "chrome", "Default"), []byte("k"), 0)
+	st := stateWith("me@laptop", "")
+	me := currentUser(t)
+	plain := errors.New("cache-unwrap exited 1 (key missing or decrypt failed): boom")
+
+	tests := []struct {
+		name   string
+		getErr error
+		snap   SessionSnapshot
+	}{
+		{
+			name:   "presence sentinel while attended propagates",
+			getErr: cache.ErrSEPresenceUnavailable,
+			snap:   liveSession(me),
+		},
+		{
+			name:   "plain error while locked propagates",
+			getErr: plain,
+			snap:   SessionSnapshot{OnConsole: true, Locked: true},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			c := newFakeCache()
+			c.getErr = tc.getErr
+			d := New(&fakeConsent{}, c, nil, staticProbe(tc.snap), &recordingRunner{}, fixedState{st: st}, fixedState{st: st})
+			_, err := d.handleAuthStatus(context.Background(), map[string]any{"browser": "chrome"})
+			if !errors.Is(err, tc.getErr) {
+				t.Fatalf("handleAuthStatus err = %v, want it to carry %v", err, tc.getErr)
+			}
+		})
+	}
+}
+
+// TestHandleAuthStatusPropagatesProbeError proves a session-probe failure fails the whole
+// call loudly, with no reply, rather than defaulting the keybag state.
+func TestHandleAuthStatusPropagatesProbeError(t *testing.T) {
+	fakeMesh(t, "me@laptop")
+	st := stateWith("me@laptop", "")
+	probeErr := errors.New("run ioreg: boom")
+	probe := func(context.Context) (SessionSnapshot, error) { return SessionSnapshot{}, probeErr }
+	d := New(&fakeConsent{}, newFakeCache(), nil, probe, &recordingRunner{}, fixedState{st: st}, fixedState{st: st})
 
 	got, err := d.handleAuthStatus(context.Background(), map[string]any{"browser": "chrome"})
-	if err != nil {
-		t.Fatalf("auth_status degraded: %v", err)
+	if !errors.Is(err, probeErr) {
+		t.Fatalf("handleAuthStatus err = %v, want it to carry the probe error %v", err, probeErr)
 	}
-	if marshalResult(t, got) != `{"authenticated":true,"degraded":true,"endpoint":"me@laptop:chrome:Default"}` {
-		t.Fatalf("degraded auth_status = %s", marshalResult(t, got))
+	if got != nil {
+		t.Fatalf("handleAuthStatus returned a reply %v alongside the probe error", got)
 	}
 }
 

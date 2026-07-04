@@ -218,6 +218,85 @@ func TestOpenWrapperFailsLoudOnExitTwoWithHelperStderr(t *testing.T) {
 	}
 }
 
+// writeUnwrapRefusingHelper writes a fake cookiesync-keyhelper that opens and wraps
+// cleanly — cache-newkey and cache-wrap succeed, so the cache opens Enclave-backed and a
+// Put stores a wrapped blob — but whose cache-unwrap prints diagnostic to stderr and
+// exits with code: the live "keybag locked after open" surface a warm key hits on Get.
+func writeUnwrapRefusingHelper(t *testing.T, code int, diagnostic string) string {
+	t.Helper()
+	binary := filepath.Join(t.TempDir(), "cookiesync-keyhelper")
+	body := `#!/bin/sh
+case "$1" in
+cache-newkey|cache-dropkey)
+  exit 0
+  ;;
+cache-wrap)
+  exec /usr/bin/perl -0777 -pe 's/(.)/chr(ord($1)^0x5A)/ges'
+  ;;
+cache-unwrap)
+  printf '%s\n' "` + diagnostic + `" >&2
+  exit ` + strconv.Itoa(code) + `
+  ;;
+*)
+  echo "unexpected verb $1" >&2
+  exit 99
+  ;;
+esac
+`
+	if err := os.WriteFile(binary, []byte(body), 0o755); err != nil { //nolint:gosec // test fixture script must be executable.
+		t.Fatalf("write unwrap-refusing helper: %v", err)
+	}
+	return binary
+}
+
+// TestSecureEnclaveWrapperUnwrapTagsLockedKeybag proves a live cache-unwrap refusal tags
+// the presence sentinel only on exit 3 (keybag locked): the Get error errors.Is
+// ErrSEPresenceUnavailable there and carries the helper stderr, while a sibling exit 1
+// (key missing / decrypt failed) stays an untagged loud failure.
+func TestSecureEnclaveWrapperUnwrapTagsLockedKeybag(t *testing.T) {
+	tests := []struct {
+		name         string
+		code         int
+		diagnostic   string
+		wantSentinel bool
+	}{
+		{
+			name:         "exit 3 locked keybag is the sentinel",
+			code:         3,
+			diagnostic:   "keyhelper: SecKeyCreateDecryptedData failed: interaction not allowed (OSStatus -25308)",
+			wantSentinel: true,
+		},
+		{
+			name:         "exit 1 decrypt failure is not the sentinel",
+			code:         1,
+			diagnostic:   "keyhelper: SecKeyCreateDecryptedData failed: key missing or decrypt failed (OSStatus -50)",
+			wantSentinel: false,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			wrapper, err := OpenWrapper(ctx, helper.Bridge{Binary: writeUnwrapRefusingHelper(t, tc.code, tc.diagnostic)})
+			if err != nil {
+				t.Fatalf("OpenWrapper: %v", err)
+			}
+			c := NewKeyCache(wrapper)
+			if err := c.Put(ctx, endpoint, testKey(), 30*time.Second); err != nil {
+				t.Fatalf("Put: %v", err)
+			}
+			if _, _, err = c.Get(ctx, endpoint); err == nil {
+				t.Fatalf("Get succeeded, want the cache-unwrap refusal")
+			}
+			if got := errors.Is(err, ErrSEPresenceUnavailable); got != tc.wantSentinel {
+				t.Fatalf("errors.Is(err, ErrSEPresenceUnavailable) = %v, want %v (err = %v)", got, tc.wantSentinel, err)
+			}
+			if !strings.Contains(err.Error(), tc.diagnostic) {
+				t.Fatalf("err = %q, want it to carry the helper stderr %q", err, tc.diagnostic)
+			}
+		})
+	}
+}
+
 // writeHealingHelper writes a fake cookiesync-keyhelper whose cache-newkey exits 3
 // (presence unavailable) for its first exit3 invocations — counted in a sidecar
 // file — and thenCode afterwards (0 heals, anything else refuses). Every verb is

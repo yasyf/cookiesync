@@ -153,6 +153,19 @@ func HasActiveSession(ctx context.Context, probe Probe) (bool, error) {
 	return snapshot.OnConsole && !snapshot.Locked && snapshot.ConsoleUser == me.Username && !snapshot.ScreenShared, nil
 }
 
+// keybagLocked reports whether the data-protection keybag is unavailable to the daemon
+// user: the console screen is locked, headless (no GUI session), or held by another user
+// via fast user switching. Unlike HasActiveSession it ignores ScreenShared — a mirrored
+// unlocked session still decrypts, so screen-share bears on consent routing, not keybag
+// availability.
+func keybagLocked(snapshot SessionSnapshot) (bool, error) {
+	me, err := user.Current()
+	if err != nil {
+		return false, fmt.Errorf("resolve current user: %w", err)
+	}
+	return snapshot.Locked || !snapshot.OnConsole || snapshot.ConsoleUser != me.Username, nil
+}
+
 // sessionSummary is this host's console session state shaped for the whoami RPC,
 // byte-for-byte the Python session_summary: {"on_console", "locked", "console_user"}.
 // console_user is null (a nil any) when no GUI session is attached.

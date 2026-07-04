@@ -13,8 +13,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/yasyf/cookiesync/internal/cache"
 	"github.com/yasyf/cookiesync/internal/cookie"
 	"github.com/yasyf/cookiesync/internal/engine"
+	"github.com/yasyf/cookiesync/internal/helper"
 	"github.com/yasyf/cookiesync/internal/paths"
 	synckit "github.com/yasyf/synckit/rpc"
 )
@@ -187,6 +189,69 @@ func TestBuildNoEnclaveStaysFatal(t *testing.T) {
 	if d != nil || closer != nil {
 		t.Fatalf("a fatal Build must return no daemon")
 	}
+}
+
+// TestHandleAuthStatusLockedUnwrapRefusalReportsLocked reproduces the live incident over
+// the real cache: the daemon opens the Enclave key and caches a wrapped key while
+// unlocked, then the screen locks and cache-unwrap refuses the per-boot key (exit 3,
+// errSecInteractionNotAllowed). auth_status must return the structured locked reply —
+// authenticated:false, degraded:false (the cache opened healthy), locked:true — not
+// propagate the refusal as an RPC error the doctor would render FAIL.
+func TestHandleAuthStatusLockedUnwrapRefusalReportsLocked(t *testing.T) {
+	fakeMesh(t, "me@laptop")
+	binary := writeUnwrapRefusingHelper(t, 3, "keyhelper: SecKeyCreateDecryptedData failed: interaction not allowed (OSStatus -25308)")
+	ctx := context.Background()
+
+	wrapper, err := cache.OpenWrapper(ctx, helper.Bridge{Binary: binary})
+	if err != nil {
+		t.Fatalf("OpenWrapper: %v", err)
+	}
+	keyCache := cache.NewKeyCache(wrapper)
+	st := stateWith("me@laptop", "")
+	d := New(&fakeConsent{}, keyCache, nil, staticProbe(SessionSnapshot{OnConsole: true, Locked: true}), &recordingRunner{}, fixedState{st: st}, fixedState{st: st})
+
+	id := endpointID("me@laptop", "chrome", "Default")
+	if err := keyCache.Put(ctx, id, []byte("safe-storage-key"), 5*time.Minute); err != nil {
+		t.Fatalf("Put a wrapped key while unlocked: %v", err)
+	}
+
+	got, err := d.handleAuthStatus(ctx, map[string]any{"browser": "chrome"})
+	if err != nil {
+		t.Fatalf("handleAuthStatus must swallow the locked-keybag refusal, got %v", err)
+	}
+	if marshalResult(t, got) != `{"authenticated":false,"degraded":false,"endpoint":"me@laptop:chrome:Default","keybag_locked":true}` {
+		t.Fatalf("auth_status = %s, want the structured locked reply", marshalResult(t, got))
+	}
+}
+
+// writeUnwrapRefusingHelper writes a fake cookiesync-keyhelper that opens and wraps
+// cleanly — cache-newkey and cache-wrap succeed — but whose cache-unwrap prints
+// diagnostic to stderr and exits with code, the "keybag locked after open" surface.
+func writeUnwrapRefusingHelper(t *testing.T, code int, diagnostic string) string {
+	t.Helper()
+	binary := filepath.Join(t.TempDir(), "cookiesync-keyhelper")
+	body := `#!/bin/sh
+case "$1" in
+cache-newkey|cache-dropkey)
+  exit 0
+  ;;
+cache-wrap)
+  exec /usr/bin/perl -0777 -pe 's/(.)/chr(ord($1)^0x5A)/ges'
+  ;;
+cache-unwrap)
+  printf '%s\n' "` + diagnostic + `" >&2
+  exit ` + fmt.Sprintf("%d", code) + `
+  ;;
+*)
+  echo "unexpected verb $1" >&2
+  exit 99
+  ;;
+esac
+`
+	if err := os.WriteFile(binary, []byte(body), 0o755); err != nil { //nolint:gosec // test fixture script must be executable.
+		t.Fatalf("write unwrap-refusing helper: %v", err)
+	}
+	return binary
 }
 
 // TestConvergeMethodsShareOneExclusiveMutex proves every method that runs the

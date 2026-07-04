@@ -84,6 +84,58 @@ func TestDoctorFailingCheckExitsNonZero(t *testing.T) {
 	}
 }
 
+// TestKeyCacheCheckRendersEveryDaemonState proves keyCacheCheck maps the daemon's
+// degradation and screen-lock flags to the exact doctor line: a locked screen is OK
+// (unavailable until unlock, or an in-memory degradation that re-primes after unlock),
+// and only a degradation while unlocked is a FAIL.
+func TestKeyCacheCheckRendersEveryDaemonState(t *testing.T) {
+	tests := []struct {
+		name       string
+		status     keyCacheStatus
+		wantOK     bool
+		wantDetail string
+	}{
+		{
+			name:       "healthy",
+			status:     keyCacheStatus{Degraded: false, Locked: false},
+			wantOK:     true,
+			wantDetail: "Secure-Enclave wrapped",
+		},
+		{
+			name:       "healthy keybag-locked",
+			status:     keyCacheStatus{Degraded: false, Locked: true},
+			wantOK:     true,
+			wantDetail: "Secure-Enclave wrapped (keybag locked: screen locked or session away)",
+		},
+		{
+			name:       "degraded keybag-locked",
+			status:     keyCacheStatus{Degraded: true, Locked: true},
+			wantOK:     true,
+			wantDetail: "in process memory (keybag locked at daemon start; re-primes Secure-Enclave wrapped on the first prime after it unlocks)",
+		},
+		{
+			name:       "degraded unlocked",
+			status:     keyCacheStatus{Degraded: true, Locked: false},
+			wantOK:     false,
+			wantDetail: "degraded: Secure Enclave presence was unavailable at daemon start; run 'cookiesync auth' to re-prime",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := keyCacheCheck(tc.status)
+			if got.label != "key cache" {
+				t.Fatalf("label = %q, want key cache", got.label)
+			}
+			if got.ok != tc.wantOK {
+				t.Fatalf("ok = %v, want %v", got.ok, tc.wantOK)
+			}
+			if got.detail != tc.wantDetail {
+				t.Fatalf("detail = %q, want %q", got.detail, tc.wantDetail)
+			}
+		})
+	}
+}
+
 // TestInstallWritesManifest proves install emits the frozen lines and writes a valid
 // synckit manifest with the cookiesync action contract, against a temp config home.
 func TestInstallWritesManifest(t *testing.T) {

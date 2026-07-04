@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/yasyf/cookiesync/internal/cache"
 	"github.com/yasyf/cookiesync/internal/cookie"
 	"github.com/yasyf/cookiesync/internal/engine"
 	"github.com/yasyf/cookiesync/internal/state"
@@ -323,10 +324,14 @@ func (d *Daemon) primeAuthAll(ctx context.Context, requestor, reason string) (ma
 	return reply, nil
 }
 
-// handleAuthStatus reports whether the endpoint's key is warm in the cache and whether
-// the cache is degraded to process memory (Secure Enclave presence unavailable at
-// open, not yet healed by a Put), the frozen {"endpoint", "authenticated", "degraded"}
-// shape.
+// handleAuthStatus reports whether the endpoint's key is warm in the cache, whether the
+// cache is degraded to process memory (Secure Enclave presence unavailable at open, not
+// yet healed by a Put), and whether the daemon user's keybag is unavailable — the console
+// session locked, absent, or held by another user via fast user switching — the frozen
+// {"endpoint", "authenticated", "degraded", "keybag_locked"} shape. A locked keybag makes a live
+// cache-unwrap refuse the per-boot key (ErrSEPresenceUnavailable); that one error is
+// swallowed as authenticated:false rather than a raw RPC failure, since the key is simply
+// unservable until unlock. Any other Get error still propagates.
 func (d *Daemon) handleAuthStatus(ctx context.Context, params map[string]any) (any, error) {
 	browser, err := stringParam(params, "browser")
 	if err != nil {
@@ -337,12 +342,21 @@ func (d *Daemon) handleAuthStatus(ctx context.Context, params map[string]any) (a
 	if err != nil {
 		return nil, err
 	}
-	id := endpointID(self, browser, profile)
-	_, ok, err := d.cache.Get(ctx, id)
+	snap, err := d.probe(ctx)
 	if err != nil {
 		return nil, err
 	}
-	return map[string]any{"endpoint": id, "authenticated": ok, "degraded": d.cache.Degraded()}, nil
+	locked, err := keybagLocked(snap)
+	if err != nil {
+		return nil, err
+	}
+	id := endpointID(self, browser, profile)
+	_, ok, err := d.cache.Get(ctx, id)
+	lockedRefusal := locked && errors.Is(err, cache.ErrSEPresenceUnavailable)
+	if err != nil && !lockedRefusal {
+		return nil, err
+	}
+	return map[string]any{"endpoint": id, "authenticated": ok, "degraded": d.cache.Degraded(), "keybag_locked": locked}, nil
 }
 
 // handleGetCookies renders cookies for one or more urls, merged into one set. With a

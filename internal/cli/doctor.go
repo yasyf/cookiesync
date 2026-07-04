@@ -143,24 +143,45 @@ func checkSocket(ctx context.Context) check {
 	return check{label: "helper socket", ok: true, detail: fmt.Sprintf("%s (svc protocol v%d)", sock, caps.ProtocolVersion)}
 }
 
-// checkKeyCache confirms the resident daemon's key cache is Secure-Enclave wrapped,
-// not degraded to plain process memory because the keybag was locked when the daemon
-// started. The degraded flag is cache-global, so the probe reads it off auth_status
-// for the default chrome endpoint — the endpoint itself is immaterial. Degradation
-// self-heals on the next prime once the screen unlocks.
+// keyCacheStatus is the slice of the auth_status reply the key-cache check reads: the
+// cache-global degradation flag and whether the daemon user's keybag is unavailable
+// (screen locked, session absent, or held by another user). A locked keybag makes an
+// in-memory degradation and an Enclave unavailability expected, healthy states.
+type keyCacheStatus struct {
+	Degraded bool `json:"degraded"`
+	Locked   bool `json:"keybag_locked"`
+}
+
+// checkKeyCache confirms the resident daemon's key cache is Secure-Enclave wrapped, not
+// degraded to plain process memory because the keybag was locked when the daemon started.
+// The flags are cache-global, so the probe reads them off auth_status for the default
+// chrome endpoint — the endpoint itself is immaterial — and keyCacheCheck renders them.
 func checkKeyCache(ctx context.Context) check {
 	probeCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
-	var status struct {
-		Degraded bool `json:"degraded"`
-	}
+	var status keyCacheStatus
 	if err := rpc.CallJSON(probeCtx, "auth_status", map[string]any{"browser": "chrome"}, &status); err != nil {
 		return check{label: "key cache", detail: fmt.Sprintf("auth_status probe failed: %v", err)}
 	}
-	if status.Degraded {
-		return check{label: "key cache", detail: "degraded: Secure Enclave presence was unavailable at daemon start; cached keys live in process memory until a prime after the screen unlocks"}
+	return keyCacheCheck(status)
+}
+
+// keyCacheCheck renders the key-cache health line from the daemon's degradation and
+// keybag-availability flags. A locked keybag is a healthy state: an Enclave wrap that is
+// unavailable until it unlocks, or an in-memory degradation that re-primes Enclave-wrapped
+// on the first prime after it unlocks. Only a degradation while the keybag is available is
+// a genuine FAIL.
+func keyCacheCheck(status keyCacheStatus) check {
+	switch {
+	case status.Degraded && status.Locked:
+		return check{label: "key cache", ok: true, detail: "in process memory (keybag locked at daemon start; re-primes Secure-Enclave wrapped on the first prime after it unlocks)"}
+	case status.Degraded:
+		return check{label: "key cache", detail: "degraded: Secure Enclave presence was unavailable at daemon start; run 'cookiesync auth' to re-prime"}
+	case status.Locked:
+		return check{label: "key cache", ok: true, detail: "Secure-Enclave wrapped (keybag locked: screen locked or session away)"}
+	default:
+		return check{label: "key cache", ok: true, detail: "Secure-Enclave wrapped"}
 	}
-	return check{label: "key cache", ok: true, detail: "Secure-Enclave wrapped"}
 }
 
 // checkMesh confirms this host has joined the synckit host mesh — that the shared

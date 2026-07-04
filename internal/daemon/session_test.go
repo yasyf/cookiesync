@@ -206,3 +206,36 @@ func TestHasActiveSessionScreenShareWins(t *testing.T) {
 		t.Fatalf("a screen-shared host must NOT be a live local session (screen-share wins)")
 	}
 }
+
+// TestKeybagLocked proves keybagLocked scopes to the daemon user's own unlocked console:
+// an attended session is available, but a locked screen, a console held by another user via
+// fast user switching, and a session-absent box are all keybag-locked. Unlike
+// HasActiveSession it ignores ScreenShared — a mirrored unlocked session still decrypts.
+func TestKeybagLocked(t *testing.T) {
+	me := currentUser(t)
+	attendedShared := liveSession(me)
+	attendedShared.ScreenShared = true
+
+	tests := []struct {
+		name string
+		snap SessionSnapshot
+		want bool
+	}{
+		{"attended", liveSession(me), false},
+		{"attended while screen-shared", attendedShared, false},
+		{"locked screen", SessionSnapshot{OnConsole: true, Locked: true, ConsoleUser: me}, true},
+		{"another user via fast user switching", SessionSnapshot{OnConsole: true, Locked: false, ConsoleUser: me + "-other"}, true},
+		{"session absent", SessionSnapshot{}, true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := keybagLocked(tc.snap)
+			if err != nil {
+				t.Fatalf("keybagLocked: %v", err)
+			}
+			if got != tc.want {
+				t.Fatalf("keybagLocked(%+v) = %v, want %v", tc.snap, got, tc.want)
+			}
+		})
+	}
+}

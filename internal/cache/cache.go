@@ -30,10 +30,11 @@ import (
 	"github.com/yasyf/cookiesync/internal/helper"
 )
 
-// ErrSEPresenceUnavailable reports that the Secure Enclave refused the per-boot key
-// because the data-protection keybag is locked (screen locked / no user present).
-// OpenWrapper returns it alongside a degraded in-memory wrapper: callers log the
-// degradation and proceed, or fail as usual on any other error.
+// ErrSEPresenceUnavailable reports that the Secure Enclave refused a per-boot key
+// operation because the data-protection keybag is locked (screen locked / no user
+// present). OpenWrapper returns it alongside a degraded in-memory wrapper at open;
+// SecureEnclaveWrapper.Wrap and Unwrap return it when the keybag locks after open. Any
+// other non-zero exit fails loud.
 var ErrSEPresenceUnavailable = errors.New("secure-enclave presence unavailable")
 
 // Wrapper wraps and unwraps key bytes so the at-rest cache value is opaque off-box.
@@ -112,11 +113,16 @@ func (w *SecureEnclaveWrapper) Wrap(ctx context.Context, plaintext []byte) ([]by
 	if err != nil {
 		return nil, err
 	}
-	if result.Code != 0 {
+	switch result.Code {
+	case 0:
+		return result.Stdout, nil
+	case helper.CodePresenceUnavailable:
+		return nil, fmt.Errorf("cache-wrap exited %d (%s): %w",
+			result.Code, bytes.TrimSpace(result.Stderr), ErrSEPresenceUnavailable)
+	default:
 		return nil, fmt.Errorf("cache-wrap exited %d (key missing or encrypt failed): %s",
 			result.Code, bytes.TrimSpace(result.Stderr))
 	}
-	return result.Stdout, nil
 }
 
 // Unwrap ECIES-decrypts blob with the Enclave key and returns the plaintext.
@@ -125,11 +131,16 @@ func (w *SecureEnclaveWrapper) Unwrap(ctx context.Context, blob []byte) ([]byte,
 	if err != nil {
 		return nil, err
 	}
-	if result.Code != 0 {
+	switch result.Code {
+	case 0:
+		return result.Stdout, nil
+	case helper.CodePresenceUnavailable:
+		return nil, fmt.Errorf("cache-unwrap exited %d (%s): %w",
+			result.Code, bytes.TrimSpace(result.Stderr), ErrSEPresenceUnavailable)
+	default:
 		return nil, fmt.Errorf("cache-unwrap exited %d (key missing or decrypt failed): %s",
 			result.Code, bytes.TrimSpace(result.Stderr))
 	}
-	return result.Stdout, nil
 }
 
 // Close drops the per-boot Enclave key via cache-dropkey. It is idempotent: the
