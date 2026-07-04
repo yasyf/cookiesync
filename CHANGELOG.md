@@ -13,6 +13,78 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   outage duration on recovery.
 - Bump synckit to v0.8.0 (from v0.7.1): ssh peer targets pin to tailscale MagicDNS FQDNs; after re-adding a host to the mesh, re-track that host's browser endpoints (cookiesync browser rm/add) so their registry keys carry the new host string.
 
+## [0.8.3] - 2026-07-03
+
+### Fixed
+- `cookiesync doctor` treats a locked keybag as healthy instead of reporting a key-cache FAIL. A
+  locked or away user session makes the live auth probe refuse, which rendered as a raw FAIL on a
+  perfectly healthy machine; doctor now renders that row OK with a note and keeps
+  degraded-while-available as the one genuine FAIL.
+
+## [0.8.2] - 2026-07-03
+
+### Added
+- A stable consent requestor derived from agent-session env vars. `COOKIESYNC_REQUESTOR` wins when
+  set, else `CLAUDE_CODE_SESSION_ID`; the token rides every grant-gated call so one agent session
+  reuses its grant instead of re-tapping Touch ID on every invocation.
+
+## [0.8.1] - 2026-07-03
+
+### Added
+- Browser-less `cookiesync cookies` unions every registered endpoint. Local browsers serve from a
+  warm grant or ride a single consent sheet, remote endpoints stream over ssh, and cold or
+  unreachable ones are skipped with a warning. Browser-less `cookiesync auth` primes all local
+  browsers in one batch flight, and the new `cookie.MergeRanked` settles union conflicts
+  newest-first, preferring the local machine on a tie.
+
+### Changed
+- Bump synckit to v0.7.1, pulling the fix for the transport crash on a stale exchange after a
+  converge peer timeout.
+- The cookie payload now streams to stdout while warnings ride stderr; `--profile` without
+  `--browser` fails fast, and the implicit chrome default is dropped.
+
+### Fixed
+- Three consent holes in the union fan-out are closed. A browser-less read against a cold peer no
+  longer bounces a Touch ID sheet back to the calling Mac and routes per that peer's own config
+  instead of failing closed, every release path now derives routing through the one shared rule so
+  `ConsentRouteHard` is honored everywhere and a mid-call presence flip can never fire a second
+  sheet or mix consent surfaces, and the ssh leg fences untrusted URLs behind `--` so a URL
+  spelled like a flag can't defeat the recursion guard.
+
+## [0.8.0] - 2026-07-03
+
+### Added
+- One Touch ID tap now covers every tracked browser. Each browser's Safe Storage key
+  batch-releases under a single LAContext, and grants are keyed per requesting principal with a
+  mode-dependent TTL of 1h under the Secure Enclave and 5m degraded. Requires synckit v0.7.0.
+
+### Fixed
+- The blank auth sheet caused by the bare-ACL vault probe.
+
+## [0.7.0] - 2026-07-02
+
+### Fixed
+- Screen-shared and locked hosts no longer deadlock convergence, via synckit v0.6.0's concurrent
+  RPC dispatch plus per-endpoint apply locks, a singleflight around `primeAuth`, a prompt gate so
+  cold primes never stack two Touch ID sheets, and real deadlines on remote calls. A daemon whose
+  keybag is unavailable at start now falls back to a RAM-only key cache instead of crash-looping.
+  The degradation is loud, with a WARN at startup, a degraded flag on `auth_status`, and a doctor
+  line, and the cache swaps back to the Secure Enclave once the keybag returns.
+
+## [0.6.4] - 2026-07-01
+
+### Changed
+- Release pipeline only. The CLI and keyhelper now ship through the shared signed/notarized cask
+  release workflows.
+
+## [0.6.3] - 2026-07-01
+
+### Added
+- Consent routes to the present human when a host is Screen Shared. An inbound Screen Sharing
+  session now folds into `SessionSnapshot.ScreenShared`, so a shared but unattended host stops
+  prompting Touch ID locally and routes the gate to a live peer. `route-consent <target> --hard`
+  forces a deterministic redirect independent of presence.
+
 ## [0.6.2] - 2026-06-27
 
 ### Added
@@ -81,6 +153,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 [Unreleased]: https://github.com/yasyf/cookiesync/compare/v0.9.0...HEAD
 [0.9.0]: https://github.com/yasyf/cookiesync/releases/tag/v0.9.0
+[0.8.3]: https://github.com/yasyf/cookiesync/releases/tag/v0.8.3
+[0.8.2]: https://github.com/yasyf/cookiesync/releases/tag/v0.8.2
+[0.8.1]: https://github.com/yasyf/cookiesync/releases/tag/v0.8.1
+[0.8.0]: https://github.com/yasyf/cookiesync/releases/tag/v0.8.0
+[0.7.0]: https://github.com/yasyf/cookiesync/releases/tag/v0.7.0
+[0.6.4]: https://github.com/yasyf/cookiesync/releases/tag/v0.6.4
+[0.6.3]: https://github.com/yasyf/cookiesync/releases/tag/v0.6.3
 [0.6.2]: https://github.com/yasyf/cookiesync/releases/tag/v0.6.2
 [0.6.1]: https://github.com/yasyf/cookiesync/releases/tag/v0.6.1
 [0.6.0]: https://github.com/yasyf/cookiesync/releases/tag/v0.6.0
