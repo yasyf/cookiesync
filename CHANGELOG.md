@@ -6,6 +6,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-07-08
+
+### Added
+- Web-storage capture. `cookiesync cookies` now reads each origin's localStorage and sessionStorage
+  from the browser's LevelDB stores alongside cookies, so localStorage-auth sites (whose login token
+  lives in localStorage, not a cookie) drive logged-in in `agent-browser` sessions. `--format
+  playwright` emits the storageState `origins[]` with localStorage; a new `--format webstorage`
+  sidecar carries both localStorage and sessionStorage (Playwright storageState has no sessionStorage
+  slot). A new local-only `get_web_storage` RPC rides the same consent grant as cookies (no extra
+  Touch ID tap) and discards the key, since web storage is unencrypted at rest. IndexedDB is not
+  captured — its LevelDB uses a custom comparator and V8-serialized values.
+- `cookiesync requestor` prints the stable requestor token — the identity that keys grant reuse —
+  so external tools can scope per-session state to this caller. Falls back to a `pid-<ppid>` token
+  outside a recognized agent session.
+
 ## [0.9.0] - 2026-07-03
 
 ### Changed

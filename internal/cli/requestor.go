@@ -1,8 +1,11 @@
 package cli
 
 import (
+	"fmt"
 	"os"
 	"strings"
+
+	"github.com/spf13/cobra"
 )
 
 const requestorEnv = "COOKIESYNC_REQUESTOR"
@@ -43,4 +46,28 @@ func shortRef(id string) string {
 		before = before[:8]
 	}
 	return before
+}
+
+// requestorToken is resolveRequestor with a never-empty tail: outside a recognized
+// agent session it falls back to the parent process id, so callers that key durable
+// state on the token (e.g. a per-session cloud browser) always get a value.
+func requestorToken() string {
+	if r, ok := resolveRequestor(); ok {
+		return r
+	}
+	return fmt.Sprintf("pid-%d", os.Getppid())
+}
+
+// newRequestorCmd prints the stable requestor token — the same identity that keys
+// grant reuse — so external tools can scope per-session state to this caller.
+func newRequestorCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "requestor",
+		Short: "Print the stable requestor token for this session (grant-reuse identity).",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			cmd.Println(requestorToken())
+			return nil
+		},
+	}
 }

@@ -61,6 +61,7 @@ func newRoot(version string) *cobra.Command {
 		newCookiesCmd(),
 		newRouteConsentCmd(),
 		newSelfCmd(),
+		newRequestorCmd(),
 		newRPCCmd(),
 		newRPCServeCmd(),
 		newHelperServeCmd(),

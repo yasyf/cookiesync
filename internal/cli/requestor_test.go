@@ -1,6 +1,11 @@
 package cli
 
-import "testing"
+import (
+	"fmt"
+	"os"
+	"strings"
+	"testing"
+)
 
 // TestResolveRequestor proves the stable-requestor derivation. Every case sets both
 // resolver-read env vars so the ambient CLAUDE_CODE_SESSION_ID never leaks in.
@@ -65,6 +70,30 @@ func TestResolveRequestorPrefersNameEnv(t *testing.T) {
 	if ref != "Test Agent · friendly" || !ok {
 		t.Fatalf("resolveRequestor() = %q, %v, want %q, true", ref, ok, "Test Agent · friendly")
 	}
+}
+
+// TestRequestorToken proves the never-empty tail: a resolved requestor passes through,
+// and an unrecognized session falls back to a non-empty pid token.
+func TestRequestorToken(t *testing.T) {
+	t.Run("resolved requestor passes through", func(t *testing.T) {
+		t.Setenv(requestorEnv, "my-own-token")
+		t.Setenv("CLAUDE_CODE_SESSION_ID", "")
+		if got := requestorToken(); got != "my-own-token" {
+			t.Fatalf("requestorToken() = %q, want %q", got, "my-own-token")
+		}
+	})
+	t.Run("unrecognized session falls back to a non-empty pid token", func(t *testing.T) {
+		t.Setenv(requestorEnv, "")
+		t.Setenv("CLAUDE_CODE_SESSION_ID", "")
+		want := fmt.Sprintf("pid-%d", os.Getppid())
+		got := requestorToken()
+		if got != want {
+			t.Fatalf("requestorToken() = %q, want %q", got, want)
+		}
+		if strings.TrimSpace(got) == "" {
+			t.Fatal("requestorToken() must never be empty")
+		}
+	})
 }
 
 // TestShortRef proves the id-to-reference reduction over UUID, sub-eight, and
