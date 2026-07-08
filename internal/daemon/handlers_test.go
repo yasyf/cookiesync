@@ -388,6 +388,69 @@ func TestHandleGetCookiesColdCacheFailsClosed(t *testing.T) {
 	}
 }
 
+// TestHandleGetWebStorageNoLocalBrowsersFailsClosed proves get_web_storage is the
+// local-only backstop: with no tracked local browser it fails closed with AuthRequired
+// rather than serving an empty document.
+func TestHandleGetWebStorageNoLocalBrowsersFailsClosed(t *testing.T) {
+	fakeMesh(t, "me@laptop")
+	d := New(&fakeConsent{}, newFakeCache(), nil, staticProbe(liveSession(currentUser(t))), &recordingRunner{}, fixedState{st: stateWith("me@laptop", "")}, fixedState{st: stateWith("me@laptop", "")})
+
+	_, err := d.handleGetWebStorage(context.Background(), map[string]any{"url": "https://x.com"})
+	var authErr *AuthRequired
+	if !errors.As(err, &authErr) {
+		t.Fatalf("get_web_storage with no local browsers = %v, want *AuthRequired", err)
+	}
+}
+
+// TestHandleGetWebStorageColdUnattendedReturnsNoStorage proves the consent gate: on a
+// cold, unattended host with no live peer, get_web_storage releases nothing, reads no
+// storage (the prime fails before ExtractWebStorage), and returns an empty origins set
+// with a skip warning — never leaking web storage without consent, and never prompting
+// Touch ID on an unattended host (an unattended release routes, it does not tap).
+func TestHandleGetWebStorageColdUnattendedReturnsNoStorage(t *testing.T) {
+	fakeMesh(t, "me@laptop")
+	consent := &fakeConsent{}
+	st := stateWith("me@laptop", "", stateEndpoint("me@laptop", "chrome", "Default"))
+	d := New(consent, newFakeCache(), nil, staticProbe(SessionSnapshot{}), &recordingRunner{}, fixedState{st: st}, fixedState{st: st})
+
+	got, err := d.handleGetWebStorage(context.Background(), map[string]any{"url": "https://x.com"})
+	if err != nil {
+		t.Fatalf("get_web_storage cold: %v", err)
+	}
+	reply, ok := got.(map[string]any)
+	if !ok {
+		t.Fatalf("get_web_storage reply = %T, want map[string]any", got)
+	}
+	origins, ok := reply["origins"].([]cookie.WireOrigin)
+	if !ok {
+		t.Fatalf("origins = %T, want []cookie.WireOrigin", reply["origins"])
+	}
+	if len(origins) != 0 {
+		t.Fatalf("cold get_web_storage leaked %d origins without consent", len(origins))
+	}
+	if reply["warnings"] == nil {
+		t.Fatalf("cold get_web_storage should warn about the skipped endpoint")
+	}
+	if len(consent.promptedReasons) != 0 {
+		t.Fatalf("an unattended host must route consent, not prompt Touch ID; got %v", consent.promptedReasons)
+	}
+}
+
+// TestHandleGetWebStorageSingleColdFailsClosed proves the browser-scoped path fails
+// closed: a cold, unattended host with no live peer returns AuthRequired rather than
+// serving one browser's web storage without consent.
+func TestHandleGetWebStorageSingleColdFailsClosed(t *testing.T) {
+	fakeMesh(t, "me@laptop")
+	st := stateWith("me@laptop", "", stateEndpoint("me@laptop", "chrome", "Default"))
+	d := New(&fakeConsent{}, newFakeCache(), nil, staticProbe(SessionSnapshot{}), &recordingRunner{}, fixedState{st: st}, fixedState{st: st})
+
+	_, err := d.handleGetWebStorage(context.Background(), map[string]any{"browser": "chrome", "url": "https://x.com"})
+	var authErr *AuthRequired
+	if !errors.As(err, &authErr) {
+		t.Fatalf("browser-scoped get_web_storage cold = %v, want *AuthRequired", err)
+	}
+}
+
 // TestGetCookiesDualURLField proves get_cookies accepts both the new "urls" list and
 // the legacy single "url" field (the dual-field backward-compat contract).
 func TestGetCookiesDualURLField(t *testing.T) {
@@ -468,7 +531,8 @@ func TestPrimeAuthAllLivePrimesEveryBrowserInOneEvaluation(t *testing.T) {
 	ctx := context.Background()
 	self := "me@laptop"
 	fakeMesh(t, self)
-	st := stateWith(self, "",
+	st := stateWith(
+		self, "",
 		stateEndpoint(self, "chrome", "Default"),
 		stateEndpoint(self, "chrome", "Work"),
 		stateEndpoint(self, "arc", "Default"),
@@ -518,7 +582,8 @@ func TestPrimeAuthAllMissingBrowserWarnsWithoutSecondSheet(t *testing.T) {
 	ctx := context.Background()
 	self := "me@laptop"
 	fakeMesh(t, self)
-	st := stateWith(self, "",
+	st := stateWith(
+		self, "",
 		stateEndpoint(self, "chrome", "Default"),
 		stateEndpoint(self, "arc", "Default"),
 	)
@@ -561,7 +626,8 @@ func TestPrimeAuthAllColdRoutesConsentPerBrowser(t *testing.T) {
 	peer := "you@desktop"
 	nonce := "all-route-nonce"
 	fakeMesh(t, self, peer)
-	st := stateWith(self, "",
+	st := stateWith(
+		self, "",
 		stateEndpoint(self, "chrome", "Default"),
 		stateEndpoint(self, "chrome", "Work"),
 		stateEndpoint(self, "arc", "Default"),
@@ -622,7 +688,8 @@ func TestPrimeAuthAllColdToLiveFlipKeepsOneSheet(t *testing.T) {
 	peer := "you@desktop"
 	nonce := "flip-live-nonce"
 	fakeMesh(t, self, peer)
-	st := stateWith(self, "",
+	st := stateWith(
+		self, "",
 		stateEndpoint(self, "arc", "Default"),
 		stateEndpoint(self, "chrome", "Default"),
 	)
@@ -678,7 +745,8 @@ func TestPrimeAuthAllHardRouteFlipDoesNotSkipLaterBrowsers(t *testing.T) {
 	peer := "you@desktop"
 	nonce := "hard-route-flip-nonce"
 	fakeMesh(t, self, peer)
-	st := stateWith(self, peer,
+	st := stateWith(
+		self, peer,
 		stateEndpoint(self, "arc", "Default"),
 		stateEndpoint(self, "arc", "Work"),
 		stateEndpoint(self, "chrome", "Default"),

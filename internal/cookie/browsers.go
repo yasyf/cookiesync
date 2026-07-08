@@ -46,6 +46,16 @@ func (b Browser) CookiesDB(profile string) string {
 	return filepath.Join(b.ProfileDir(profile), "Cookies")
 }
 
+// LocalStorageDir is the LevelDB directory holding one profile's Local Storage.
+func (b Browser) LocalStorageDir(profile string) string {
+	return filepath.Join(b.ProfileDir(profile), "Local Storage", "leveldb")
+}
+
+// SessionStorageDir is the LevelDB directory holding one profile's Session Storage.
+func (b Browser) SessionStorageDir(profile string) string {
+	return filepath.Join(b.ProfileDir(profile), "Session Storage")
+}
+
 // LocalState is the Local State JSON file at this browser's data root.
 func (b Browser) LocalState() string {
 	return filepath.Join(b.DataRoot, "Local State")

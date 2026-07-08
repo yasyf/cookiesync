@@ -548,6 +548,125 @@ func (d *Daemon) getCookiesAll(ctx context.Context, requestor string, urls []str
 	return reply, nil
 }
 
+// handleGetWebStorage renders the web storage (localStorage + sessionStorage) for one or
+// more urls' origins. It is LOCAL-only — no ssh remote fan-out — and consent-gated exactly
+// like get_cookies. With a "browser" param it scopes to that one endpoint via
+// getWebStorageSingle (so a browser-scoped cookies pull pairs with the SAME browser's web
+// storage — never mixing one browser's cookie identity with another's localStorage token).
+// With no "browser" it unions every registered local browser via getWebStorageAll.
+func (d *Daemon) handleGetWebStorage(ctx context.Context, params map[string]any) (any, error) {
+	if optionalString(params, "browser", "") == "" {
+		return d.getWebStorageAll(ctx, params)
+	}
+	return d.getWebStorageSingle(ctx, params)
+}
+
+// getWebStorageSingle renders one browser's web storage for every url, consent-gated by the
+// same primeAuth path getCookiesSingle uses, then DISCARDING the released key — web storage
+// is stored unencrypted, so only the consent side-effect (the tap and the requestor grant)
+// is needed. It fails closed with AuthRequired when the prime does, never serving storage
+// without consent. Emits the frozen {"origins": [...]}.
+func (d *Daemon) getWebStorageSingle(ctx context.Context, params map[string]any) (any, error) {
+	browser, err := stringParam(params, "browser")
+	if err != nil {
+		return nil, err
+	}
+	profile := optionalString(params, "profile", defaultProfile)
+	urls, err := urlsParam(params)
+	if err != nil {
+		return nil, err
+	}
+	if _, _, err := d.primeAuth(ctx, requestorID(ctx, params), browser, profile, consentReason, releaseLocal); err != nil {
+		return nil, err
+	}
+	b, err := cookie.Lookup(cookie.BrowserName(browser))
+	if err != nil {
+		return nil, err
+	}
+	origins, err := cookie.ExtractWebStorage(ctx, urls, b, profile)
+	if err != nil {
+		return nil, err
+	}
+	return originsPayload(origins), nil
+}
+
+// getWebStorageAll unions the web storage for every url across every registered LOCAL
+// browser, best-effort. It mirrors getCookiesAll's local leg: the first cold endpoint runs
+// one release flight (a live session prompts one Touch ID sheet granting the whole local
+// batch, a cold session routes consent to a live peer) whose released key is DISCARDED, a
+// warm+granted endpoint serves silently, and anything still cold is a skip warning. A
+// requestor already granted by an earlier get_cookies call rides that grant with no extra
+// tap. Origins are folded in endpoint-id order, so an (origin, name) collision resolves
+// deterministically to the lowest endpoint id. Emits {"origins": [...], "warnings": [...]}.
+func (d *Daemon) getWebStorageAll(ctx context.Context, params map[string]any) (any, error) {
+	urls, err := urlsParam(params)
+	if err != nil {
+		return nil, err
+	}
+	requestor := requestorID(ctx, params)
+	self, err := meshSelf(ctx)
+	if err != nil {
+		return nil, err
+	}
+	st, err := d.state.Load(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var locals []state.Endpoint
+	for _, ep := range st.Endpoints() {
+		if ep.Host == self {
+			locals = append(locals, ep)
+		}
+	}
+	if len(locals) == 0 {
+		return nil, &AuthRequired{Msg: "no local browsers are tracked; run cookiesync browser add"}
+	}
+	sort.Slice(locals, func(i, j int) bool { return locals[i].ID() < locals[j].ID() })
+
+	acc := map[string]*originAcc{}
+	var warnings []string
+	prompted := false
+	for _, ep := range locals {
+		id := string(ep.ID())
+		name := cookie.BrowserName(ep.Browser)
+		_, warm, err := d.cache.Get(ctx, id)
+		if err != nil {
+			return nil, err
+		}
+		switch {
+		case warm && d.granted(requestor, name):
+		case !prompted:
+			// The released key is discarded: web storage is unencrypted, so only the
+			// consent side-effect (the tap and the requestor grant) is taken.
+			_, _, err := d.primeAuth(ctx, requestor, ep.Browser, ep.Profile, consentReason, releaseLocal)
+			prompted = true
+			if err != nil {
+				warnings = append(warnings, fmt.Sprintf("skip cold %s: run cookiesync auth (%v)", id, err))
+				continue
+			}
+		default:
+			warnings = append(warnings, fmt.Sprintf("skip cold %s: run cookiesync auth", id))
+			continue
+		}
+		b, err := cookie.Lookup(name)
+		if err != nil {
+			warnings = append(warnings, fmt.Sprintf("skip %s: %v", id, err))
+			continue
+		}
+		origins, err := cookie.ExtractWebStorage(ctx, urls, b, ep.Profile)
+		if err != nil {
+			warnings = append(warnings, fmt.Sprintf("skip %s: %v", id, err))
+			continue
+		}
+		mergeOrigins(acc, origins)
+	}
+	reply := originsPayload(collectOrigins(acc))
+	if len(warnings) > 0 {
+		reply["warnings"] = warnings
+	}
+	return reply, nil
+}
+
 // remoteGetCookies drives a peer's single-browser get_cookies over ssh and parses the
 // wire cookies it streams back, mirroring routedRelease's runner precedent. --browser is
 // always sent so the peer daemon takes the single path (the recursion guard), and origin
@@ -858,6 +977,69 @@ func cookiesPayload(cookies []cookie.Cookie) map[string]any {
 		wire[i] = cookie.ToWire(c)
 	}
 	return map[string]any{"cookies": wire}
+}
+
+// originAcc unions one origin's web storage across endpoints, first contributor winning
+// per entry name so a collision resolves deterministically to the earliest (lowest
+// endpoint-id) fold.
+type originAcc struct {
+	origin      string
+	local       []cookie.WebStorageEntry
+	session     []cookie.WebStorageEntry
+	localSeen   map[string]bool
+	sessionSeen map[string]bool
+}
+
+// mergeOrigins folds one endpoint's origins into acc, keyed by origin string, keeping the
+// first value seen for each (origin, name) pair.
+func mergeOrigins(acc map[string]*originAcc, origins []cookie.OriginStorage) {
+	for _, o := range origins {
+		a := acc[o.Origin]
+		if a == nil {
+			a = &originAcc{origin: o.Origin, localSeen: map[string]bool{}, sessionSeen: map[string]bool{}}
+			acc[o.Origin] = a
+		}
+		for _, e := range o.LocalStorage {
+			if a.localSeen[e.Name] {
+				continue
+			}
+			a.localSeen[e.Name] = true
+			a.local = append(a.local, e)
+		}
+		for _, e := range o.SessionStorage {
+			if a.sessionSeen[e.Name] {
+				continue
+			}
+			a.sessionSeen[e.Name] = true
+			a.session = append(a.session, e)
+		}
+	}
+}
+
+// collectOrigins flattens acc into an origin-sorted slice with name-sorted entries.
+func collectOrigins(acc map[string]*originAcc) []cookie.OriginStorage {
+	out := make([]cookie.OriginStorage, 0, len(acc))
+	for _, a := range acc {
+		sortStorageEntries(a.local)
+		sortStorageEntries(a.session)
+		out = append(out, cookie.OriginStorage{Origin: a.origin, LocalStorage: a.local, SessionStorage: a.session})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Origin < out[j].Origin })
+	return out
+}
+
+func sortStorageEntries(entries []cookie.WebStorageEntry) {
+	sort.Slice(entries, func(i, j int) bool { return entries[i].Name < entries[j].Name })
+}
+
+// originsPayload is the frozen {"origins": [...]} envelope a web-storage set crosses the
+// boundary as, each origin in the frozen wire shape.
+func originsPayload(origins []cookie.OriginStorage) map[string]any {
+	wire := make([]cookie.WireOrigin, len(origins))
+	for i, o := range origins {
+		wire[i] = cookie.OriginToWire(o)
+	}
+	return map[string]any{"origins": wire}
 }
 
 // wireCookiesParam reads the "cookies" param — a JSON array of wire cookie objects —

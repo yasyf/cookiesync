@@ -45,6 +45,16 @@ func tok() Cookie {
 
 func state() StorageState { return StorageState{Cookies: []Cookie{sid(), tok()}} }
 
+// fayeStorage is one origin carrying a localStorage auth blob and a sessionStorage value
+// with an embedded quote, so the JSON escaping is exercised in the goldens.
+func fayeStorage() []OriginStorage {
+	return []OriginStorage{{
+		Origin:         "https://app.findfaye.com",
+		LocalStorage:   []WebStorageEntry{{Name: "auth", Value: `{"t":1}`}},
+		SessionStorage: []WebStorageEntry{{Name: "sid", Value: `s"v`}},
+	}}
+}
+
 func readGolden(t *testing.T, name string) string {
 	t.Helper()
 	data, err := os.ReadFile(filepath.Join("testdata", name)) //nolint:gosec // test reads its own testdata fixture by name.
@@ -79,6 +89,38 @@ func TestRenderEmitsExactLines(t *testing.T) {
 				t.Fatalf("Render(%s):\n got = %#v\nwant = %#v", tc.format, got, tc.want)
 			}
 		})
+	}
+}
+
+// TestRenderPlaywrightEmitsPopulatedOrigins pins the storageState with real origins: the
+// cookie bytes are unchanged from the empty-origins golden and the "origins" array now
+// carries each origin's localStorage (Playwright storageState has no sessionStorage slot).
+func TestRenderPlaywrightEmitsPopulatedOrigins(t *testing.T) {
+	cookiesPart := strings.TrimSuffix(goldenPlaywright, `, "origins": []}`)
+	want := cookiesPart + `, "origins": [{"origin": "https://app.findfaye.com", "localStorage": [{"name": "auth", "value": "{\"t\":1}"}]}]}`
+	got := Render(StorageState{Cookies: []Cookie{sid(), tok()}, Origins: fayeStorage()}, FormatPlaywright)
+	if len(got) != 1 || got[0] != want {
+		t.Fatalf("playwright with origins:\n got = %q\nwant = %q", got[0], want)
+	}
+}
+
+// TestRenderWebStorageSidecar pins the webstorage sidecar: {"origins": [...]} carrying
+// both localStorage and sessionStorage, the only channel that emits sessionStorage.
+func TestRenderWebStorageSidecar(t *testing.T) {
+	want := `{"origins": [{"origin": "https://app.findfaye.com", "localStorage": [{"name": "auth", "value": "{\"t\":1}"}], "sessionStorage": [{"name": "sid", "value": "s\"v"}]}]}`
+	got := Render(StorageState{Origins: fayeStorage()}, FormatWebStorage)
+	if len(got) != 1 || got[0] != want {
+		t.Fatalf("webstorage sidecar:\n got = %q\nwant = %q", got[0], want)
+	}
+}
+
+// TestRenderPlaywrightDropsSessionOnlyOrigin proves an origin with no localStorage does
+// not appear in the Playwright origins array, which has no sessionStorage to carry.
+func TestRenderPlaywrightDropsSessionOnlyOrigin(t *testing.T) {
+	sessionOnly := []OriginStorage{{Origin: "https://app.findfaye.com", SessionStorage: []WebStorageEntry{{Name: "sid", Value: "v"}}}}
+	got := Render(StorageState{Origins: sessionOnly}, FormatPlaywright)
+	if len(got) != 1 || got[0] != `{"cookies": [], "origins": []}` {
+		t.Fatalf("session-only origin in playwright = %q, want empty origins", got[0])
 	}
 }
 

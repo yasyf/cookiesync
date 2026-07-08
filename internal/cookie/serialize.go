@@ -8,13 +8,14 @@ import (
 	"unicode/utf16"
 )
 
-// Render a StorageState to one of four cookie wire formats.
+// Render a StorageState to one of the cookie wire formats.
 //
 // The Playwright/agent-browser format is the load-bearing one: "agent-browser
-// --state -" consumes the standard {"cookies": [...], "origins": []} storageState
-// shape. We only carry cookies (the local store has no localStorage), so origins is
-// always empty. The other formats serve cookies.txt (netscape), a "Cookie:" request
-// header, and a raw JSON array of the same per-cookie objects.
+// --state -" consumes the standard {"cookies": [...], "origins": [...]} storageState
+// shape, whose origins carry each origin's localStorage. The webstorage format is the
+// sidecar carrying both localStorage and sessionStorage (Playwright storageState has no
+// sessionStorage slot). The other formats serve cookies.txt (netscape), a "Cookie:"
+// request header, and a raw JSON array of the same per-cookie objects.
 //
 // The JSON output is byte-compatible with Python's json.dumps: ", "/": " separators
 // and ensure_ascii=True escaping, so a rendered state is identical across the two
@@ -24,7 +25,7 @@ import (
 type OutputFormat string
 
 const (
-	// FormatPlaywright is the Playwright storageState object: {"cookies": [...], "origins": []}.
+	// FormatPlaywright is the Playwright storageState object: {"cookies": [...], "origins": [...]}.
 	FormatPlaywright OutputFormat = "playwright"
 	// FormatNetscape is the cookies.txt tab-separated format.
 	FormatNetscape OutputFormat = "netscape"
@@ -32,6 +33,9 @@ const (
 	FormatHeader OutputFormat = "header"
 	// FormatJSON is a bare JSON array of the per-cookie Playwright objects.
 	FormatJSON OutputFormat = "json"
+	// FormatWebStorage is the web-storage sidecar: {"origins": [{origin, localStorage,
+	// sessionStorage}]}, the only channel carrying sessionStorage.
+	FormatWebStorage OutputFormat = "webstorage"
 )
 
 // samesiteGetcookie maps a get-cookie sameSite string (lowercased) to Chrome's int.
@@ -42,7 +46,9 @@ var samesiteGetcookie = map[string]int{"strict": 2, "lax": 1, "none": 0}
 func Render(state StorageState, format OutputFormat) []string {
 	switch format {
 	case FormatPlaywright:
-		return []string{`{"cookies": ` + playwrightArray(state.Cookies) + `, "origins": []}`}
+		return []string{`{"cookies": ` + playwrightArray(state.Cookies) + `, "origins": ` + playwrightOrigins(state.Origins) + `}`}
+	case FormatWebStorage:
+		return []string{`{"origins": ` + webStorageOrigins(state.Origins) + `}`}
 	case FormatJSON:
 		return []string{playwrightArray(state.Cookies)}
 	case FormatNetscape:
@@ -86,6 +92,51 @@ func playwrightCookie(c Cookie) string {
 		`"sameSite": ` + pyJSONString(same),
 	}
 	return "{" + strings.Join(members, ", ") + "}"
+}
+
+// playwrightOrigins renders the storageState "origins" array: one object per origin
+// carrying its localStorage. Origins with no localStorage are dropped, and an empty
+// result renders "[]" byte-identically to the cookie-only path. Playwright's
+// storageState has no sessionStorage slot, so only localStorage is emitted here.
+func playwrightOrigins(origins []OriginStorage) string {
+	objs := make([]string, 0, len(origins))
+	for _, o := range origins {
+		if len(o.LocalStorage) == 0 {
+			continue
+		}
+		objs = append(objs, "{"+strings.Join([]string{
+			`"origin": ` + pyJSONString(o.Origin),
+			`"localStorage": ` + webStorageArray(o.LocalStorage),
+		}, ", ")+"}")
+	}
+	return "[" + strings.Join(objs, ", ") + "]"
+}
+
+// webStorageOrigins renders the webstorage sidecar's "origins" array: one object per
+// origin carrying both its localStorage and its sessionStorage.
+func webStorageOrigins(origins []OriginStorage) string {
+	objs := make([]string, len(origins))
+	for i, o := range origins {
+		objs[i] = "{" + strings.Join([]string{
+			`"origin": ` + pyJSONString(o.Origin),
+			`"localStorage": ` + webStorageArray(o.LocalStorage),
+			`"sessionStorage": ` + webStorageArray(o.SessionStorage),
+		}, ", ") + "}"
+	}
+	return "[" + strings.Join(objs, ", ") + "]"
+}
+
+// webStorageArray renders a run of web-storage entries as a JSON array of {name, value}
+// objects, each string escaped the Python-json.dumps way.
+func webStorageArray(entries []WebStorageEntry) string {
+	objs := make([]string, len(entries))
+	for i, e := range entries {
+		objs[i] = "{" + strings.Join([]string{
+			`"name": ` + pyJSONString(e.Name),
+			`"value": ` + pyJSONString(e.Value),
+		}, ", ") + "}"
+	}
+	return "[" + strings.Join(objs, ", ") + "]"
 }
 
 // expiresJSON renders the expires field: the integer -1 for a session cookie,

@@ -211,6 +211,7 @@ func (d *Daemon) Dispatcher() *synckit.Dispatcher {
 	dispatcher.Register("whoami", d.handleWhoami)
 	dispatcher.Register("prime_auth", d.handlePrimeAuth)
 	dispatcher.Register("get_cookies", d.handleGetCookies)
+	dispatcher.Register("get_web_storage", d.handleGetWebStorage)
 	dispatcher.Register("auth_status", d.handleAuthStatus)
 	dispatcher.Register("request_consent", d.handleRequestConsent)
 	return dispatcher

@@ -18,6 +18,7 @@ func newRPCCmd() *cobra.Command {
 	cmd.AddCommand(
 		newRPCExtractCmd(),
 		newRPCGetCookiesCmd(),
+		newRPCGetWebStorageCmd(),
 		newRPCApplyCmd(),
 		newRPCSyncCmd(),
 		newRPCReconcileCmd(),
@@ -114,6 +115,33 @@ func newRPCGetCookiesCmd() *cobra.Command {
 	cmd.Flags().StringVar(&profile, "profile", "Default", "The profile to read cookies from.")
 	cmd.Flags().StringVar(&origin, "origin", "", "Anti-echo provenance tag from the notifying peer.")
 	_ = cmd.MarkFlagRequired("browser")
+	return cmd
+}
+
+func newRPCGetWebStorageCmd() *cobra.Command {
+	var browser, profile string
+	cmd := &cobra.Command{
+		Use:   "get_web_storage <url>...",
+		Short: "Return this host's localStorage + sessionStorage for one or more urls' origins (local browsers only).",
+		Args:  cobra.MinimumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			// A passthrough to the resident daemon's local-only web-storage read. It is
+			// consent-gated like get_cookies; web storage is never pulled across hosts, so
+			// there is no ssh fan-out. --browser scopes to one browser (else every local
+			// browser is unioned), pairing with the same-browser cookies read.
+			params := map[string]any{"url": args[0], "urls": asAnySlice(args)}
+			if browser != "" {
+				params["browser"] = browser
+				params["profile"] = profile
+			}
+			if r, ok := resolveRequestor(); ok {
+				params["requestor"] = r
+			}
+			return rpcPassthrough(cmd, "get_web_storage", params)
+		},
+	}
+	cmd.Flags().StringVar(&browser, "browser", "", "The browser to read web storage from; omitted unions every registered local browser.")
+	cmd.Flags().StringVar(&profile, "profile", "Default", "The profile to read web storage from (requires --browser).")
 	return cmd
 }
 

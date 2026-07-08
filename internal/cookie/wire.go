@@ -96,3 +96,77 @@ func UnmarshalCookies(data []byte) ([]Cookie, error) {
 	}
 	return cookies, nil
 }
+
+// WireStorageEntry is the wire shape of one web-storage item: a name/value pair.
+type WireStorageEntry struct {
+	Name  string `json:"name"`
+	Value string `json:"value"`
+}
+
+// WireOrigin is the wire shape of one origin's web storage. It is a SEPARATE top-level
+// payload from WireCookie — origins never nest inside a cookie object — carried under the
+// "origins" key of the get_web_storage contract.
+type WireOrigin struct {
+	Origin         string             `json:"origin"`
+	LocalStorage   []WireStorageEntry `json:"localStorage"`
+	SessionStorage []WireStorageEntry `json:"sessionStorage"`
+}
+
+func storageEntriesToWire(entries []WebStorageEntry) []WireStorageEntry {
+	wire := make([]WireStorageEntry, len(entries))
+	for i, e := range entries {
+		wire[i] = WireStorageEntry(e)
+	}
+	return wire
+}
+
+func storageEntriesFromWire(wire []WireStorageEntry) []WebStorageEntry {
+	entries := make([]WebStorageEntry, len(wire))
+	for i, w := range wire {
+		entries[i] = WebStorageEntry(w)
+	}
+	return entries
+}
+
+// OriginToWire projects an OriginStorage into its wire shape.
+func OriginToWire(o OriginStorage) WireOrigin {
+	return WireOrigin{
+		Origin:         o.Origin,
+		LocalStorage:   storageEntriesToWire(o.LocalStorage),
+		SessionStorage: storageEntriesToWire(o.SessionStorage),
+	}
+}
+
+// OriginFromWire rebuilds an OriginStorage from its wire shape.
+func OriginFromWire(w WireOrigin) OriginStorage {
+	return OriginStorage{
+		Origin:         w.Origin,
+		LocalStorage:   storageEntriesFromWire(w.LocalStorage),
+		SessionStorage: storageEntriesFromWire(w.SessionStorage),
+	}
+}
+
+// MarshalOrigins encodes an origin set as the {"origins": [...]} payload the
+// get_web_storage rpc contract emits, each origin in the frozen wire shape.
+func MarshalOrigins(origins []OriginStorage) ([]byte, error) {
+	wire := make([]WireOrigin, len(origins))
+	for i, o := range origins {
+		wire[i] = OriginToWire(o)
+	}
+	return json.Marshal(struct {
+		Origins []WireOrigin `json:"origins"`
+	}{Origins: wire})
+}
+
+// UnmarshalOrigins decodes a bare JSON array of wire origins back into the model.
+func UnmarshalOrigins(data []byte) ([]OriginStorage, error) {
+	var wire []WireOrigin
+	if err := json.Unmarshal(data, &wire); err != nil {
+		return nil, err
+	}
+	origins := make([]OriginStorage, len(wire))
+	for i, w := range wire {
+		origins[i] = OriginFromWire(w)
+	}
+	return origins, nil
+}

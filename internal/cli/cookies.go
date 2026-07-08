@@ -199,7 +199,7 @@ func newCookiesCmd() *cobra.Command {
 	}
 	cmd.Flags().StringVar(&browser, "browser", "", "The browser to read cookies from; omitted unions every registered browser and host, skipping any that fail.")
 	cmd.Flags().StringVar(&profile, "profile", "Default", "The profile to read cookies from (requires --browser).")
-	cmd.Flags().StringVar(&format, "format", "playwright", "The output wire format (playwright|netscape|header|json).")
+	cmd.Flags().StringVar(&format, "format", "playwright", "The output wire format (playwright|netscape|header|json|webstorage).")
 	return cmd
 }
 
@@ -211,9 +211,9 @@ func newCookiesCmd() *cobra.Command {
 // remote — rendering the merged set on stdout with per-endpoint skips on stderr.
 func runCookies(cmd *cobra.Command, urls []string, browser, profile, format string) error {
 	switch cookie.OutputFormat(format) {
-	case cookie.FormatPlaywright, cookie.FormatNetscape, cookie.FormatHeader, cookie.FormatJSON:
+	case cookie.FormatPlaywright, cookie.FormatNetscape, cookie.FormatHeader, cookie.FormatJSON, cookie.FormatWebStorage:
 	default:
-		return fmt.Errorf("unknown format %q: want playwright, netscape, header, or json", format)
+		return fmt.Errorf("unknown format %q: want playwright, netscape, header, json, or webstorage", format)
 	}
 	if cmd.Flags().Changed("profile") && browser == "" {
 		return errors.New("--profile requires --browser")
@@ -236,7 +236,11 @@ func runCookies(cmd *cobra.Command, urls []string, browser, profile, format stri
 	if err := rpc.CallJSON(cmd.Context(), "get_cookies", params, &result); err != nil {
 		return err
 	}
-	renderCookies(cmd, result.Cookies, format)
+	origins, err := fetchOrigins(cmd, urls, browser, profile, format)
+	if err != nil {
+		return err
+	}
+	renderCookies(cmd, result.Cookies, origins, format)
 	return nil
 }
 
@@ -262,17 +266,55 @@ func runCookiesAll(cmd *cobra.Command, urls []string, format string) error {
 	if err := rpc.CallJSON(cmd.Context(), "get_cookies", params, &result); err != nil {
 		return err
 	}
-	renderCookies(cmd, result.Cookies, format)
+	origins, err := fetchOrigins(cmd, urls, "", "", format)
+	if err != nil {
+		return err
+	}
+	renderCookies(cmd, result.Cookies, origins, format)
 	for _, warning := range result.Warnings {
 		cmd.PrintErrln(warning)
 	}
 	return nil
 }
 
-// renderCookies writes the wire cookies to stdout in the chosen format, one document
-// line per Println.
-func renderCookies(cmd *cobra.Command, wire []cookie.WireCookie, format string) {
-	storage := cookie.StorageState{Cookies: fromWireCookies(wire)}
+// fetchOrigins pulls this host's localStorage + sessionStorage for every url from the
+// daemon, but only for the formats that carry origins (playwright and webstorage). It
+// scopes to the same browser/profile as the cookies call — an explicit --browser reads
+// only that browser's web storage, so the origins pair with the cookies from that same
+// browser rather than mixing another browser's token — and reuses the cookies call's
+// requestor so the get_web_storage prime rides that warm grant with no extra Touch ID
+// tap. Any per-endpoint skip is written to stderr.
+func fetchOrigins(cmd *cobra.Command, urls []string, browser, profile, format string) ([]cookie.WireOrigin, error) {
+	switch cookie.OutputFormat(format) {
+	case cookie.FormatPlaywright, cookie.FormatWebStorage:
+	default:
+		return nil, nil
+	}
+	params := map[string]any{"url": urls[0], "urls": asAnySlice(urls)}
+	if browser != "" {
+		params["browser"] = browser
+		params["profile"] = profile
+	}
+	if r, ok := resolveRequestor(); ok {
+		params["requestor"] = r
+	}
+	var result struct {
+		Origins  []cookie.WireOrigin `json:"origins"`
+		Warnings []string            `json:"warnings"`
+	}
+	if err := rpc.CallJSON(cmd.Context(), "get_web_storage", params, &result); err != nil {
+		return nil, err
+	}
+	for _, warning := range result.Warnings {
+		cmd.PrintErrln(warning)
+	}
+	return result.Origins, nil
+}
+
+// renderCookies writes the wire cookies and origins to stdout in the chosen format, one
+// document line per Println.
+func renderCookies(cmd *cobra.Command, wire []cookie.WireCookie, origins []cookie.WireOrigin, format string) {
+	storage := cookie.StorageState{Cookies: fromWireCookies(wire), Origins: fromWireOrigins(origins)}
 	for _, line := range cookie.Render(storage, cookie.OutputFormat(format)) {
 		cmd.Println(line)
 	}
@@ -290,6 +332,14 @@ func fromWireCookies(in []cookie.WireCookie) []cookie.Cookie {
 	out := make([]cookie.Cookie, len(in))
 	for i, w := range in {
 		out[i] = cookie.FromWire(w)
+	}
+	return out
+}
+
+func fromWireOrigins(in []cookie.WireOrigin) []cookie.OriginStorage {
+	out := make([]cookie.OriginStorage, len(in))
+	for i, w := range in {
+		out[i] = cookie.OriginFromWire(w)
 	}
 	return out
 }

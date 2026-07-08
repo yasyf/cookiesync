@@ -108,7 +108,26 @@ type EncryptedRow struct {
 	HasCrossSiteAncestor int
 }
 
-// StorageState is a bundle of decrypted cookies, ready to seed a browser session.
+// WebStorageEntry is one localStorage or sessionStorage item: a name/value pair
+// decoded from a browser's LevelDB web-storage store.
+type WebStorageEntry struct {
+	Name  string
+	Value string
+}
+
+// OriginStorage is one origin's captured web storage — its localStorage and
+// sessionStorage — ready to inject into a headless browser session. IndexedDB is
+// deferred: its idb_cmp1 comparator and V8-serialized values need a bespoke reader, so
+// it is not read here.
+type OriginStorage struct {
+	Origin         string
+	LocalStorage   []WebStorageEntry
+	SessionStorage []WebStorageEntry
+}
+
+// StorageState is a bundle of decrypted cookies plus per-origin web storage, ready to
+// seed a browser session.
 type StorageState struct {
 	Cookies []Cookie
+	Origins []OriginStorage
 }
