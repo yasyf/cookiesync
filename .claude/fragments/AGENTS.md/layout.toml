@@ -4,3 +4,6 @@ fragments = [
   "style",
   "cc-skills:version-control",
 ]
+
+[sources.cc-skills]
+source = "github:yasyf/cc-skills@main"
