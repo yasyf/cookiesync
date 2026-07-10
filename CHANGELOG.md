@@ -6,6 +6,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.1] - 2026-07-10
+
+### Fixed
+- The Homebrew cask restarts the resident helper with `launchctl kickstart` after every install and
+  upgrade. A cask upgrade swaps the binary on disk but never touches launchd, so the old helper kept
+  serving a stale RPC dispatcher that rejected `get_web_storage` until a manual restart. First
+  install is a no-op since the agent doesn't exist until `synckitd install`.
+
 ## [0.10.0] - 2026-07-08
 
 ### Added
@@ -166,7 +174,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `synckitd install` now owns the agents. The host mesh is read from the shared
   `~/.config/synckit`.
 
-[Unreleased]: https://github.com/yasyf/cookiesync/compare/v0.9.0...HEAD
+[Unreleased]: https://github.com/yasyf/cookiesync/compare/v0.10.1...HEAD
+[0.10.1]: https://github.com/yasyf/cookiesync/releases/tag/v0.10.1
+[0.10.0]: https://github.com/yasyf/cookiesync/releases/tag/v0.10.0
 [0.9.0]: https://github.com/yasyf/cookiesync/releases/tag/v0.9.0
 [0.8.3]: https://github.com/yasyf/cookiesync/releases/tag/v0.8.3
 [0.8.2]: https://github.com/yasyf/cookiesync/releases/tag/v0.8.2

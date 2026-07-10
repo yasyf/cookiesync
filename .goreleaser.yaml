@@ -68,6 +68,18 @@ homebrew_casks:
     # the per-boot Enclave key cache are available before the first sync.
     dependencies:
       - cask: cookiesync-keyhelper
+    # brew upgrade swaps the binary on disk but never touches launchd, so the
+    # resident helper (com.github.yasyf.synckit.helper.cookiesync) keeps serving
+    # the old dispatcher until reboot. Kick it after every (re)install so upgrades
+    # self-deploy. must_succeed keeps first install a no-op — the agent only
+    # exists after `cookiesync install` + `synckitd install`.
+    hooks:
+      post:
+        install: |
+          system_command "/bin/launchctl",
+                         args:         ["kickstart", "-k", "gui/#{Process.uid}/com.github.yasyf.synckit.helper.cookiesync"],
+                         must_succeed: false,
+                         print_stderr: false
     caveats: |
       Wire up the watch daemon and reconcile tick, then track your first browser:
 
