@@ -68,6 +68,9 @@ homebrew_casks:
     # the per-boot Enclave key cache are available before the first sync.
     dependencies:
       - cask: cookiesync-keyhelper
+    # Strip the quarantine attribute so the (notarized, or unsigned) binary runs on
+    # first launch.
+    #
     # brew upgrade swaps the binary on disk but never touches launchd, so the
     # resident helper (com.github.yasyf.synckit.helper.cookiesync) keeps serving
     # the old dispatcher until reboot. Kick it after every (re)install so upgrades
@@ -76,6 +79,10 @@ homebrew_casks:
     hooks:
       post:
         install: |
+          if OS.mac?
+            system_command "/usr/bin/xattr",
+                           args: ["-dr", "com.apple.quarantine", "#{staged_path}/cookiesync"]
+          end
           system_command "/bin/launchctl",
                          args:         ["kickstart", "-k", "gui/#{Process.uid}/com.github.yasyf.synckit.helper.cookiesync"],
                          must_succeed: false,
