@@ -22,6 +22,27 @@ import (
 // so a wide mesh does not open one ssh process per remote endpoint at once.
 const unionSSHConcurrency = 4
 
+// unionReadTimeout bounds one peer's get_cookies leg in the browser-less union read; the
+// union is a background data-plane read — a wedged peer costs seconds, never the consent
+// window, because the peer's own release flight is detached (primeAuth runs it under
+// context.WithoutCancel), so a Touch ID sheet pending there survives the killed ssh and
+// the next union pull rides the resulting grant. Mirrors engine's fetchTimeout. A var so
+// tests shrink it.
+var unionReadTimeout = 15 * time.Second
+
+// authStatusTimeout bounds the session probe and cache read behind a status query. A
+// client deadline does not cross the socket (the dispatcher runs the handler for minutes),
+// so a wedged probe or a locked-keybag helper round-trip would block the doctor's 2s read
+// into an i/o-timeout FAIL. On the bound the host is reported locked — data the doctor
+// renders OK-with-note, not an error. Under the doctor's 2s so the reply lands first; a var
+// so tests shrink it.
+var authStatusTimeout = 1500 * time.Millisecond
+
+// errAuthStatusTimeout is the cause the status read stamps on its own deadline, so a probe
+// or unwrap that outran authStatusTimeout is told apart from a parent cancel or an earlier
+// parent deadline via context.Cause — only the former reports the host locked.
+var errAuthStatusTimeout = errors.New("auth_status probe/read exceeded authStatusTimeout")
+
 // releaseMode selects whether a release derives the routed/local consent split or is
 // pinned to a local terminus. A local prime walks the full ladder — hard consent route,
 // local Touch ID, routed fallback — deriving the routed/local split once inside the
@@ -328,10 +349,15 @@ func (d *Daemon) primeAuthAll(ctx context.Context, requestor, reason string) (ma
 // cache is degraded to process memory (Secure Enclave presence unavailable at open, not
 // yet healed by a Put), and whether the daemon user's keybag is unavailable — the console
 // session locked, absent, or held by another user via fast user switching — the frozen
-// {"endpoint", "authenticated", "degraded", "keybag_locked"} shape. A locked keybag makes a live
-// cache-unwrap refuse the per-boot key (ErrSEPresenceUnavailable); that one error is
-// swallowed as authenticated:false rather than a raw RPC failure, since the key is simply
-// unservable until unlock. Any other Get error still propagates.
+// {"endpoint", "authenticated", "degraded", "keybag_locked"} shape. The probe and cache read
+// run under authStatusTimeout so a status read never blocks the caller: a probe that outruns
+// the bound reports the host locked (the keybag is unreadable to a live read) without
+// touching the cache, since a key is unservable while locked anyway. A locked keybag makes a
+// live cache-unwrap refuse the per-boot key (ErrSEPresenceUnavailable), and an unwrap that
+// outruns the bound fails the same way; both are swallowed as authenticated:false rather
+// than a raw RPC failure. Any other Get error, and any probe failure that is not the bound,
+// still propagates. context.Cause tells the bound apart from a parent cancel so a caller
+// that went away is never reported as locked.
 func (d *Daemon) handleAuthStatus(ctx context.Context, params map[string]any) (any, error) {
 	browser, err := stringParam(params, "browser")
 	if err != nil {
@@ -342,18 +368,26 @@ func (d *Daemon) handleAuthStatus(ctx context.Context, params map[string]any) (a
 	if err != nil {
 		return nil, err
 	}
-	snap, err := d.probe(ctx)
+	id := endpointID(self, browser, profile)
+
+	statusCtx, cancel := context.WithTimeoutCause(ctx, authStatusTimeout, errAuthStatusTimeout)
+	defer cancel()
+
+	snap, err := d.probe(statusCtx)
 	if err != nil {
-		return nil, err
+		if !errors.Is(context.Cause(statusCtx), errAuthStatusTimeout) {
+			return nil, err
+		}
+		return map[string]any{"endpoint": id, "authenticated": false, "degraded": d.cache.Degraded(), "keybag_locked": true}, nil
 	}
 	locked, err := keybagLocked(snap)
 	if err != nil {
 		return nil, err
 	}
-	id := endpointID(self, browser, profile)
-	_, ok, err := d.cache.Get(ctx, id)
-	lockedRefusal := locked && errors.Is(err, cache.ErrSEPresenceUnavailable)
-	if err != nil && !lockedRefusal {
+
+	_, ok, err := d.cache.Get(statusCtx, id)
+	unservable := locked && (errors.Is(err, cache.ErrSEPresenceUnavailable) || errors.Is(context.Cause(statusCtx), errAuthStatusTimeout))
+	if err != nil && !unservable {
 		return nil, err
 	}
 	return map[string]any{"endpoint": id, "authenticated": ok, "degraded": d.cache.Degraded(), "keybag_locked": locked}, nil
@@ -529,6 +563,10 @@ func (d *Daemon) getCookiesAll(ctx context.Context, requestor string, urls []str
 			cookies, err := d.remoteGetCookies(ctx, ep.Host, ep.Browser, ep.Profile, urls)
 			mu.Lock()
 			defer mu.Unlock()
+			if errors.Is(err, context.DeadlineExceeded) {
+				warnings = append(warnings, fmt.Sprintf("skip %s: no reply from %s within %s (consent may be pending there or the host is slow); approve on %s or run cookiesync auth on it", ep.ID(), ep.Host, unionReadTimeout, ep.Host))
+				return
+			}
 			if err != nil {
 				warnings = append(warnings, fmt.Sprintf("skip %s: %v", ep.ID(), err))
 				return
@@ -672,8 +710,10 @@ func (d *Daemon) getWebStorageAll(ctx context.Context, params map[string]any) (a
 // always sent so the peer daemon takes the single path (the recursion guard), and origin
 // is this host's mesh self so the peer's grant keys "host:"+self like extract — the
 // first union pull prompts the peer once, then its grant window keeps the rest silent.
-// The call gets the extract-style window (DispatchTimeout - 30s): a peer may hold a Touch
-// ID sheet open, so a short I/O timeout would kill a legitimate prompt.
+// The call gets a short data-plane bound (unionReadTimeout): a peer stuck behind a pending
+// consent is killed in seconds rather than held for the whole consent window, because that
+// peer's release flight is detached and survives the killed ssh — the approval it earns
+// there makes the next union pull silent.
 func (d *Daemon) remoteGetCookies(ctx context.Context, host, browser, profile string, urls []string) ([]cookie.Cookie, error) {
 	self, err := meshSelf(ctx)
 	if err != nil {
@@ -693,10 +733,15 @@ func (d *Daemon) remoteGetCookies(ctx context.Context, host, browser, profile st
 		hostregistry.ShellQuote(browser), hostregistry.ShellQuote(profile),
 		hostregistry.ShellQuote(self), strings.Join(quoted, " "),
 	)
-	rctx, cancel := context.WithTimeout(ctx, synckit.DispatchTimeout-30*time.Second)
+	rctx, cancel := context.WithTimeout(ctx, unionReadTimeout)
 	defer cancel()
 	out, err := d.runner.Run(rctx, host, cmd, nil)
 	if err != nil {
+		// exec.CommandContext reports the deadline kill as a bare exit error that loses the
+		// context cause; restore it so the caller can branch on the wedged-peer case.
+		if rctx.Err() != nil {
+			return nil, fmt.Errorf("rpc get_cookies on %s: %w (underlying: %v)", host, rctx.Err(), err)
+		}
 		return nil, err
 	}
 	var payload struct {

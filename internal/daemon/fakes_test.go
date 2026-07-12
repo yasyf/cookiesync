@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -377,6 +378,24 @@ func (r *recordingRunner) Run(_ context.Context, target, cmd string, _ []byte) (
 		}
 	}
 	return "", nil
+}
+
+// wedgedTargetRunner wraps an inner recordingRunner and, for one wedged target, blocks
+// until the call's deadline kills it, then reports the kill the way exec.CommandContext
+// does — a bare exit error that loses the context cause — so remoteGetCookies proves it
+// restores context.DeadlineExceeded itself. Every other target delegates to the inner
+// runner.
+type wedgedTargetRunner struct {
+	inner  *recordingRunner
+	wedged string
+}
+
+func (r *wedgedTargetRunner) Run(ctx context.Context, target, cmd string, stdin []byte) (string, error) {
+	if target == r.wedged {
+		<-ctx.Done()
+		return "", errors.New("signal: killed")
+	}
+	return r.inner.Run(ctx, target, cmd, stdin)
 }
 
 // forbiddenRunner fails the test on any ssh dial — the transport double for paths

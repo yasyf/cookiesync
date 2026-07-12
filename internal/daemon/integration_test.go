@@ -211,6 +211,130 @@ func TestGetCookiesUnionLocalAndRemote(t *testing.T) {
 	}
 }
 
+// TestGetCookiesUnionWedgedPeerSkippedAtDeadline proves the union's remote leg gives a
+// wedged peer only unionReadTimeout — not the full consent window — before skipping it
+// with a consent-hinting warning, while every healthy endpoint still contributes its
+// cookies. A plain (non-deadline) ssh failure keeps the generic skip with no consent hint.
+func TestGetCookiesUnionWedgedPeerSkippedAtDeadline(t *testing.T) {
+	restore := unionReadTimeout
+	unionReadTimeout = 25 * time.Millisecond
+	t.Cleanup(func() { unionReadTimeout = restore })
+
+	ctx := context.Background()
+	browser := chromeStoreUnderHome(t)
+	key := cookie.DeriveKey(cookie.SafeStorageKey("peanuts"))
+	local := []cookie.Cookie{{HostKey: "x.com", Name: "loc", Value: "here", Path: "/", LastUpdateUTC: 13_350_000_000_000_000, SameSite: 2, IsSecure: true, SourceScheme: 2, SourcePort: 443}}
+	if _, err := cookie.Apply(ctx, local, browser, "Default", key); err != nil {
+		t.Fatalf("seed apply: %v", err)
+	}
+	remote := cookie.Cookie{HostKey: "x.com", Name: "rem", Value: "there", Path: "/", LastUpdateUTC: 13_350_000_000_000_000, SameSite: 2, IsSecure: true, SourceScheme: 2, SourcePort: 443}
+
+	self := "me@laptop"
+	wedged := "wedged@desktop"
+	healthy := "healthy@desktop"
+
+	tests := []struct {
+		name    string
+		peers   []string
+		runner  engine.SSHRunner
+		wantRem bool
+		check   func(t *testing.T, warning string)
+	}{
+		{
+			name:    "wedged only peer",
+			peers:   []string{wedged},
+			runner:  &wedgedTargetRunner{inner: &recordingRunner{}, wedged: wedged},
+			wantRem: false,
+			check: func(t *testing.T, warning string) {
+				if !strings.Contains(warning, endpointID(wedged, "chrome", "Default")) {
+					t.Fatalf("warning must name the wedged endpoint: %q", warning)
+				}
+				if !strings.Contains(warning, "consent") {
+					t.Fatalf("warning must hint at a pending consent: %q", warning)
+				}
+			},
+		},
+		{
+			name:  "wedged beside healthy peer",
+			peers: []string{wedged, healthy},
+			runner: &wedgedTargetRunner{
+				inner:  &recordingRunner{perTarget: map[string]string{healthy: peerExtractReply(t, remote)}},
+				wedged: wedged,
+			},
+			wantRem: true,
+			check: func(t *testing.T, warning string) {
+				if !strings.Contains(warning, endpointID(wedged, "chrome", "Default")) {
+					t.Fatalf("warning must name the wedged endpoint: %q", warning)
+				}
+				if strings.Contains(warning, endpointID(healthy, "chrome", "Default")) {
+					t.Fatalf("the healthy endpoint must not appear in the skip warning: %q", warning)
+				}
+			},
+		},
+		{
+			name:    "plain ssh failure keeps generic skip",
+			peers:   []string{wedged},
+			runner:  &recordingRunner{err: errors.New("ssh: connect refused")},
+			wantRem: false,
+			check: func(t *testing.T, warning string) {
+				wantPrefix := "skip " + endpointID(wedged, "chrome", "Default") + ": "
+				if !strings.HasPrefix(warning, wantPrefix) {
+					t.Fatalf("plain ssh failure must keep the generic skip prefix %q: %q", wantPrefix, warning)
+				}
+				if strings.Contains(warning, "consent") {
+					t.Fatalf("a non-deadline ssh failure must not carry a consent hint: %q", warning)
+				}
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			fakeMesh(t, self, tc.peers...)
+			endpoints := []state.Endpoint{stateEndpoint(self, "chrome", "Default")}
+			for _, p := range tc.peers {
+				endpoints = append(endpoints, stateEndpoint(p, "chrome", "Default"))
+			}
+			st := stateWith(self, "", endpoints...)
+			cache := newFakeCache()
+			consent := &fakeConsent{key: key}
+			d := New(consent, cache, nil, staticProbe(SessionSnapshot{}), tc.runner, fixedState{st: st}, fixedState{st: st})
+			_ = cache.Put(ctx, endpointID(self, "chrome", "Default"), []byte(key), 0)
+			d.grant("local", []cookie.BrowserName{"chrome"}, time.Hour)
+
+			start := time.Now()
+			got, err := d.handleGetCookies(ctx, map[string]any{"url": "https://x.com/"})
+			if err != nil {
+				t.Fatalf("handleGetCookies union: %v", err)
+			}
+			if elapsed := time.Since(start); elapsed > 2*time.Second {
+				t.Fatalf("union waited %v on a wedged peer; unionReadTimeout must bound it", elapsed)
+			}
+			cookies := wireCookieNames(t, got)
+			if cookies["loc"].Value != "here" {
+				t.Fatalf("union dropped the warm local cookie: %+v", cookies)
+			}
+			if _, gotRem := cookies["rem"]; gotRem != tc.wantRem {
+				t.Fatalf("union rem present = %v, want %v: %+v", gotRem, tc.wantRem, cookies)
+			}
+			warnings := decodeWarnings(t, got)
+			if len(warnings) != 1 {
+				t.Fatalf("want exactly one skip warning, got %v", warnings)
+			}
+			tc.check(t, warnings[0])
+		})
+	}
+}
+
+// TestUnionReadTimeoutIsDataPlane pins unionReadTimeout to a short data-plane bound: the
+// browser-less union read is a background pull, so a wedged peer costs seconds — the
+// peer's own detached release flight carries any pending consent, not this call.
+func TestUnionReadTimeoutIsDataPlane(t *testing.T) {
+	if want := 15 * time.Second; unionReadTimeout != want {
+		t.Fatalf("unionReadTimeout = %v, want %v (a short data-plane bound, not the consent window)", unionReadTimeout, want)
+	}
+}
+
 // TestGetCookiesUnionLocalWinsTie proves the conflict rule: when a local and a remote
 // endpoint carry the same logical cookie with an equal last_update_utc but a different
 // value, MergeRanked keeps the LOCAL machine's value.

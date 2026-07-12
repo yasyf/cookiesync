@@ -80,7 +80,7 @@ Every listed endpoint converges continuously. The daemon watches each cookie sto
 | `browser add/ls/rm` | Track, list, and untrack the browser profiles synced across hosts. |
 | `browser profiles <browser>` | List this host's profiles for a browser that hold a cookie store. |
 | `auth` | Release the Safe Storage key behind one Touch ID tap and cache it for a short window; omit `--browser` to prime every registered browser at once. |
-| `cookies <url>...` | Stream cookies for one or more URLs as `playwright`, `netscape`, `header`, or `json`; omit `--browser` to union every registered browser and host. |
+| `cookies <url>...` | Stream cookies for one or more URLs as `playwright`, `netscape`, `header`, `json`, or `webstorage`; omit `--browser` to union every registered browser and host. |
 | `route-consent <target>` | Route the consent gate to a host that already has a live, unlocked session. |
 | `self` | Print this host's SSH target, as the synckit host mesh reports it. |
 | `rpc <method>` | Low-level RPC client for the resident daemon (extract, apply, sync, reconcile). |

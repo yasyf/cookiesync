@@ -4,7 +4,24 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.10.3] - 2026-07-12
+
+### Fixed
+- The browser-less union no longer hangs on a wedged peer. A peer's `get_cookies` leg is
+  bounded at 15s (`unionReadTimeout`) instead of inheriting the 10-minute consent window,
+  and a timed-out peer is skipped with a stderr warning naming the host and the likely
+  cause (consent pending there, or the host is slow). Consent flows keep their full
+  window; a pending Touch ID sheet on the peer survives the killed ssh, and the next
+  union pull rides the resulting grant.
+- The ssh runner's deadline now terminates the whole process subtree. `Setpgid` plus a
+  process-group SIGKILL and a 5s `WaitDelay` replace the default cancel, which killed
+  only the direct child and then blocked in `Wait` forever when a grandchild held the
+  stdout pipe — the mechanism that could strand a remote call past `applyTimeout`.
+- `auth_status` answers within 1.5s on a locked Mac. The doctor's 2s deadline never
+  crossed the RPC socket, so a slow session probe (`ioreg`/`netstat` under screen share)
+  ran under the dispatcher's 10-minute window and surfaced as a `key cache: i/o timeout`
+  FAIL; the probe and cache read are now bounded, and a keybag that cannot be confirmed
+  servable in time reports locked — rendered as the OK-with-note line, never an error.
 
 ## [0.10.1] - 2026-07-10
 

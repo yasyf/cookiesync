@@ -156,6 +156,7 @@ func TestWantsKeyGatesModalStates(t *testing.T) {
 // TestRemoveConfirmThenRemove proves r on a selected endpoint opens a confirm,
 // and y issues the remove command for that endpoint.
 func TestRemoveConfirmThenRemove(t *testing.T) {
+	seedMesh(t, "me@laptop")
 	m := newBrowsersModel(&fakeRunner{})
 	m.loading = false
 	ep := state.Endpoint{Host: "me@laptop", Browser: "chrome", Profile: "Default"}

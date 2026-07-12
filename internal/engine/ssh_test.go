@@ -3,7 +3,11 @@ package engine
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -244,5 +248,97 @@ func TestSSHFetcherDeadline(t *testing.T) {
 	}
 	if want := "get_state from you@desktop"; !strings.Contains(err.Error(), want) {
 		t.Fatalf("Fetch error %q does not name the operation and peer %q", err, want)
+	}
+}
+
+// writeFakeSSH drops an executable named "ssh" into dir that ignores its args,
+// backgrounds a grandchild recording its pid to pidFile, then blocks on its own
+// foreground sleep so the direct child stays alive until the deadline fires.
+// detachStdout redirects the grandchild's stdio away from the inherited stdout
+// pipe, isolating the process-group kill from the pipe-EOF path.
+func writeFakeSSH(t *testing.T, dir, pidFile string, detachStdout bool) {
+	t.Helper()
+	redir := ""
+	if detachStdout {
+		redir = " >/dev/null 2>&1 </dev/null"
+	}
+	script := "#!/bin/sh\nsleep 30" + redir + " &\necho \"$!\" > " + pidFile + "\nsleep 30\n"
+	if err := os.WriteFile(filepath.Join(dir, "ssh"), []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake ssh: %v", err)
+	}
+}
+
+// readSleeperPID waits for the fake ssh to record its backgrounded grandchild's pid.
+func readSleeperPID(t *testing.T, pidFile string) int {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		raw, err := os.ReadFile(pidFile)
+		if err == nil {
+			if pid, perr := strconv.Atoi(strings.TrimSpace(string(raw))); perr == nil {
+				return pid
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("fake ssh never recorded a sleeper pid")
+	return 0
+}
+
+// waitDead polls until syscall.Kill(pid, 0) reports the process gone (ESRCH).
+func waitDead(pid int) bool {
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if syscall.Kill(pid, 0) == syscall.ESRCH {
+			return true
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	return syscall.Kill(pid, 0) == syscall.ESRCH
+}
+
+// TestExecSSHRunnerKillsProcessGroupOnDeadline drives the production ssh runner
+// across a real exec boundary (a fake "ssh" on PATH) and proves it tears down
+// cleanly at its deadline: Run returns promptly rather than wedging in cmd.Wait
+// on a helper that inherited the stdout pipe, and the whole process group —
+// including a grandchild that outlives the direct ssh child — is killed, so no
+// "rpc apply" ssh subtree survives the timeout. Regression for the 3h survivor.
+func TestExecSSHRunnerKillsProcessGroupOnDeadline(t *testing.T) {
+	tests := []struct {
+		name         string
+		detachStdout bool
+	}{
+		{name: "grandchild shares stdout pipe", detachStdout: false},
+		{name: "grandchild detached from stdout", detachStdout: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			pidFile := filepath.Join(dir, "sleeper.pid")
+			writeFakeSSH(t, dir, pidFile, tt.detachStdout)
+			t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+			ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+			defer cancel()
+
+			start := time.Now()
+			_, err := execSSHRunner{}.Run(ctx, "you@desktop", "rpc apply", nil)
+			elapsed := time.Since(start)
+
+			if err == nil {
+				t.Fatal("Run returned nil error, want the deadline kill")
+			}
+			// A wedge would only surface at WaitDelay (5s); the group-kill must
+			// unblock Wait well before that.
+			if elapsed > 3*time.Second {
+				t.Fatalf("Run took %v — cmd.Wait wedged past the deadline", elapsed)
+			}
+
+			sleeper := readSleeperPID(t, pidFile)
+			t.Cleanup(func() { _ = syscall.Kill(sleeper, syscall.SIGKILL) })
+			if !waitDead(sleeper) {
+				t.Fatalf("grandchild sleeper %d survived Run — process group not killed", sleeper)
+			}
+		})
 	}
 }

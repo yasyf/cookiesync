@@ -5,8 +5,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"os/exec"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/yasyf/cookiesync/internal/cookie"
@@ -60,6 +62,21 @@ func NewExecSSHRunner() SSHRunner {
 func (execSSHRunner) Run(ctx context.Context, target, remoteCmd string, stdin []byte) (string, error) {
 	args := append(append([]string{}, sshOpts...), target, brewShellenv+remoteCmd)
 	cmd := exec.CommandContext(ctx, "ssh", args...) //nolint:gosec // G204: this sync tool's job is to run ssh; target/remoteCmd come from trusted local state (registered hosts), not untrusted input.
+	// On deadline, SIGKILL the whole process group (Setpgid + negative-pid kill) so
+	// an ssh helper that inherited our stdout pipe dies too; otherwise cmd.Wait
+	// blocks past the deadline waiting for pipe EOF. WaitDelay force-closes the
+	// pipes as a backstop if the group-kill misses a holder.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error {
+		err := syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		// ESRCH means the group already exited: report os.ErrProcessDone like
+		// Process.Kill would, so a completion/cancellation race is not an error.
+		if err == syscall.ESRCH {
+			return os.ErrProcessDone
+		}
+		return err
+	}
+	cmd.WaitDelay = 5 * time.Second
 	if stdin != nil {
 		cmd.Stdin = bytes.NewReader(stdin)
 	}

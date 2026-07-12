@@ -254,6 +254,135 @@ esac
 	return binary
 }
 
+// TestHandleAuthStatusBoundsWedgedProbeReportsLockedNote pins the fast path on the live
+// locked/screen-shared incident: the session probe wedges, but a status read must never
+// block the caller past its deadline. authStatusTimeout bounds the probe and a bounded-out
+// probe reports the host locked — the degraded+locked OK-with-note reply the doctor renders
+// healthy — rather than hanging into an i/o-timeout FAIL. Without the bound the handler
+// would block on the never-done background context and the watchdog would fire.
+func TestHandleAuthStatusBoundsWedgedProbeReportsLockedNote(t *testing.T) {
+	fakeMesh(t, "me@laptop")
+	restore := authStatusTimeout
+	authStatusTimeout = 20 * time.Millisecond
+	t.Cleanup(func() { authStatusTimeout = restore })
+
+	// A probe that returns only when its context is cancelled — the wedged ioreg/netstat
+	// exec.CommandContext the bound kills and unblocks.
+	wedged := func(ctx context.Context) (SessionSnapshot, error) {
+		<-ctx.Done()
+		return SessionSnapshot{}, ctx.Err()
+	}
+	c := newFakeCache()
+	c.degraded = true
+	st := stateWith("me@laptop", "")
+	d := New(&fakeConsent{}, c, nil, wedged, &recordingRunner{}, fixedState{st: st}, fixedState{st: st})
+
+	type result struct {
+		got any
+		err error
+	}
+	done := make(chan result, 1)
+	start := time.Now()
+	go func() {
+		got, err := d.handleAuthStatus(context.Background(), map[string]any{"browser": "chrome"})
+		done <- result{got, err}
+	}()
+
+	select {
+	case r := <-done:
+		if r.err != nil {
+			t.Fatalf("handleAuthStatus must not fail on a wedged probe, got %v", r.err)
+		}
+		if marshalResult(t, r.got) != `{"authenticated":false,"degraded":true,"endpoint":"me@laptop:chrome:Default","keybag_locked":true}` {
+			t.Fatalf("auth_status = %s, want the degraded+locked note reply", marshalResult(t, r.got))
+		}
+		if elapsed := time.Since(start); elapsed > 2*time.Second {
+			t.Fatalf("handleAuthStatus took %v; authStatusTimeout must bound the probe near %v", elapsed, authStatusTimeout)
+		}
+		if c.getCalls() != 0 {
+			t.Fatalf("cache Get called %d times after a probe timeout; the fallback must skip the cache read", c.getCalls())
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("handleAuthStatus hung on a wedged probe; authStatusTimeout did not bound it")
+	}
+}
+
+// TestHandleAuthStatusBoundsWedgedUnwrapReportsLockedNote proves the cache read is bounded
+// too: the Enclave opened healthy and cached a key, then the screen locked and cache-unwrap
+// hangs (a helper round-trip with no deadline of its own). authStatusTimeout kills the
+// unwrap and the locked keybag is reported as the OK-with-note reply, not a FAIL.
+func TestHandleAuthStatusBoundsWedgedUnwrapReportsLockedNote(t *testing.T) {
+	fakeMesh(t, "me@laptop")
+	restore := authStatusTimeout
+	authStatusTimeout = 50 * time.Millisecond
+	t.Cleanup(func() { authStatusTimeout = restore })
+
+	ctx := context.Background()
+	wrapper, err := cache.OpenWrapper(ctx, helper.Bridge{Binary: writeHangingUnwrapHelper(t)})
+	if err != nil {
+		t.Fatalf("OpenWrapper: %v", err)
+	}
+	keyCache := cache.NewKeyCache(wrapper)
+	st := stateWith("me@laptop", "")
+	d := New(&fakeConsent{}, keyCache, nil, staticProbe(SessionSnapshot{OnConsole: true, Locked: true}), &recordingRunner{}, fixedState{st: st}, fixedState{st: st})
+
+	id := endpointID("me@laptop", "chrome", "Default")
+	if err := keyCache.Put(ctx, id, []byte("safe-storage-key"), 5*time.Minute); err != nil {
+		t.Fatalf("Put a wrapped key while unlocked: %v", err)
+	}
+
+	done := make(chan any, 1)
+	start := time.Now()
+	go func() {
+		got, err := d.handleAuthStatus(ctx, map[string]any{"browser": "chrome"})
+		if err != nil {
+			t.Errorf("handleAuthStatus must swallow the bounded-out unwrap, got %v", err)
+		}
+		done <- got
+	}()
+
+	select {
+	case got := <-done:
+		if marshalResult(t, got) != `{"authenticated":false,"degraded":false,"endpoint":"me@laptop:chrome:Default","keybag_locked":true}` {
+			t.Fatalf("auth_status = %s, want the locked note reply", marshalResult(t, got))
+		}
+		if elapsed := time.Since(start); elapsed > 2*time.Second {
+			t.Fatalf("handleAuthStatus took %v; authStatusTimeout must bound the unwrap", elapsed)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("handleAuthStatus hung on a wedged cache-unwrap; authStatusTimeout did not bound it")
+	}
+}
+
+// writeHangingUnwrapHelper writes a fake cookiesync-keyhelper that opens and wraps cleanly
+// — cache-newkey and cache-wrap succeed — but whose cache-unwrap hangs, the "keybag locked,
+// unwrap wedged after open" surface. It execs sleep so the bound's kill leaves no orphan.
+func writeHangingUnwrapHelper(t *testing.T) string {
+	t.Helper()
+	binary := filepath.Join(t.TempDir(), "cookiesync-keyhelper")
+	body := `#!/bin/sh
+case "$1" in
+cache-newkey|cache-dropkey)
+  exit 0
+  ;;
+cache-wrap)
+  exec cat
+  ;;
+cache-unwrap)
+  exec sleep 30
+  ;;
+*)
+  echo "unexpected verb $1" >&2
+  exit 99
+  ;;
+esac
+`
+	if err := os.WriteFile(binary, []byte(body), 0o755); err != nil { //nolint:gosec // test fixture script must be executable.
+		t.Fatalf("write hanging-unwrap helper: %v", err)
+	}
+	return binary
+}
+
 // TestConvergeMethodsShareOneExclusiveMutex proves every method that runs the
 // flock-wrapped converge pass — sync, reconcile, svc.sync, svc.reconcile — is
 // registered exclusive: two passes never hold the store lock at once, whichever
