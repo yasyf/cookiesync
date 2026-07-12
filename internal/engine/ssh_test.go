@@ -263,7 +263,7 @@ func writeFakeSSH(t *testing.T, dir, pidFile string, detachStdout bool) {
 		redir = " >/dev/null 2>&1 </dev/null"
 	}
 	script := "#!/bin/sh\nsleep 30" + redir + " &\necho \"$!\" > " + pidFile + "\nsleep 30\n"
-	if err := os.WriteFile(filepath.Join(dir, "ssh"), []byte(script), 0o755); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "ssh"), []byte(script), 0o700); err != nil { //nolint:gosec // G306: the fake ssh must be executable
 		t.Fatalf("write fake ssh: %v", err)
 	}
 }
@@ -273,7 +273,7 @@ func readSleeperPID(t *testing.T, pidFile string) int {
 	t.Helper()
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
-		raw, err := os.ReadFile(pidFile)
+		raw, err := os.ReadFile(pidFile) //nolint:gosec // G304: pidFile is a t.TempDir path
 		if err == nil {
 			if pid, perr := strconv.Atoi(strings.TrimSpace(string(raw))); perr == nil {
 				return pid

@@ -740,7 +740,7 @@ func (d *Daemon) remoteGetCookies(ctx context.Context, host, browser, profile st
 		// exec.CommandContext reports the deadline kill as a bare exit error that loses the
 		// context cause; restore it so the caller can branch on the wedged-peer case.
 		if rctx.Err() != nil {
-			return nil, fmt.Errorf("rpc get_cookies on %s: %w (underlying: %v)", host, rctx.Err(), err)
+			return nil, fmt.Errorf("rpc get_cookies on %s: %w (underlying: %w)", host, rctx.Err(), err)
 		}
 		return nil, err
 	}
