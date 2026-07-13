@@ -4,6 +4,20 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.10.4] - 2026-07-13
+
+### Fixed
+- `auth_status` no longer blocks past its 1.5s bound while a key-cache heal is mid-flight.
+  The heal's `cache-newkey` helper subprocess — a human-timescale Touch ID presence prompt —
+  ran while holding the cache lock every reader takes, so an in-flight heal stalled every
+  status read past its deadline (a context timeout cannot interrupt a `sync.Mutex.Lock`).
+  Readers now load the cached wrapper through an atomic pointer, lock-free, so status reads
+  never queue behind an in-flight heal; heals stay serialized, one prompt at a time.
+- `auth_status` derives its keybag verdict from an `ioreg`-only probe. The screen-share
+  `netstat` probe bears on consent routing, not keybag availability, so it no longer runs on
+  the doctor hot path (`ioreg` ~17ms, `netstat` ~4ms on a locked Mac). A cache read that
+  outruns the bound after an unlocked probe now reports `degraded`, not a forced lock.
+
 ## [0.10.3] - 2026-07-12
 
 ### Fixed

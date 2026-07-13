@@ -3,6 +3,7 @@ package daemon
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -381,6 +382,188 @@ esac
 		t.Fatalf("write hanging-unwrap helper: %v", err)
 	}
 	return binary
+}
+
+// writeBlockingHealHelper writes a fake cookiesync-keyhelper whose first cache-newkey
+// (the OpenWrapper probe) exits 3 to degrade, and whose next cache-newkey (a KeyCache
+// heal) appends to tallyPath then parks until releasePath exists — a heal wedged in its
+// presence prompt, so a test can drive auth_status against a cache mid-heal.
+func writeBlockingHealHelper(t *testing.T) (binary, tallyPath, releasePath string) {
+	t.Helper()
+	dir := t.TempDir()
+	binary = filepath.Join(dir, "cookiesync-keyhelper")
+	countPath := filepath.Join(dir, "newkey.count")
+	tallyPath = filepath.Join(dir, "heal.tally")
+	releasePath = filepath.Join(dir, "release")
+	body := `#!/bin/sh
+case "$1" in
+cache-newkey)
+  n=$(cat "` + countPath + `" 2>/dev/null || echo 0); n=$((n+1)); printf '%s' "$n" > "` + countPath + `"
+  if [ "$n" -gt 1 ]; then
+    printf 'x\n' >> "` + tallyPath + `"
+    while [ ! -f "` + releasePath + `" ]; do sleep 0.01; done
+  fi
+  exit 3
+  ;;
+*)
+  echo "unexpected verb $1" >&2
+  exit 99
+  ;;
+esac
+`
+	if err := os.WriteFile(binary, []byte(body), 0o755); err != nil { //nolint:gosec // test fixture script must be executable.
+		t.Fatalf("write blocking heal helper: %v", err)
+	}
+	return binary, tallyPath, releasePath
+}
+
+// TestHandleAuthStatusReturnsWhileAHealIsMidFlight proves the A1 lock split at the daemon
+// boundary: with a Put's heal parked in cache-newkey (its presence prompt), a status read
+// still returns within authStatusTimeout because the heal no longer holds the wrapper lock
+// the read's Degraded check takes.
+func TestHandleAuthStatusReturnsWhileAHealIsMidFlight(t *testing.T) {
+	fakeMesh(t, "me@laptop")
+	binary, tallyPath, releasePath := writeBlockingHealHelper(t)
+	wrapper, err := cache.OpenWrapper(context.Background(), helper.Bridge{Binary: binary})
+	if !errors.Is(err, cache.ErrSEPresenceUnavailable) {
+		t.Fatalf("OpenWrapper err = %v, want ErrSEPresenceUnavailable", err)
+	}
+	keyCache := cache.NewKeyCache(wrapper)
+	st := stateWith("me@laptop", "")
+	d := New(&fakeConsent{}, keyCache, nil, staticProbe(SessionSnapshot{}), &recordingRunner{}, fixedState{st: st}, fixedState{st: st})
+	d.probeKeybag = staticProbe(liveSession(currentUser(t)))
+
+	id := endpointID("me@laptop", "chrome", "Default")
+	putDone := make(chan error, 1)
+	go func() { putDone <- keyCache.Put(context.Background(), id, []byte("k"), 5*time.Minute) }()
+	t.Cleanup(func() {
+		_ = os.WriteFile(releasePath, nil, 0o600)
+		<-putDone
+	})
+	// Wait until the heal is parked in cache-newkey.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if data, _ := os.ReadFile(tallyPath); len(data) > 0 { //nolint:gosec // test-controlled temp file.
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("heal never parked in cache-newkey")
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+
+	done := make(chan any, 1)
+	start := time.Now()
+	go func() {
+		got, err := d.handleAuthStatus(context.Background(), map[string]any{"browser": "chrome"})
+		if err != nil {
+			t.Errorf("handleAuthStatus: %v", err)
+		}
+		done <- got
+	}()
+	select {
+	case <-done:
+		if elapsed := time.Since(start); elapsed > authStatusTimeout {
+			t.Fatalf("handleAuthStatus took %v with a heal mid-flight; the read must stay off the heal lock (bound %v)", elapsed, authStatusTimeout)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("handleAuthStatus hung with a heal mid-flight")
+	}
+}
+
+// TestHandleAuthStatusUsesKeybagProbeNotTheFullProbe proves auth_status reads the
+// ioreg-only keybag probe: the full probe (the one carrying the netstat screen-share leg)
+// never runs, and a screen-shared-but-unlocked keybag reports keybag_locked:false.
+func TestHandleAuthStatusUsesKeybagProbeNotTheFullProbe(t *testing.T) {
+	fakeMesh(t, "me@laptop")
+	st := stateWith("me@laptop", "")
+
+	var fullProbeCalls, keybagCalls atomic.Int32
+	fullProbe := func(_ context.Context) (SessionSnapshot, error) {
+		fullProbeCalls.Add(1)
+		// A locked verdict: were this probe wrongly used, keybag_locked would flip true.
+		return SessionSnapshot{OnConsole: true, Locked: true}, nil
+	}
+	keybagProbe := func(_ context.Context) (SessionSnapshot, error) {
+		keybagCalls.Add(1)
+		snap := liveSession(currentUser(t))
+		snap.ScreenShared = true
+		return snap, nil
+	}
+	d := New(&fakeConsent{}, newFakeCache(), nil, fullProbe, &recordingRunner{}, fixedState{st: st}, fixedState{st: st})
+	d.probeKeybag = keybagProbe
+
+	got, err := d.handleAuthStatus(context.Background(), map[string]any{"browser": "chrome"})
+	if err != nil {
+		t.Fatalf("handleAuthStatus: %v", err)
+	}
+	if fullProbeCalls.Load() != 0 {
+		t.Fatalf("auth_status ran the full probe %d times; it must read the keybag probe only (no netstat)", fullProbeCalls.Load())
+	}
+	if keybagCalls.Load() != 1 {
+		t.Fatalf("auth_status ran the keybag probe %d times, want 1", keybagCalls.Load())
+	}
+	if want := `{"authenticated":false,"degraded":false,"endpoint":"me@laptop:chrome:Default","keybag_locked":false}`; marshalResult(t, got) != want {
+		t.Fatalf("auth_status = %s, want %s (screen share must not lock the keybag)", marshalResult(t, got), want)
+	}
+}
+
+// TestWhoamiReadsScreenShareFromTheFullProbe proves whoami still draws its screen-share
+// signal from the full probe — only auth_status was moved to the keybag-only read.
+func TestWhoamiReadsScreenShareFromTheFullProbe(t *testing.T) {
+	me := currentUser(t)
+	st := stateWith("me@laptop", "")
+	full := liveSession(me)
+	full.ScreenShared = true
+	d := New(&fakeConsent{}, newFakeCache(), nil, staticProbe(full), &recordingRunner{}, fixedState{st: st}, fixedState{st: st})
+	// A keybag probe with no screen-share signal; whoami must not read it.
+	d.probeKeybag = staticProbe(liveSession(me))
+
+	got, err := d.handleWhoami(context.Background(), map[string]any{})
+	if err != nil {
+		t.Fatalf("handleWhoami: %v", err)
+	}
+	if m := got.(map[string]any); m["screen_shared"] != true {
+		t.Fatalf("whoami screen_shared = %v, want true (from the full probe)", m["screen_shared"])
+	}
+}
+
+// TestHandleAuthStatusMasksBoundedCacheReadAfterUnlockedProbe proves the masking fix: an
+// unlocked keybag probe followed by a cache read that outruns authStatusTimeout reports
+// degraded:true, authenticated:false, and keybag_locked:false — not a forced lock and not
+// a raw RPC error.
+func TestHandleAuthStatusMasksBoundedCacheReadAfterUnlockedProbe(t *testing.T) {
+	fakeMesh(t, "me@laptop")
+	restore := authStatusTimeout
+	authStatusTimeout = 30 * time.Millisecond
+	t.Cleanup(func() { authStatusTimeout = restore })
+
+	st := stateWith("me@laptop", "")
+	c := &blockingGetCache{fakeCache: newFakeCache()}
+	c.degraded = true
+	d := New(&fakeConsent{}, c, nil, staticProbe(SessionSnapshot{}), &recordingRunner{}, fixedState{st: st}, fixedState{st: st})
+	d.probeKeybag = staticProbe(liveSession(currentUser(t)))
+
+	done := make(chan any, 1)
+	start := time.Now()
+	go func() {
+		got, err := d.handleAuthStatus(context.Background(), map[string]any{"browser": "chrome"})
+		if err != nil {
+			t.Errorf("handleAuthStatus must swallow the bounded-out read, got %v", err)
+		}
+		done <- got
+	}()
+	select {
+	case got := <-done:
+		if want := `{"authenticated":false,"degraded":true,"endpoint":"me@laptop:chrome:Default","keybag_locked":false}`; marshalResult(t, got) != want {
+			t.Fatalf("auth_status = %s, want %s", marshalResult(t, got), want)
+		}
+		if elapsed := time.Since(start); elapsed > 2*time.Second {
+			t.Fatalf("handleAuthStatus took %v; authStatusTimeout must bound the read", elapsed)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("handleAuthStatus hung on a blocking cache read")
+	}
 }
 
 // TestConvergeMethodsShareOneExclusiveMutex proves every method that runs the

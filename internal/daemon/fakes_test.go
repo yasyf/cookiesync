@@ -293,6 +293,17 @@ func (c *fakeCache) Degraded() bool {
 	return c.degraded
 }
 
+// blockingGetCache is a fakeCache whose Get parks until its context is cancelled, the
+// stand-in for a cache read that outruns authStatusTimeout.
+type blockingGetCache struct {
+	*fakeCache
+}
+
+func (c *blockingGetCache) Get(ctx context.Context, _ string) ([]byte, bool, error) {
+	<-ctx.Done()
+	return nil, false, ctx.Err()
+}
+
 // raceEvictCache drops every entry once, right after the Put for evictOn lands —
 // the concurrent heal-EvictAll race the requested-endpoint-last verify re-Put in
 // releaseAllLocal guards against.

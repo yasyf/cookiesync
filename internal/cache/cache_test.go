@@ -453,32 +453,32 @@ func TestPutRewrapsWhenAHealSwapsMidPut(t *testing.T) {
 	c := NewKeyCache(hw)
 	key := testKey()
 
-	// Park the stale Put on c.mu after its re-probe stayed degraded (identity blob
-	// in hand), let a second Put heal and swap, then release: the stale Put must
-	// notice the swap and re-wrap through the Enclave instead of inserting.
+	// Park the stale Put on c.mu after its re-probe stayed degraded (identity blob in
+	// hand), swap the wrapper to the Enclave underneath it, then release: the stale Put
+	// must notice the swap and re-wrap through the Enclave instead of inserting. The swap
+	// is applied directly, not via a second Put, to drive exactly one flight: a second Put
+	// would join the parked re-probe, then re-probe again once it stayed degraded, muddying
+	// the cache-newkey count.
 	c.mu.Lock()
 	stale := make(chan error, 1)
 	go func() { stale <- c.Put(ctx, endpoint, key, 30*time.Second) }()
 	waitFor(t, func() bool { return strings.Count(readFile(t, logPath), "cache-newkey") == 2 })
 
-	healing := make(chan error, 1)
-	go func() { healing <- c.Put(ctx, other, key, 30*time.Second) }()
-	waitFor(t, func() bool { return !hw.degraded() })
+	hw.se.Store(&SecureEnclaveWrapper{helper: hw.bridge, label: hw.label})
 	c.mu.Unlock()
 
 	if err := <-stale; err != nil {
 		t.Fatalf("stale Put: %v", err)
 	}
-	if err := <-healing; err != nil {
-		t.Fatalf("healing Put: %v", err)
+	if got := strings.Count(readFile(t, logPath), "cache-wrap"); got != 1 {
+		t.Fatalf("cache-wrap ran %d times, want 1 (the stale Put's re-wrap through the Enclave)", got)
 	}
-	if got := strings.Count(readFile(t, logPath), "cache-wrap"); got != 2 {
-		t.Fatalf("cache-wrap ran %d times, want 2 (the healing Put plus the stale Put's re-wrap)", got)
+	e, ok := c.entries[endpoint]
+	if !ok {
+		t.Fatalf("stale Put stored no entry")
 	}
-	for id, e := range c.entries {
-		if !bytes.Equal(e.blob, xor(key)) {
-			t.Fatalf("entry %s = %x, want Enclave-wrapped %x (identity blob crossed the heal swap)", id, e.blob, xor(key))
-		}
+	if !bytes.Equal(e.blob, xor(key)) {
+		t.Fatalf("entry = %x, want Enclave-wrapped %x (identity blob crossed the heal swap)", e.blob, xor(key))
 	}
 }
 
@@ -817,4 +817,394 @@ func readFile(t *testing.T, path string) string {
 		t.Fatalf("read %s: %v", path, err)
 	}
 	return string(data)
+}
+
+// writeBlockingNewkeyHelper writes a fake cookiesync-keyhelper whose cache-newkey appends
+// one line to tallyPath — an invocation tally — then blocks until releasePath exists and
+// exits 3 (stays degraded). It stands in for a heal's Touch ID presence prompt parked at
+// human timescale, so a test can prove reads don't queue behind it.
+func writeBlockingNewkeyHelper(t *testing.T) (binary, tallyPath, releasePath string) {
+	t.Helper()
+	dir := t.TempDir()
+	binary = filepath.Join(dir, "cookiesync-keyhelper")
+	tallyPath = filepath.Join(dir, "newkey.tally")
+	releasePath = filepath.Join(dir, "release")
+	body := `#!/bin/sh
+case "$1" in
+cache-newkey)
+  printf 'x\n' >> "` + tallyPath + `"
+  while [ ! -f "` + releasePath + `" ]; do sleep 0.01; done
+  exit 3
+  ;;
+*)
+  echo "unexpected verb $1" >&2
+  exit 99
+  ;;
+esac
+`
+	if err := os.WriteFile(binary, []byte(body), 0o755); err != nil { //nolint:gosec // test fixture script must be executable.
+		t.Fatalf("write blocking newkey helper: %v", err)
+	}
+	return binary, tallyPath, releasePath
+}
+
+func tallyCount(t *testing.T, path string) int {
+	t.Helper()
+	data, err := os.ReadFile(path) //nolint:gosec // path is a test-controlled temp file.
+	if errors.Is(err, os.ErrNotExist) {
+		return 0
+	}
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	return strings.Count(string(data), "x\n")
+}
+
+func TestDegradedReadsDoNotBlockOnAnInFlightHeal(t *testing.T) {
+	binary, tallyPath, releasePath := writeBlockingNewkeyHelper(t)
+	hw := &healingWrapper{bridge: helper.Bridge{Binary: binary}, label: "test-label"}
+	c := NewKeyCache(hw)
+	if !c.Degraded() {
+		t.Fatalf("Degraded() = false at open over a healingWrapper")
+	}
+
+	// A Put whose heal parks in cache-newkey, the human-timescale presence prompt.
+	putDone := make(chan error, 1)
+	go func() { putDone <- c.Put(context.Background(), endpoint, testKey(), 30*time.Second) }()
+	waitFor(t, func() bool { return tallyCount(t, tallyPath) == 1 })
+
+	// While the heal is parked holding w.mu across the subprocess, a concurrent reader
+	// must return well under a short bound — reads load the wrapper atomically, never
+	// taking w.mu. A reader that instead queued on the heal lock would block until the
+	// release below and trip the 2s watchdog.
+	readDone := make(chan time.Duration, 1)
+	go func() {
+		start := time.Now()
+		_ = c.Degraded()
+		if _, _, err := c.Get(context.Background(), endpoint); err != nil {
+			t.Errorf("Get during in-flight heal: %v", err)
+		}
+		readDone <- time.Since(start)
+	}()
+	select {
+	case elapsed := <-readDone:
+		if elapsed > 250*time.Millisecond {
+			t.Fatalf("reads took %v behind an in-flight heal; the heal must not hold the read lock", elapsed)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("reads blocked behind the in-flight heal")
+	}
+
+	if err := os.WriteFile(releasePath, nil, 0o600); err != nil {
+		t.Fatalf("release the heal: %v", err)
+	}
+	if err := <-putDone; err != nil {
+		t.Fatalf("Put after release: %v", err)
+	}
+}
+
+// writeGatedNewkeyHelper writes a helper whose cache-newkey blocks until a release
+// file appears and then exits thenCode, so a heal can be parked mid-flight. It tallies
+// cache-newkey and cache-dropkey invocations and XORs cache-wrap/cache-unwrap.
+func writeGatedNewkeyHelper(t *testing.T, thenCode int) (binary, newkeyTally, dropTally, releasePath string) {
+	t.Helper()
+	dir := t.TempDir()
+	binary = filepath.Join(dir, "cookiesync-keyhelper")
+	newkeyTally = filepath.Join(dir, "newkey.tally")
+	dropTally = filepath.Join(dir, "drop.tally")
+	releasePath = filepath.Join(dir, "release")
+	body := `#!/bin/sh
+verb="$1"
+case "$verb" in
+cache-newkey)
+  printf 'x\n' >> "` + newkeyTally + `"
+  while [ ! -f "` + releasePath + `" ]; do sleep 0.01; done
+  exit ` + strconv.Itoa(thenCode) + `
+  ;;
+cache-wrap|cache-unwrap)
+  exec /usr/bin/perl -0777 -pe 's/(.)/chr(ord($1)^0x5A)/ges'
+  ;;
+cache-dropkey)
+  printf 'x\n' >> "` + dropTally + `"
+  exit 0
+  ;;
+*)
+  echo "unexpected verb $verb" >&2
+  exit 99
+  ;;
+esac
+`
+	if err := os.WriteFile(binary, []byte(body), 0o755); err != nil { //nolint:gosec // test fixture script must be executable.
+		t.Fatalf("write gated newkey helper: %v", err)
+	}
+	return binary, newkeyTally, dropTally, releasePath
+}
+
+// writeCtxExpiryNewkeyHelper writes a helper whose first cache-newkey blocks forever
+// (until its ctx-killed subprocess dies) and whose second and later calls exit 0, so a
+// healer's ctx can expire mid-probe and a live-ctx waiter can re-probe to success.
+func writeCtxExpiryNewkeyHelper(t *testing.T) (binary, newkeyTally string) {
+	t.Helper()
+	dir := t.TempDir()
+	binary = filepath.Join(dir, "cookiesync-keyhelper")
+	newkeyTally = filepath.Join(dir, "newkey.tally")
+	countPath := filepath.Join(dir, "newkey.count")
+	body := `#!/bin/sh
+verb="$1"
+case "$verb" in
+cache-newkey)
+  n=$(cat "` + countPath + `" 2>/dev/null || echo 0)
+  n=$((n+1))
+  printf '%s' "$n" > "` + countPath + `"
+  printf 'x\n' >> "` + newkeyTally + `"
+  if [ "$n" -ge 2 ]; then exit 0; fi
+  while true; do sleep 0.01; done
+  ;;
+cache-wrap|cache-unwrap)
+  exec /usr/bin/perl -0777 -pe 's/(.)/chr(ord($1)^0x5A)/ges'
+  ;;
+cache-dropkey)
+  exit 0
+  ;;
+*)
+  echo "unexpected verb $verb" >&2
+  exit 99
+  ;;
+esac
+`
+	if err := os.WriteFile(binary, []byte(body), 0o755); err != nil { //nolint:gosec // test fixture script must be executable.
+		t.Fatalf("write ctx-expiry newkey helper: %v", err)
+	}
+	return binary, newkeyTally
+}
+
+func TestConcurrentDegradedPutsShareOneSuccessfulHeal(t *testing.T) {
+	binary, newkeyTally, dropTally, releasePath := writeGatedNewkeyHelper(t, 0)
+	hw := &healingWrapper{bridge: helper.Bridge{Binary: binary}, label: "test-label"}
+	c := NewKeyCache(hw)
+	if !c.Degraded() {
+		t.Fatalf("Degraded() = false at open over a healingWrapper")
+	}
+
+	const n = 8
+	key := testKey()
+	errs := make(chan error, n)
+	for range n {
+		go func() { errs <- c.Put(context.Background(), endpoint, key, 30*time.Second) }()
+	}
+	// Every other Put queues on w.mu behind the one heal parked at cache-newkey; no
+	// second probe starts while it is in flight.
+	waitFor(t, func() bool { return tallyCount(t, newkeyTally) == 1 })
+	time.Sleep(100 * time.Millisecond)
+	if got := tallyCount(t, newkeyTally); got != 1 {
+		t.Fatalf("cache-newkey ran %d times while one heal was in flight, want 1", got)
+	}
+
+	if err := os.WriteFile(releasePath, nil, 0o600); err != nil {
+		t.Fatalf("release the heal: %v", err)
+	}
+	for range n {
+		if err := <-errs; err != nil {
+			t.Fatalf("degraded Put: %v", err)
+		}
+	}
+	// One success installs the Enclave key exactly once; every queued Put sees se
+	// installed and never re-probes, so there is no second Touch ID prompt and no
+	// key-wiping second cache-newkey.
+	if got := tallyCount(t, newkeyTally); got != 1 {
+		t.Fatalf("cache-newkey ran %d times for %d Puts sharing one successful heal, want 1", got, n)
+	}
+	if c.Degraded() {
+		t.Fatalf("Degraded() = true after the heal installed the Enclave key")
+	}
+	c.mu.Lock()
+	e, ok := c.entries[endpoint]
+	c.mu.Unlock()
+	if !ok {
+		t.Fatalf("no entry after the healing Puts")
+	}
+	if !bytes.Equal(e.blob, xor(key)) {
+		t.Fatalf("entry = %x, want the Enclave-wrapped %x", e.blob, xor(key))
+	}
+	if err := hw.Close(context.Background()); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if got := tallyCount(t, dropTally); got != 1 {
+		t.Fatalf("cache-dropkey ran %d times on Close, want 1", got)
+	}
+}
+
+func TestCloseRacingASuccessfulHealLeavesNoEnclaveKey(t *testing.T) {
+	binary, newkeyTally, dropTally, releasePath := writeGatedNewkeyHelper(t, 0)
+	hw := &healingWrapper{bridge: helper.Bridge{Binary: binary}, label: "test-label"}
+	c := NewKeyCache(hw)
+
+	putDone := make(chan error, 1)
+	go func() { putDone <- c.Put(context.Background(), endpoint, testKey(), 30*time.Second) }()
+	waitFor(t, func() bool { return tallyCount(t, newkeyTally) == 1 })
+
+	// Close is issued while the probe is parked; it queues on w.mu behind the heal,
+	// so the key the exit-0 probe installs is there for Close to drop.
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- hw.Close(context.Background()) }()
+	time.Sleep(100 * time.Millisecond)
+	if err := os.WriteFile(releasePath, nil, 0o600); err != nil {
+		t.Fatalf("release the heal: %v", err)
+	}
+	if err := <-putDone; err != nil {
+		t.Fatalf("Put racing Close: %v", err)
+	}
+	if err := <-closeDone; err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	// The exit-0 probe created an Enclave key before Close's verdict landed; it must
+	// not survive: every created key gets dropped, and nothing Enclave-backed is
+	// handed out after Close.
+	created, dropped := tallyCount(t, newkeyTally), tallyCount(t, dropTally)
+	if created != dropped {
+		t.Fatalf("cache-newkey ran %d times but cache-dropkey %d; the key created by the flight racing Close must be dropped", created, dropped)
+	}
+	if !c.Degraded() {
+		t.Fatalf("Degraded() = false after Close; nothing Enclave-backed may be handed out post-Close")
+	}
+}
+
+func TestCloseWaitsForInFlightHealThenDropsTheKey(t *testing.T) {
+	binary, newkeyTally, dropTally, releasePath := writeGatedNewkeyHelper(t, 0)
+	hw := &healingWrapper{bridge: helper.Bridge{Binary: binary}, label: "test-label"}
+	c := NewKeyCache(hw)
+
+	putDone := make(chan error, 1)
+	go func() { putDone <- c.Put(context.Background(), endpoint, testKey(), 30*time.Second) }()
+	waitFor(t, func() bool { return tallyCount(t, newkeyTally) == 1 })
+
+	// Close lands while the heal is parked in cache-newkey. It must wait for that heal so
+	// the Enclave key the heal installs gets dropped — not return early past a still-nil se.
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- hw.Close(context.Background()) }()
+	time.Sleep(100 * time.Millisecond)
+	if got := tallyCount(t, dropTally); got != 0 {
+		t.Fatalf("cache-dropkey ran %d times before the heal finished, want 0", got)
+	}
+
+	if err := os.WriteFile(releasePath, nil, 0o600); err != nil {
+		t.Fatalf("release the heal: %v", err)
+	}
+	if err := <-putDone; err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	if err := <-closeDone; err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if got := tallyCount(t, newkeyTally); got != 1 {
+		t.Fatalf("cache-newkey ran %d times, want 1 (Close must not spawn a second heal)", got)
+	}
+	if got := tallyCount(t, dropTally); got != 1 {
+		t.Fatalf("cache-dropkey ran %d times, want 1 (Close drops the in-flight heal's key exactly once)", got)
+	}
+}
+
+func TestCloseWithFailedDropLeavesTheKeyRetryable(t *testing.T) {
+	binary, _, dropTally, releasePath := writeGatedNewkeyHelper(t, 0)
+	hw := &healingWrapper{bridge: helper.Bridge{Binary: binary}, label: "test-label"}
+	c := NewKeyCache(hw)
+
+	// Install a real Enclave key first.
+	if err := os.WriteFile(releasePath, nil, 0o600); err != nil {
+		t.Fatalf("release the heal: %v", err)
+	}
+	if err := c.Put(context.Background(), endpoint, testKey(), 30*time.Second); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	if c.Degraded() {
+		t.Fatalf("Degraded() = true, want a healed wrapper before Close")
+	}
+
+	// A Close whose cache-dropkey fails (here: an already-canceled ctx kills the drop
+	// subprocess) must surface the error and NOT clear se — otherwise the key leaks
+	// non-retryably and a later Close falsely reports success against a live key.
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := hw.Close(canceled); err == nil {
+		t.Fatalf("Close with a canceled ctx: got nil, want the drop error")
+	}
+	if c.Degraded() {
+		t.Fatalf("Degraded() = true after a failed drop: se was cleared, the key leaked non-retryably")
+	}
+	if got := tallyCount(t, dropTally); got != 0 {
+		t.Fatalf("cache-dropkey ran %d times on the canceled drop, want 0", got)
+	}
+
+	// A retry with a live ctx must actually drop the still-present key.
+	if err := hw.Close(context.Background()); err != nil {
+		t.Fatalf("retry Close: %v", err)
+	}
+	if !c.Degraded() {
+		t.Fatalf("Degraded() = false after a successful retry Close")
+	}
+	if got := tallyCount(t, dropTally); got != 1 {
+		t.Fatalf("cache-dropkey ran %d times, want 1 (the retry dropped the key exactly once)", got)
+	}
+}
+
+func TestHealAfterCloseStaysDegradedWithoutAKey(t *testing.T) {
+	binary, newkeyTally, _, _ := writeGatedNewkeyHelper(t, 0)
+	hw := &healingWrapper{bridge: helper.Bridge{Binary: binary}, label: "test-label"}
+	c := NewKeyCache(hw)
+
+	if err := hw.Close(context.Background()); err != nil {
+		t.Fatalf("Close while degraded: %v", err)
+	}
+	// A Put after Close must not spawn cache-newkey: closed rejects the heal and the wrapper
+	// stays in-memory.
+	key := testKey()
+	if err := c.Put(context.Background(), endpoint, key, 30*time.Second); err != nil {
+		t.Fatalf("Put after Close: %v", err)
+	}
+	if got := tallyCount(t, newkeyTally); got != 0 {
+		t.Fatalf("cache-newkey ran %d times after Close, want 0 (closed rejects new heals)", got)
+	}
+	if !c.Degraded() {
+		t.Fatalf("Degraded() = false after Close-while-degraded")
+	}
+	c.mu.Lock()
+	blob := c.entries[endpoint].blob
+	c.mu.Unlock()
+	if !bytes.Equal(blob, key) {
+		t.Fatalf("entry = %x, want the identity RAM copy %x", blob, key)
+	}
+}
+
+func TestHealerCtxExpiryLetsAWaiterBecomeTheNextHealer(t *testing.T) {
+	binary, newkeyTally := writeCtxExpiryNewkeyHelper(t)
+	hw := &healingWrapper{bridge: helper.Bridge{Binary: binary}, label: "test-label"}
+	c := NewKeyCache(hw)
+
+	leaderCtx, cancelLeader := context.WithCancel(context.Background())
+	defer cancelLeader()
+	leaderErr := make(chan error, 1)
+	go func() { leaderErr <- c.Put(leaderCtx, endpoint, testKey(), 30*time.Second) }()
+	waitFor(t, func() bool { return tallyCount(t, newkeyTally) == 1 })
+
+	// A second Put with a live ctx queues on w.mu behind the leader's probe.
+	waiterErr := make(chan error, 1)
+	go func() { waiterErr <- c.Put(context.Background(), other, testKey(), 30*time.Second) }()
+	time.Sleep(100 * time.Millisecond)
+
+	// The leader's ctx expires mid-cache-newkey: its subprocess dies, its heal fails, and it
+	// releases w.mu. The queued waiter, ctx still live, runs its own probe and heals —
+	// a queued Put must not inherit the leader's cancellation.
+	cancelLeader()
+	if err := <-leaderErr; err == nil {
+		t.Fatalf("leader Put succeeded, want the cancelled-ctx failure")
+	}
+	if err := <-waiterErr; err != nil {
+		t.Fatalf("waiter Put after leader ctx expiry: %v", err)
+	}
+	if c.Degraded() {
+		t.Fatalf("Degraded() = true; the waiter's live-ctx re-probe should have healed")
+	}
+	if got := tallyCount(t, newkeyTally); got != 2 {
+		t.Fatalf("cache-newkey ran %d times, want 2 (leader killed, waiter re-probed to success)", got)
+	}
 }

@@ -94,13 +94,14 @@ type StateLoader interface {
 // gate, the Enclave-backed cache, the sync engine, the ioreg session probe, and the
 // ssh runner.
 type Daemon struct {
-	consent  cookie.Consent
-	cache    Cache
-	engine   *engine.Engine
-	probe    Probe
-	runner   engine.SSHRunner
-	state    StateLoader
-	registry RegistryLoader
+	consent     cookie.Consent
+	cache       Cache
+	engine      *engine.Engine
+	probe       Probe
+	probeKeybag Probe
+	runner      engine.SSHRunner
+	state       StateLoader
+	registry    RegistryLoader
 
 	// batchFlight collapses concurrent primeAuth calls into one flight per release
 	// mode and requestor, so a burst of cold primes from one principal — same
@@ -158,6 +159,10 @@ func Build(ctx context.Context) (*Daemon, func(context.Context) error, error) {
 	eng := engine.New(store, keyCache, runner, engine.NewDigestRecorder())
 
 	d := New(cookie.TouchIDConsent{}, keyCache, eng, ProbeSession, runner, store, store)
+	// auth_status derives keybag_locked from the console session alone, so it reads the
+	// ioreg-only probe — the netstat screen-share leg (unused for that verdict) never
+	// runs on the doctor hot path.
+	d.probeKeybag = probeKeybag
 
 	closer := func(ctx context.Context) error {
 		keyCache.EvictAll()
@@ -166,19 +171,22 @@ func Build(ctx context.Context) (*Daemon, func(context.Context) error, error) {
 	return d, closer, nil
 }
 
-// New builds a daemon over injected collaborators, for tests and for Build. The nonce
-// source defaults to crypto/rand; override the field after construction to pin it.
+// New builds a daemon over injected collaborators, for tests and for Build. probeKeybag
+// defaults to probe (the full session read); Build overrides it with the ioreg-only
+// keybag probe, and an auth_status test pins it directly. The nonce source defaults to
+// crypto/rand; override the field after construction to pin it.
 func New(consent cookie.Consent, c Cache, eng *engine.Engine, probe Probe, runner engine.SSHRunner, st StateLoader, reg RegistryLoader) *Daemon {
 	return &Daemon{
-		consent:  consent,
-		cache:    c,
-		engine:   eng,
-		probe:    probe,
-		runner:   runner,
-		state:    st,
-		registry: reg,
-		grants:   map[string]time.Time{},
-		newNonce: newNonce,
+		consent:     consent,
+		cache:       c,
+		engine:      eng,
+		probe:       probe,
+		probeKeybag: probe,
+		runner:      runner,
+		state:       st,
+		registry:    reg,
+		grants:      map[string]time.Time{},
+		newNonce:    newNonce,
 	}
 }
 

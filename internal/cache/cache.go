@@ -25,6 +25,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/yasyf/cookiesync/internal/helper"
@@ -172,39 +173,47 @@ func (memoryWrapper) Close(context.Context) error { return nil }
 // SecureEnclaveWrapper the first time a heal re-probe finds the keybag unlocked.
 // KeyCache drives heal from Put and evicts every entry on the swap, so no
 // identity-wrapped blob outlives the degradation.
+//
+// Readers are lock-free: current and degraded load se atomically and never take
+// w.mu, so a heal parked in cache-newkey — a human-timescale Touch ID presence
+// prompt — cannot stall them. w.mu serializes only the writers, heal and Close.
 type healingWrapper struct {
 	bridge helper.Bridge
 	label  string
 
-	mu sync.Mutex
-	se *SecureEnclaveWrapper
+	se atomic.Pointer[SecureEnclaveWrapper] // nil while degraded; written under w.mu, read lock-free
+
+	mu     sync.Mutex // serializes heal and Close; readers never take it
+	closed bool       // rejects heals after Close, so shutdown never mints a new key
 }
 
 // current is the wrapper blobs are wrapped and unwrapped with right now: the
 // Enclave wrapper once healed, the identity memoryWrapper while degraded.
 func (w *healingWrapper) current() Wrapper {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	if w.se != nil {
-		return w.se
+	if se := w.se.Load(); se != nil {
+		return se
 	}
 	return memoryWrapper{}
 }
 
 func (w *healingWrapper) degraded() bool {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	return w.se == nil
+	return w.se.Load() == nil
 }
 
 // heal re-probes cache-newkey while degraded, returning the wrapper to wrap with
-// and whether this call performed the memory-to-Enclave swap. A probe exit 3 stays
-// degraded silently; any other non-zero exit fails the caller's Put loudly.
+// and whether this call performed the memory-to-Enclave swap. w.mu is held across
+// the subprocess: probes run serially, one prompt at a time under the caller's own
+// ctx, and a Put queued behind a successful heal sees se installed and returns
+// without re-probing. Exit 3 stays degraded silently; any other non-zero exit
+// fails the caller's Put loudly.
 func (w *healingWrapper) heal(ctx context.Context) (Wrapper, bool, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	if w.se != nil {
-		return w.se, false, nil
+	if se := w.se.Load(); se != nil {
+		return se, false, nil
+	}
+	if w.closed {
+		return memoryWrapper{}, false, nil
 	}
 	result, err := w.bridge.CacheNewkey(ctx, w.label)
 	if err != nil {
@@ -212,8 +221,9 @@ func (w *healingWrapper) heal(ctx context.Context) (Wrapper, bool, error) {
 	}
 	switch result.Code {
 	case 0:
-		w.se = &SecureEnclaveWrapper{helper: w.bridge, label: w.label}
-		return w.se, true, nil
+		se := &SecureEnclaveWrapper{helper: w.bridge, label: w.label}
+		w.se.Store(se)
+		return se, true, nil
 	case helper.CodePresenceUnavailable:
 		return memoryWrapper{}, false, nil
 	default:
@@ -230,13 +240,24 @@ func (w *healingWrapper) Unwrap(ctx context.Context, blob []byte) ([]byte, error
 	return w.current().Unwrap(ctx, blob)
 }
 
+// Close waits for any in-flight heal (via w.mu), then drops the Enclave key if
+// one was installed; closed makes every later heal return degraded without a
+// new key. se is cleared only after the drop succeeds, so a failed drop leaves
+// the key observable and a later Close can retry it rather than silently
+// reporting success against a still-live key.
 func (w *healingWrapper) Close(ctx context.Context) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	if w.se == nil {
+	w.closed = true
+	se := w.se.Load()
+	if se == nil {
 		return nil
 	}
-	return w.se.Close(ctx)
+	if err := se.Close(ctx); err != nil {
+		return err
+	}
+	w.se.Store(nil)
+	return nil
 }
 
 // entry is one cached key: the wrapped blob, the wrapper that produced it, and its

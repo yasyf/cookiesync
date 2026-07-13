@@ -108,26 +108,43 @@ func parseScreenShare(payload []byte) (bool, error) {
 	return false, nil
 }
 
-// ProbeSession is the production Probe: it shells ioreg for the console session, then
-// netstat for an inbound screen share, and folds both into the snapshot.
-func ProbeSession(ctx context.Context) (SessionSnapshot, error) {
+// probeKeybag shells ioreg for the console session — the keybag-availability half of a
+// full probe, carrying no screen-share signal. It is the read auth_status runs so the
+// unused netstat leg stays off the doctor hot path.
+func probeKeybag(ctx context.Context) (SessionSnapshot, error) {
 	cmd := exec.CommandContext(ctx, ioregArgv[0], ioregArgv[1:]...) //nolint:gosec // G204: ioregArgv is a fixed argv, not user-supplied.
 	out, err := cmd.Output()
 	if err != nil {
 		return SessionSnapshot{}, fmt.Errorf("run ioreg: %w", err)
 	}
-	snapshot, err := parseSession(out)
-	if err != nil {
-		return SessionSnapshot{}, err
-	}
+	return parseSession(out)
+}
+
+// probeScreenShare shells netstat for an inbound Screen Sharing session mirroring this
+// host's console, the signal consent routing folds into a full probe.
+func probeScreenShare(ctx context.Context) (bool, error) {
 	netCmd := exec.CommandContext(ctx, screenShareArgv[0], screenShareArgv[1:]...) //nolint:gosec // G204: screenShareArgv is a fixed argv, not user-supplied.
 	netOut, err := netCmd.Output()
 	if err != nil {
-		return SessionSnapshot{}, fmt.Errorf("run netstat: %w", err)
+		return false, fmt.Errorf("run netstat: %w", err)
 	}
 	shared, err := parseScreenShare(netOut)
 	if err != nil {
-		return SessionSnapshot{}, fmt.Errorf("parse netstat: %w", err)
+		return false, fmt.Errorf("parse netstat: %w", err)
+	}
+	return shared, nil
+}
+
+// ProbeSession is the production Probe: it shells ioreg for the console session, then
+// netstat for an inbound screen share, and folds both into the snapshot.
+func ProbeSession(ctx context.Context) (SessionSnapshot, error) {
+	snapshot, err := probeKeybag(ctx)
+	if err != nil {
+		return SessionSnapshot{}, err
+	}
+	shared, err := probeScreenShare(ctx)
+	if err != nil {
+		return SessionSnapshot{}, err
 	}
 	snapshot.ScreenShared = shared
 	return snapshot, nil

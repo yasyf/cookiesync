@@ -349,15 +349,18 @@ func (d *Daemon) primeAuthAll(ctx context.Context, requestor, reason string) (ma
 // cache is degraded to process memory (Secure Enclave presence unavailable at open, not
 // yet healed by a Put), and whether the daemon user's keybag is unavailable — the console
 // session locked, absent, or held by another user via fast user switching — the frozen
-// {"endpoint", "authenticated", "degraded", "keybag_locked"} shape. The probe and cache read
-// run under authStatusTimeout so a status read never blocks the caller: a probe that outruns
-// the bound reports the host locked (the keybag is unreadable to a live read) without
-// touching the cache, since a key is unservable while locked anyway. A locked keybag makes a
-// live cache-unwrap refuse the per-boot key (ErrSEPresenceUnavailable), and an unwrap that
-// outruns the bound fails the same way; both are swallowed as authenticated:false rather
-// than a raw RPC failure. Any other Get error, and any probe failure that is not the bound,
-// still propagates. context.Cause tells the bound apart from a parent cancel so a caller
-// that went away is never reported as locked.
+// {"endpoint", "authenticated", "degraded", "keybag_locked"} shape. The keybag verdict
+// comes from probeKeybag, the ioreg-only console read: netstat's screen-share signal bears
+// on consent routing, not keybag availability, so it stays off this hot path. The probe and
+// cache read run under authStatusTimeout so a status read never blocks the caller. Only a
+// probe that itself outruns the bound (ioreg wedged) or fails forces keybag_locked true and
+// skips the cache, since a key is unservable while the keybag is unreadable. After a
+// successful probe keybag_locked is the probe's verdict, and a cache read that outruns the
+// bound — or, while locked, refuses the per-boot key (ErrSEPresenceUnavailable) — is
+// swallowed as authenticated:false rather than a raw RPC failure, so a mid-flight heal or a
+// wedged unwrap never fails the status query. Any other Get error, and any probe failure
+// that is not the bound, still propagates. context.Cause tells the bound apart from a parent
+// cancel so a caller that went away is never reported as locked.
 func (d *Daemon) handleAuthStatus(ctx context.Context, params map[string]any) (any, error) {
 	browser, err := stringParam(params, "browser")
 	if err != nil {
@@ -373,7 +376,7 @@ func (d *Daemon) handleAuthStatus(ctx context.Context, params map[string]any) (a
 	statusCtx, cancel := context.WithTimeoutCause(ctx, authStatusTimeout, errAuthStatusTimeout)
 	defer cancel()
 
-	snap, err := d.probe(statusCtx)
+	snap, err := d.probeKeybag(statusCtx)
 	if err != nil {
 		if !errors.Is(context.Cause(statusCtx), errAuthStatusTimeout) {
 			return nil, err
@@ -386,9 +389,12 @@ func (d *Daemon) handleAuthStatus(ctx context.Context, params map[string]any) (a
 	}
 
 	_, ok, err := d.cache.Get(statusCtx, id)
-	unservable := locked && (errors.Is(err, cache.ErrSEPresenceUnavailable) || errors.Is(context.Cause(statusCtx), errAuthStatusTimeout))
-	if err != nil && !unservable {
-		return nil, err
+	if err != nil {
+		timedOut := errors.Is(context.Cause(statusCtx), errAuthStatusTimeout)
+		sePresence := locked && errors.Is(err, cache.ErrSEPresenceUnavailable)
+		if !timedOut && !sePresence {
+			return nil, err
+		}
 	}
 	return map[string]any{"endpoint": id, "authenticated": ok, "degraded": d.cache.Degraded(), "keybag_locked": locked}, nil
 }
