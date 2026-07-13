@@ -145,10 +145,16 @@ func (w *SecureEnclaveWrapper) Unwrap(ctx context.Context, blob []byte) ([]byte,
 }
 
 // Close drops the per-boot Enclave key via cache-dropkey. It is idempotent: the
-// helper exits 0 even when the key is already gone.
+// helper exits 0 even when the key is already gone. A nonzero exit — a locked
+// keybag included — leaves the key live and is surfaced as a retryable error.
 func (w *SecureEnclaveWrapper) Close(ctx context.Context) error {
-	if _, err := w.helper.CacheDropkey(ctx, w.label); err != nil {
+	result, err := w.helper.CacheDropkey(ctx, w.label)
+	if err != nil {
 		return err
+	}
+	if result.Code != 0 {
+		return fmt.Errorf("cache-dropkey exited %d (key still live): %s",
+			result.Code, bytes.TrimSpace(result.Stderr))
 	}
 	return nil
 }
@@ -171,8 +177,8 @@ func (memoryWrapper) Close(context.Context) error { return nil }
 // healingWrapper is the ErrSEPresenceUnavailable fallback: it starts over the
 // identity memoryWrapper and swaps — permanently and at most once — to the real
 // SecureEnclaveWrapper the first time a heal re-probe finds the keybag unlocked.
-// KeyCache drives heal from Put and evicts every entry on the swap, so no
-// identity-wrapped blob outlives the degradation.
+// KeyCache drives heal from Put and evicts every identity-wrapped (stale) entry
+// on the swap, so no identity-wrapped blob outlives the degradation.
 //
 // Readers are lock-free: current and degraded load se atomically and never take
 // w.mu, so a heal parked in cache-newkey — a human-timescale Touch ID presence
@@ -313,8 +319,9 @@ func (c *KeyCache) inner() Wrapper {
 	return c.healer.current()
 }
 
-// heal re-probes a degraded healer and evicts every entry on the swap; with no
-// healer it hands back the cache's own wrapper untouched.
+// heal re-probes a degraded healer and evicts every identity-wrapped (stale)
+// entry on the swap; with no healer it hands back the cache's own wrapper
+// untouched.
 func (c *KeyCache) heal(ctx context.Context) (Wrapper, error) {
 	if c.healer == nil {
 		return c.wrapper, nil
@@ -324,7 +331,7 @@ func (c *KeyCache) heal(ctx context.Context) (Wrapper, error) {
 		return nil, err
 	}
 	if healed {
-		c.EvictAll()
+		c.evictStale(inner)
 	}
 	return inner, nil
 }
@@ -392,4 +399,17 @@ func (c *KeyCache) EvictAll() {
 	c.mu.Lock()
 	clear(c.entries)
 	c.mu.Unlock()
+}
+
+// evictStale drops every entry not wrapped with keep, clearing the identity-wrapped
+// blobs a heal swap leaves behind. keep is the installed wrapper, passed in (not
+// re-read from c.inner()) so a racing Close cannot spare — then serve — a stale entry.
+func (c *KeyCache) evictStale(keep Wrapper) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for id, e := range c.entries {
+		if e.wrapper != keep {
+			delete(c.entries, id)
+		}
+	}
 }

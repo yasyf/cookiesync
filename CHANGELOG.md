@@ -4,6 +4,19 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.10.5] - 2026-07-13
+
+### Fixed
+- A heal that swaps the degraded in-memory key wrapper over to the Secure Enclave no longer
+  wipes a cached key that a concurrent request stored under the new wrapper. The swap used to
+  clear the whole cache, which could drop an entry another in-flight prime had just written
+  correctly Enclave-wrapped — a silent miss that forced one redundant Touch ID re-prime for an
+  unrelated endpoint. The swap now evicts only the stale identity-wrapped entries left behind.
+- A failed `cache-dropkey` at shutdown surfaces instead of reading as a clean close. Dropping
+  the Enclave key checked only whether the helper could be spawned, not its exit code, so a
+  nonzero drop — the key was not deleted — still reported success and cleared the wrapper. A
+  nonzero exit is now returned as an error, leaving the key retryable rather than silently leaked.
+
 ## [0.10.4] - 2026-07-13
 
 ### Fixed
@@ -205,7 +218,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `synckitd install` now owns the agents. The host mesh is read from the shared
   `~/.config/synckit`.
 
-[Unreleased]: https://github.com/yasyf/cookiesync/compare/v0.10.1...HEAD
+[Unreleased]: https://github.com/yasyf/cookiesync/compare/v0.10.5...HEAD
+[0.10.5]: https://github.com/yasyf/cookiesync/releases/tag/v0.10.5
+[0.10.4]: https://github.com/yasyf/cookiesync/releases/tag/v0.10.4
+[0.10.3]: https://github.com/yasyf/cookiesync/releases/tag/v0.10.3
+[0.10.2]: https://github.com/yasyf/cookiesync/releases/tag/v0.10.2
 [0.10.1]: https://github.com/yasyf/cookiesync/releases/tag/v0.10.1
 [0.10.0]: https://github.com/yasyf/cookiesync/releases/tag/v0.10.0
 [0.9.0]: https://github.com/yasyf/cookiesync/releases/tag/v0.9.0

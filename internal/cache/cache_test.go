@@ -482,6 +482,110 @@ func TestPutRewrapsWhenAHealSwapsMidPut(t *testing.T) {
 	}
 }
 
+func TestHealEvictionSparesCurrentWrapperEntry(t *testing.T) {
+	binary, _ := writeHealingHelper(t, 2, 0)
+	ctx := context.Background()
+
+	wrapper, err := OpenWrapper(ctx, helper.Bridge{Binary: binary})
+	if !errors.Is(err, ErrSEPresenceUnavailable) {
+		t.Fatalf("OpenWrapper err = %v, want ErrSEPresenceUnavailable", err)
+	}
+	hw := wrapper.(*healingWrapper)
+	c := NewKeyCache(hw)
+	if !c.Degraded() {
+		t.Fatalf("Degraded() = false at open")
+	}
+
+	key := testKey()
+	// A stale entry laid down while degraded: identity-wrapped in RAM.
+	if err := c.Put(ctx, "stale", key, 30*time.Second); err != nil {
+		t.Fatalf("degraded Put: %v", err)
+	}
+	if !c.Degraded() {
+		t.Fatalf("Degraded() = false while the re-probe still exits 3")
+	}
+
+	// Perform the memory-to-Enclave swap directly, without going through a healing Put.
+	inner, healed, err := hw.heal(ctx)
+	if err != nil {
+		t.Fatalf("heal: %v", err)
+	}
+	if !healed {
+		t.Fatalf("heal healed = false, want the memory-to-Enclave swap")
+	}
+	if _, ok := inner.(*SecureEnclaveWrapper); !ok {
+		t.Fatalf("heal returned %T, want *SecureEnclaveWrapper", inner)
+	}
+
+	// A fresh entry laid down after the swap: Enclave-wrapped by the live wrapper.
+	if err := c.Put(ctx, "fresh", key, 30*time.Second); err != nil {
+		t.Fatalf("post-heal Put: %v", err)
+	}
+	if blob := c.entries["fresh"].blob; !bytes.Equal(blob, xor(key)) {
+		t.Fatalf("fresh blob = %x, want the Enclave-wrapped %x", blob, xor(key))
+	}
+
+	// Call the eviction directly to model a concurrent Put's fresh entry landing between the
+	// swap and the (synchronous) heal-time eviction. evictStale must spare fresh, drop stale.
+	c.evictStale(inner)
+
+	got, ok, err := c.Get(ctx, "fresh")
+	if err != nil || !ok || !bytes.Equal(got, key) {
+		t.Fatalf("Get(fresh) = %x ok=%v err=%v, want the key still served", got, ok, err)
+	}
+	if _, ok, _ := c.Get(ctx, "stale"); ok {
+		t.Fatalf("stale identity entry still served after evictStale")
+	}
+	if len(c.entries) != 1 {
+		t.Fatalf("entries after evictStale = %d, want 1 (only the fresh Enclave entry)", len(c.entries))
+	}
+}
+
+// TestEvictStaleUsesInstalledWrapperNotLiveInner proves the heal eviction targets the
+// wrapper the swap installed rather than the live c.inner(): a Close that reverts inner to
+// the identity wrapper between the swap and the eviction must not spare a stale entry that
+// Get would then serve.
+func TestEvictStaleUsesInstalledWrapperNotLiveInner(t *testing.T) {
+	binary, _ := writeHealingHelper(t, 2, 0)
+	ctx := context.Background()
+
+	wrapper, err := OpenWrapper(ctx, helper.Bridge{Binary: binary})
+	if !errors.Is(err, ErrSEPresenceUnavailable) {
+		t.Fatalf("OpenWrapper err = %v, want ErrSEPresenceUnavailable", err)
+	}
+	hw := wrapper.(*healingWrapper)
+	c := NewKeyCache(hw)
+
+	key := testKey()
+	if err := c.Put(ctx, "stale", key, 30*time.Second); err != nil {
+		t.Fatalf("degraded Put: %v", err)
+	}
+	inner, healed, err := hw.heal(ctx)
+	if err != nil || !healed {
+		t.Fatalf("heal healed=%v err=%v, want the memory-to-Enclave swap", healed, err)
+	}
+	if err := c.Put(ctx, "fresh", key, 30*time.Second); err != nil {
+		t.Fatalf("post-heal Put: %v", err)
+	}
+
+	// A concurrent Close drops the Enclave key and reverts the live wrapper to the identity
+	// memoryWrapper before the healing Put's eviction runs.
+	if err := hw.Close(ctx); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if !c.Degraded() {
+		t.Fatalf("Degraded() = false after Close")
+	}
+
+	c.evictStale(inner)
+	if _, ok := c.entries["stale"]; ok {
+		t.Fatalf("stale identity entry survived evictStale after a racing Close (Get would serve it)")
+	}
+	if _, ok := c.entries["fresh"]; !ok {
+		t.Fatalf("fresh Enclave entry wrongly dropped by evictStale after Close")
+	}
+}
+
 func waitFor(t *testing.T, cond func() bool) {
 	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
@@ -1144,6 +1248,85 @@ func TestCloseWithFailedDropLeavesTheKeyRetryable(t *testing.T) {
 	}
 	if got := tallyCount(t, dropTally); got != 1 {
 		t.Fatalf("cache-dropkey ran %d times, want 1 (the retry dropped the key exactly once)", got)
+	}
+}
+
+// writeDropExitHelper writes a helper whose cache-newkey exits 0 (so a real
+// SecureEnclaveWrapper is minted) and whose cache-dropkey exits 1 with stderr
+// until the dropOK marker exists, then exits 0 — parameterizing a cleanly failing
+// then succeeding key drop without an in-process fake.
+func writeDropExitHelper(t *testing.T) (binary, dropOKPath string) {
+	t.Helper()
+	dir := t.TempDir()
+	binary = filepath.Join(dir, "cookiesync-keyhelper")
+	dropOKPath = filepath.Join(dir, "drop-ok")
+	body := `#!/bin/sh
+verb="$1"
+case "$verb" in
+cache-newkey)
+  exit 0
+  ;;
+cache-wrap|cache-unwrap)
+  exec /usr/bin/perl -0777 -pe 's/(.)/chr(ord($1)^0x5A)/ges'
+  ;;
+cache-dropkey)
+  if [ -f "` + dropOKPath + `" ]; then exit 0; fi
+  echo "keyhelper: SecItemDelete failed (OSStatus -25300)" >&2
+  exit 1
+  ;;
+*)
+  echo "unexpected verb $verb" >&2
+  exit 99
+  ;;
+esac
+`
+	if err := os.WriteFile(binary, []byte(body), 0o755); err != nil { //nolint:gosec // test fixture script must be executable.
+		t.Fatalf("write drop-exit helper: %v", err)
+	}
+	return binary, dropOKPath
+}
+
+func TestCloseSurfacesNonzeroDropExit(t *testing.T) {
+	binary, dropOKPath := writeDropExitHelper(t)
+	ctx := context.Background()
+
+	// A bare SecureEnclaveWrapper whose cache-dropkey exits 1 must surface the exit code
+	// rather than swallow it — the key is still live.
+	opened, err := OpenWrapper(ctx, helper.Bridge{Binary: binary})
+	if err != nil {
+		t.Fatalf("OpenWrapper: %v", err)
+	}
+	se := opened.(*SecureEnclaveWrapper)
+	if err := se.Close(ctx); err == nil || !strings.Contains(err.Error(), "cache-dropkey exited 1") {
+		t.Fatalf("SecureEnclaveWrapper.Close err = %v, want it to mention the nonzero exit code", err)
+	}
+
+	// A healed healingWrapper wrapping an se whose drop still exits 1: Close reports the
+	// error and keeps se installed, so the still-live key stays retryable.
+	hw := &healingWrapper{bridge: helper.Bridge{Binary: binary}, label: "test-label"}
+	c := NewKeyCache(hw)
+	if err := c.Put(ctx, endpoint, testKey(), 30*time.Second); err != nil {
+		t.Fatalf("healing Put: %v", err)
+	}
+	if c.Degraded() {
+		t.Fatalf("Degraded() = true, want a healed wrapper before Close")
+	}
+	if err := hw.Close(ctx); err == nil {
+		t.Fatalf("healingWrapper.Close over a failing drop: got nil, want the exit-code error")
+	}
+	if c.Degraded() {
+		t.Fatalf("Degraded() = true after a failed drop: se was cleared, the live key leaked non-retryably")
+	}
+
+	// Once cache-dropkey succeeds, a retry Close drops the key and clears se.
+	if err := os.WriteFile(dropOKPath, nil, 0o600); err != nil {
+		t.Fatalf("flip drop to exit 0: %v", err)
+	}
+	if err := hw.Close(ctx); err != nil {
+		t.Fatalf("retry Close after drop succeeds: %v", err)
+	}
+	if !c.Degraded() {
+		t.Fatalf("Degraded() = false after a successful retry Close cleared se")
 	}
 }
 
