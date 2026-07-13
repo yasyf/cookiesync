@@ -1,1 +1,1 @@
-{"v":1,"lamport":2,"ops":[{"kind":"add_comment","body":"Fixed in commit 1685628 (SecureEnclaveWrapper.Close returns an error on a nonzero cache-dropkey Result.Code, mirroring Wrap/Unwrap). Released in cookiesync v0.11.1. Test: TestCloseSurfacesNonzeroDropExit. NOTE: the signed Swift helper still always exits 0 on drop; end-to-end completion tracked in follow-up c67aed3."}]}
+{"v":1,"lamport":3,"ops":[{"kind":"set_criterion_status","id":"b4731f2a2f0e1d9bdd22b86e0dd768d5","status":"met"}]}
