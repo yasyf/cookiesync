@@ -4,7 +4,7 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.10.5] - 2026-07-13
+## [0.10.6] - 2026-07-13
 
 ### Fixed
 - A heal that swaps the degraded in-memory key wrapper over to the Secure Enclave no longer
@@ -218,7 +218,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `synckitd install` now owns the agents. The host mesh is read from the shared
   `~/.config/synckit`.
 
-[Unreleased]: https://github.com/yasyf/cookiesync/compare/v0.10.5...HEAD
+[Unreleased]: https://github.com/yasyf/cookiesync/compare/v0.10.6...HEAD
+[0.10.6]: https://github.com/yasyf/cookiesync/releases/tag/v0.10.6
 [0.10.5]: https://github.com/yasyf/cookiesync/releases/tag/v0.10.5
 [0.10.4]: https://github.com/yasyf/cookiesync/releases/tag/v0.10.4
 [0.10.3]: https://github.com/yasyf/cookiesync/releases/tag/v0.10.3
