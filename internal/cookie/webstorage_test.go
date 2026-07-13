@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"os"
 	"reflect"
+	"strings"
 	"testing"
 	"unicode/utf16"
 
@@ -78,8 +79,9 @@ const (
 )
 
 // writeFayeLocalStorage lays down a Local Storage LevelDB with two script values (a
-// Latin-1 auth token and a UTF-16 value), an evil.com value for the filter test, and two
-// metadata keys that must be skipped.
+// Latin-1 auth token and a UTF-16 value), an evil.com value for the filter test, a
+// partitioned StorageKey row that must be skipped, and two metadata keys that must be
+// skipped.
 func writeFayeLocalStorage(t *testing.T, root, profile string) Browser {
 	t.Helper()
 	b := makeBrowser(t, root, profile)
@@ -87,9 +89,10 @@ func writeFayeLocalStorage(t *testing.T, root, profile string) Browser {
 		t.Fatalf("mkdir local storage: %v", err)
 	}
 	writeLevelDB(t, b.LocalStorageDir(profile), map[string][]byte{
-		string(lsKey(fayeOrigin, "auth")):           latin1Val(`{"token":"` + fayeJWT + `"}`),
-		string(lsKey(fayeOrigin, "greeting")):       utf16Val("héllo→世界🎉"),
-		string(lsKey("https://evil.com", "stolen")): latin1Val("nope"),
+		string(lsKey(fayeOrigin, "auth")):                            latin1Val(`{"token":"` + fayeJWT + `"}`),
+		string(lsKey(fayeOrigin, "greeting")):                        utf16Val("héllo→世界🎉"),
+		string(lsKey("https://evil.com", "stolen")):                  latin1Val("nope"),
+		string(lsKey(fayeOrigin+"/^0https://lemire.me", "embedded")): latin1Val("partitioned"),
 		"VERSION":            {0x01},
 		"META:" + fayeOrigin: {0x08, 0x01},
 	})
@@ -120,6 +123,9 @@ func TestReadLocalStorageDecodesMarkerForms(t *testing.T) {
 	if _, ok := local["VERSION"]; ok {
 		t.Fatal("VERSION metadata key must not surface as an origin")
 	}
+	if _, ok := local[fayeOrigin+"/^0https://lemire.me"]; ok {
+		t.Fatal("partitioned StorageKey origin must not surface")
+	}
 }
 
 func TestReadLocalStorageMissingDirIsEmpty(t *testing.T) {
@@ -135,19 +141,22 @@ func TestReadLocalStorageMissingDirIsEmpty(t *testing.T) {
 
 // writeFayeSessionStorage lays down a Session Storage LevelDB: two namespaces (an open
 // tab per origin) indirecting to their maps, one origin carrying a markerless UTF-16
-// value and a 0x01/Latin-1 value.
+// value and a 0x01/Latin-1 value, plus a partitioned StorageKey namespace whose map must
+// never be read.
 func writeFayeSessionStorage(t *testing.T, b Browser, profile string) {
 	t.Helper()
 	if err := os.MkdirAll(b.SessionStorageDir(profile), 0o700); err != nil {
 		t.Fatalf("mkdir session storage: %v", err)
 	}
 	writeLevelDB(t, b.SessionStorageDir(profile), map[string][]byte{
-		"namespace-aaaa_1111-" + fayeOrigin + "/": []byte("7"),
-		"namespace-bbbb_2222-https://evil.com/":   []byte("9"),
-		"map-7-replay":                            utf16LEBytes(`{"id":"r1"}`),
-		"map-7-flag":                              latin1Val("true"),
-		"map-9-loot":                              utf16LEBytes("secret"),
-		"next-map-id":                             []byte("10"),
+		"namespace-aaaa_1111-" + fayeOrigin + "/":                    []byte("7"),
+		"namespace-bbbb_2222-https://evil.com/":                      []byte("9"),
+		"namespace-cccc_3333-" + fayeOrigin + "/^0https://lemire.me": []byte("11"),
+		"map-7-replay": utf16LEBytes(`{"id":"r1"}`),
+		"map-7-flag":   latin1Val("true"),
+		"map-9-loot":   utf16LEBytes("secret"),
+		"map-11-glued": latin1Val("must-not-appear"),
+		"next-map-id":  []byte("12"),
 	})
 }
 
@@ -167,6 +176,16 @@ func TestReadSessionStorageIndirection(t *testing.T) {
 	}
 	if evil := entryMap(session["https://evil.com/"]); evil["loot"] != "secret" {
 		t.Fatalf("evil loot = %q, want %q", evil["loot"], "secret")
+	}
+	if _, ok := session[fayeOrigin+"/^0https://lemire.me"]; ok {
+		t.Fatal("partitioned namespace origin must not surface")
+	}
+	for origin, entries := range session {
+		for _, e := range entries {
+			if e.Name == "glued" {
+				t.Fatalf("partitioned map entry %q surfaced under %q", e.Name, origin)
+			}
+		}
 	}
 }
 
@@ -194,9 +213,17 @@ func TestExtractWebStorageFiltersAndMergesOrigin(t *testing.T) {
 	if len(got.LocalStorage) != 2 {
 		t.Fatalf("localStorage entries = %d, want 2", len(got.LocalStorage))
 	}
-	sessionNames := []string{got.SessionStorage[0].Name, got.SessionStorage[1].Name}
+	sessionNames := make([]string, 0, len(got.SessionStorage))
+	for _, e := range got.SessionStorage {
+		sessionNames = append(sessionNames, e.Name)
+	}
 	if !reflect.DeepEqual(sessionNames, []string{"flag", "replay"}) {
 		t.Fatalf("sessionStorage names = %v, want [flag replay] (name-sorted)", sessionNames)
+	}
+	for _, o := range origins {
+		if strings.ContainsRune(o.Origin, '^') {
+			t.Fatalf("origin %q contains a partition separator", o.Origin)
+		}
 	}
 }
 
@@ -208,5 +235,57 @@ func TestExtractWebStorageRejectsUnmatchedHost(t *testing.T) {
 	}
 	if len(origins) != 0 {
 		t.Fatalf("origins = %#v, want none for an unmatched host", origins)
+	}
+}
+
+func TestParseLocalStorageKeyPartitioned(t *testing.T) {
+	cases := []struct {
+		name      string
+		key       string
+		origin    string
+		scriptKey string
+		ok        bool
+	}{
+		{"first-party", "_https://app.findfaye.com\x00\x01auth", "https://app.findfaye.com", "auth", true},
+		{"top-level-site", "_https://github.com/^0https://lemire.me\x00\x01k", "", "", false},
+		{"nonce", "_https://github.com/^13735928559^23405691582\x00\x01k", "", "", false},
+		{"ancestor-bit", "_https://github.com/^31\x00\x01k", "", "", false},
+		{"opaque-top-level-site", "_https://github.com/^412^234^6https://p.example\x00\x01k", "", "", false},
+		{"caret-in-script-key", "_https://app.findfaye.com\x00\x01ca^ret", "https://app.findfaye.com", "ca^ret", true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			origin, scriptKey, ok := parseLocalStorageKey([]byte(c.key))
+			if origin != c.origin || scriptKey != c.scriptKey || ok != c.ok {
+				t.Fatalf("parseLocalStorageKey(%q) = (%q, %q, %v), want (%q, %q, %v)",
+					c.key, origin, scriptKey, ok, c.origin, c.scriptKey, c.ok)
+			}
+		})
+	}
+}
+
+func TestParseNamespaceOriginPartitioned(t *testing.T) {
+	cases := []struct {
+		name   string
+		key    string
+		origin string
+		ok     bool
+	}{
+		{"first-party", "namespace-aaaa_1111-https://app.findfaye.com/", "https://app.findfaye.com/", true},
+		{"top-level-site", "namespace-aaaa_1111-https://github.com/^0https://lemire.me", "", false},
+		{"nonce", "namespace-aaaa_1111-https://github.com/^1123^2456", "", false},
+		{"ancestor-bit", "namespace-aaaa_1111-https://github.com/^31", "", false},
+		{"opaque-top-level-site", "namespace-aaaa_1111-https://github.com/^412^234^6https://p.example", "", false},
+		{"next-map-id", "next-map-id", "", false},
+		{"empty-namespace", "namespace-aaaa_1111-", "", false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			origin, ok := parseNamespaceOrigin(c.key)
+			if origin != c.origin || ok != c.ok {
+				t.Fatalf("parseNamespaceOrigin(%q) = (%q, %v), want (%q, %v)",
+					c.key, origin, ok, c.origin, c.ok)
+			}
+		})
 	}
 }

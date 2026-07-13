@@ -22,6 +22,7 @@ import (
 // keys and values carry Chrome's String16 marker byte (0x00 UTF-16LE, 0x01 Latin-1).
 // Session Storage indirects namespace-<nsid>-<origin> -> map-id then map-<map-id>-<key>
 // -> value, whose values are 0x01/Latin-1 or a markerless raw UTF-16LE payload.
+// Partitioned "^N" StorageKeys are skipped: only first-party storage is captured.
 // IndexedDB is out of scope: its idb_cmp1 comparator and V8 values need a bespoke reader.
 
 const (
@@ -81,8 +82,9 @@ func decodeSSValue(b []byte) string {
 }
 
 // parseLocalStorageKey splits a Local Storage data key "_<origin>\x00<marker><key>" into
-// the exact origin string and the decoded script key. A non-data key (VERSION, META:*)
-// — anything not led by '_' or missing the NUL separator — returns ok=false.
+// the exact origin string and the decoded script key. A non-data key (VERSION, META:*, a
+// partitioned "^N" StorageKey) — anything not led by '_', missing the NUL separator, or
+// carrying partition attributes on its origin — returns ok=false.
 func parseLocalStorageKey(key []byte) (origin, scriptKey string, ok bool) {
 	if len(key) == 0 || key[0] != lsDataPrefix {
 		return "", "", false
@@ -92,13 +94,18 @@ func parseLocalStorageKey(key []byte) (origin, scriptKey string, ok bool) {
 	if nul < 0 {
 		return "", "", false
 	}
-	return string(rest[:nul]), decodeLSValue(rest[nul+1:]), true
+	origin = string(rest[:nul])
+	if isPartitionedKey(origin) {
+		return "", "", false
+	}
+	return origin, decodeLSValue(rest[nul+1:]), true
 }
 
 // parseNamespaceOrigin extracts the exact origin from a Session Storage
 // "namespace-<nsid>-<origin>" key. The origin begins at its scheme, which the namespace
 // id never contains, so the first "://" locates it. Keys without an origin (the
-// next-map-id counter, the empty namespace) return ok=false.
+// next-map-id counter, the empty namespace) and partitioned "^N" StorageKeys return
+// ok=false.
 func parseNamespaceOrigin(key string) (string, bool) {
 	rest, ok := strings.CutPrefix(key, "namespace-")
 	if !ok {
@@ -115,12 +122,21 @@ func parseNamespaceOrigin(key string) (string, bool) {
 	if start == 0 || rest[start-1] != '-' {
 		return "", false
 	}
-	return rest[start:], true
+	origin := rest[start:]
+	if isPartitionedKey(origin) {
+		return "", false
+	}
+	return origin, true
 }
 
 func isSchemeByte(c byte) bool {
 	return c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z'
 }
+
+// isPartitionedKey reports whether a stored origin carries "^N" StorageKey partition
+// attributes (top-level site, nonce, ancestor bit) — partitioned storage, not
+// first-party. Chromium never emits "^" inside a serialized bare origin.
+func isPartitionedKey(origin string) bool { return strings.ContainsRune(origin, '^') }
 
 // copyDir copies a browser LevelDB directory (Local Storage / Session Storage) into
 // destDir so a running browser's LOCK is never taken. A LevelDB dir is flat — CURRENT,
@@ -282,8 +298,7 @@ func sessionEntries(ctx context.Context, db *leveldb.DB, ids []string) ([]WebSto
 
 // canonicalOrigin normalizes a stored origin to its scheme://host[:port] form: Session
 // Storage serializes the origin with a trailing "/", Local Storage does not, so the same
-// origin collapses to one key. A partitioned key (…^0…) has no trailing slash and is
-// left intact.
+// origin collapses to one key.
 func canonicalOrigin(origin string) string {
 	return strings.TrimSuffix(origin, "/")
 }
