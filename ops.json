@@ -1,1 +1,1 @@
-{"v":1,"lamport":2,"ops":[{"kind":"add_comment","body":"Fixed in commit 1685628 (KeyCache.heal calls evictStale(keep) keyed on the installed wrapper: drops only stale identity-wrapped entries, spares a concurrent different-endpoint Put, and a racing Close cannot revert the eviction target). Released in cookiesync v0.11.1. Tests: TestHealEvictionSparesCurrentWrapperEntry + TestEvictStaleUsesInstalledWrapperNotLiveInner (mutation-verified)."}]}
+{"v":1,"lamport":3,"ops":[{"kind":"set_criterion_status","id":"a6eecca35923f7669af95139effd06fc","status":"met"}]}
