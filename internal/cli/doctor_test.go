@@ -7,6 +7,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/spf13/cobra"
 
@@ -168,8 +169,8 @@ func TestInstallWritesManifest(t *testing.T) {
 	if m.Name != "cookiesync" || m.Binary != "cookiesync" {
 		t.Fatalf("manifest name/binary = %q/%q, want cookiesync/cookiesync", m.Name, m.Binary)
 	}
-	if m.Watch.Backend != "fsnotify" {
-		t.Fatalf("manifest watch backend = %q, want fsnotify", m.Watch.Backend)
+	if time.Duration(m.Watch.Debounce) != watchDebounce {
+		t.Fatalf("manifest watch debounce = %v, want %v", time.Duration(m.Watch.Debounce), watchDebounce)
 	}
 	// The typed service block: synckitd starts `cookiesync rpc-serve` and bridges the
 	// svc.* contract to the resident socket, dialing the socket directly.

@@ -18,8 +18,8 @@ import (
 )
 
 // watchDebounce is the settle window synckitd holds a local store's write burst for
-// before converging cookiesync — long enough for a Cookies DB and its -wal/-shm
-// sidecars to land as one change.
+// before converging cookiesync — long enough for a rollback-journal commit's writes to
+// the Cookies DB to land as one change.
 const watchDebounce = 3 * time.Second
 
 func newHelperServeCmd() *cobra.Command {
@@ -82,7 +82,6 @@ func cookiesyncManifest() (manifest.Manifest, error) {
 		Binary: "cookiesync",
 		Brew:   "yasyf/tap/cookiesync",
 		Watch: manifest.WatchSpec{
-			Backend:  "fsnotify",
 			Debounce: codec.Duration(watchDebounce),
 		},
 		Service: manifest.ServiceSpec{

@@ -55,13 +55,14 @@ type StateLoader interface {
 	Load(ctx context.Context) (*state.State, error)
 }
 
-// watchItem builds one endpoint's watch item: its id, its profile directory (which holds
-// the Cookies DB and its -wal/-shm sidecars, so a write burst across all three is
-// observed), and the apply-stable logical digest of its cookie store. The digest keys on
-// (host_key, name, path, last_update_utc) and never decrypts, so a self-induced write
-// (which preserves last_update_utc) reproduces it — that is what lets synckitd dedup
-// cookiesync's own apply without a cross-process seed. An absent profile dir yields
-// ok=false.
+// watchItem builds one endpoint's watch item: its id, its Cookies DB file (Chromium keeps
+// the store in rollback-journal mode, not WAL, so every commit rewrites the Cookies file
+// in place — watching that one file observes all writes, without the per-entry fd cost of
+// watching the whole profile tree), and the apply-stable logical digest of its cookie
+// store. The digest keys on (host_key, name, path, last_update_utc) and never decrypts,
+// so a self-induced write (which preserves last_update_utc) reproduces it — that is what
+// lets synckitd dedup cookiesync's own apply without a cross-process seed. An absent
+// profile dir yields ok=false.
 func watchItem(ctx context.Context, ep state.Endpoint) (syncservice.WatchItem, bool, error) {
 	browser, err := cookie.Lookup(cookie.BrowserName(ep.Browser))
 	if err != nil {
@@ -77,7 +78,7 @@ func watchItem(ctx context.Context, ep state.Endpoint) (syncservice.WatchItem, b
 	}
 	return syncservice.WatchItem{
 		ID:          string(ep.ID()),
-		WatchDirs:   []string{dir},
+		WatchDirs:   []string{browser.CookiesDB(ep.Profile)},
 		Fingerprint: string(cookie.LogicalDigest(rows)),
 	}, true, nil
 }
