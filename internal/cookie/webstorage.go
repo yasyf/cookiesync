@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -137,6 +138,25 @@ func isSchemeByte(c byte) bool {
 // attributes (top-level site, nonce, ancestor bit) — partitioned storage, not
 // first-party. Chromium never emits "^" inside a serialized bare origin.
 func isPartitionedKey(origin string) bool { return strings.ContainsRune(origin, '^') }
+
+// copyFile copies one browser data file to a private temp dir. Both paths are the
+// tool's own resolved layout and temp-dir-derived copies, never user-supplied.
+func copyFile(src, dst string) error {
+	in, err := os.Open(src) //nolint:gosec // G304: src is the tool's own browser data path, not user-supplied.
+	if err != nil {
+		return err
+	}
+	defer func() { _ = in.Close() }()
+	out, err := os.Create(dst) //nolint:gosec // G304: dst is inside a freshly created private temp dir, not user-supplied.
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(out, in); err != nil {
+		_ = out.Close()
+		return err
+	}
+	return out.Close()
+}
 
 // copyDir copies a browser LevelDB directory (Local Storage / Session Storage) into
 // destDir so a running browser's LOCK is never taken. A LevelDB dir is flat — CURRENT,

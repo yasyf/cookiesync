@@ -3,9 +3,12 @@ package cookie
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 )
 
 // v18: carries is_same_party; UNIQUE(host_key, top_frame_site_key, name, path); no
@@ -631,6 +634,170 @@ func TestWriteSoftBusyReturnsMinusOne(t *testing.T) {
 		}
 		if len(rows) != 0 {
 			t.Fatalf("soft-busy clobbered the DB: got %d rows, want 0", len(rows))
+		}
+	})
+}
+
+// assertNoTornCopyNoise fails if err carries one of the three signatures the old
+// plain-copy + wal_checkpoint read path emitted on a torn snapshot.
+func assertNoTornCopyNoise(t *testing.T, err error) {
+	t.Helper()
+	if err == nil {
+		return
+	}
+	for _, sig := range []string{`near "FROM"`, "wal checkpoint", "malformed", "disk image"} {
+		if strings.Contains(err.Error(), sig) {
+			t.Fatalf("read error carries torn-copy signature %q: %v", sig, err)
+		}
+	}
+}
+
+// TestReadSnapshotConsistentUnderHotWriter proves the VACUUM INTO snapshot reads a
+// consistent committed view while a second connection holds an uncommitted write
+// (RESERVED lock) — the "hot" state a running browser leaves — never a torn image.
+func TestReadSnapshotConsistentUnderHotWriter(t *testing.T) {
+	forEachSchema(t, func(t *testing.T, browser Browser, profile string) {
+		key := testKey(t)
+		dbPath := browser.CookiesDB(profile)
+		insertNative(t, dbPath, ".committed.com", "sid", mustEncrypt(t, "committed", key, HostKey(".committed.com")))
+
+		writer, err := sql.Open(driverName, dbPath)
+		if err != nil {
+			t.Fatalf("open writer: %v", err)
+		}
+		defer func() { _ = writer.Close() }()
+		wtx, err := writer.Begin()
+		if err != nil {
+			t.Fatalf("writer begin: %v", err)
+		}
+		held := mustEncrypt(t, "held", key, HostKey(".uncommitted.com"))
+		if hasColumn(t, dbPath, "last_update_utc") {
+			insertV24(t, wtx.Exec, ".uncommitted.com", "held", held)
+		} else {
+			insertV18(t, wtx.Exec, ".uncommitted.com", "held", held)
+		}
+
+		rows, err := Read(context.Background(), browser, profile)
+		_ = wtx.Rollback()
+		if err != nil {
+			assertNoTornCopyNoise(t, err)
+			t.Fatalf("Read under hot writer: %v", err)
+		}
+		if len(rows) != 1 {
+			t.Fatalf("got %d rows, want 1 (only the committed row, uncommitted excluded)", len(rows))
+		}
+		if rows[0].HostKey != ".committed.com" {
+			t.Errorf("host_key = %q, want .committed.com", rows[0].HostKey)
+		}
+		if got := mustDecrypt(t, rows[0].EncryptedValue, key, rows[0].HostKey); got != "committed" {
+			t.Errorf("decrypted = %q, want committed", got)
+		}
+	})
+}
+
+// TestReadTornDBReturnsCleanError feeds a garbage (non-SQLite) Cookies file; the
+// snapshot read must fail with a clean typed SQLite error, never a torn-copy
+// signature.
+func TestReadTornDBReturnsCleanError(t *testing.T) {
+	browser := makeBrowser(t, t.TempDir(), "Default")
+	if err := os.WriteFile(browser.CookiesDB("Default"), []byte(strings.Repeat("\xde\xad\xbe\xef", 1024)), 0o600); err != nil {
+		t.Fatalf("write garbage db: %v", err)
+	}
+	_, err := Read(context.Background(), browser, "Default")
+	if err == nil {
+		t.Fatal("Read of a garbage DB returned nil error, want a clean typed failure")
+	}
+	assertNoTornCopyNoise(t, err)
+}
+
+// TestReadMissingCookiesTableCleanError opens a valid SQLite DB with no cookies
+// table; the empty-columns guard must surface errNoCookiesTable rather than build a
+// 'SELECT  FROM cookies' that fails with 'near "FROM"'.
+func TestReadMissingCookiesTableCleanError(t *testing.T) {
+	browser := makeBrowser(t, t.TempDir(), "Default")
+	initDB(t, browser.CookiesDB("Default"), "CREATE TABLE meta (key TEXT, value TEXT);")
+	_, err := Read(context.Background(), browser, "Default")
+	if !errors.Is(err, errNoCookiesTable) {
+		t.Fatalf("Read err = %v, want errNoCookiesTable", err)
+	}
+	if strings.Contains(err.Error(), `near "FROM"`) {
+		t.Fatalf("error leaks the empty-columns bug: %v", err)
+	}
+}
+
+func TestTableColumnsErrorsWithoutCookiesTable(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "Cookies")
+	initDB(t, path, "CREATE TABLE other (a INTEGER);")
+	db, err := sql.Open(driverName, path)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+	cols, err := tableColumns(context.Background(), db)
+	if !errors.Is(err, errNoCookiesTable) {
+		t.Fatalf("tableColumns err = %v, want errNoCookiesTable", err)
+	}
+	if cols != nil {
+		t.Errorf("columns = %v, want nil", cols)
+	}
+	if strings.Contains(err.Error(), `near "FROM"`) {
+		t.Fatalf("error must not resemble the malformed SELECT: %v", err)
+	}
+}
+
+func TestUpsertSQLGuardsEmptyColumns(t *testing.T) {
+	if q, err := upsertSQL(nil, []string{"host_key"}); !errors.Is(err, errNoCookiesTable) || q != "" {
+		t.Fatalf("upsertSQL(nil, ...) = (%q, %v), want (\"\", errNoCookiesTable)", q, err)
+	}
+	q, err := upsertSQL([]string{"host_key", "name", "encrypted_value"}, []string{"host_key", "name"})
+	if err != nil {
+		t.Fatalf("upsertSQL(valid) err = %v, want nil", err)
+	}
+	if !strings.HasPrefix(q, "INSERT INTO cookies (") {
+		t.Errorf("upsertSQL(valid) = %q, want a well-formed INSERT", q)
+	}
+	if strings.Contains(q, "()") {
+		t.Errorf("upsertSQL(valid) built an empty column/value list: %q", q)
+	}
+}
+
+// TestWriteAllImmediateSoftBusyIsPrompt holds a write lock on a second connection so
+// BEGIN IMMEDIATE cannot acquire it; Write must return -1 (soft busy) promptly,
+// bounded by busy_timeout, never hanging or erroring.
+func TestWriteAllImmediateSoftBusyIsPrompt(t *testing.T) {
+	forEachSchema(t, func(t *testing.T, browser Browser, profile string) {
+		key := testKey(t)
+		dbPath := browser.CookiesDB(profile)
+
+		locker, err := sql.Open(driverName, dbPath)
+		if err != nil {
+			t.Fatalf("open locker: %v", err)
+		}
+		defer func() { _ = locker.Close() }()
+		ltx, err := locker.Begin()
+		if err != nil {
+			t.Fatalf("locker begin: %v", err)
+		}
+		if hasColumn(t, dbPath, "last_update_utc") {
+			insertV24(t, ltx.Exec, ".lock.com", "held", mustEncrypt(t, "x", key, HostKey(".lock.com")))
+		} else {
+			insertV18(t, ltx.Exec, ".lock.com", "held", mustEncrypt(t, "x", key, HostKey(".lock.com")))
+		}
+
+		start := time.Now()
+		n, err := Write(context.Background(), browser, profile, []Cookie{sampleCookie(".example.com", "sid", "v")}, key)
+		elapsed := time.Since(start)
+		if err != nil {
+			t.Fatalf("Write on locked DB errored, want soft -1: %v", err)
+		}
+		if n != -1 {
+			t.Fatalf("Write = %d on locked DB, want -1", n)
+		}
+		if elapsed > 5*time.Second {
+			t.Fatalf("Write took %v on a locked DB; IMMEDIATE + busy_timeout must fail fast", elapsed)
+		}
+		if err := ltx.Rollback(); err != nil {
+			t.Fatalf("rollback: %v", err)
 		}
 	})
 }

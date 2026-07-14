@@ -5,7 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -15,27 +15,15 @@ import (
 	sqlite3 "modernc.org/sqlite/lib"
 )
 
-// Schema-version-aware I/O against Chrome's SQLite cookie store.
-//
-// Reads copy the live Cookies DB (plus its -wal/-shm/-journal sidecars) into a
-// private temp dir and open the copy, so a running browser is never disturbed and
-// the WAL checkpoints into the copy before we SELECT. Writes go to the live DB,
-// best-effort: a short busy_timeout plus a soft-busy -1 return on a locked DB,
-// never a forced clobber.
-//
-// Chrome's cookie schema drifts across versions: v18 carries is_same_party and a
-// UNIQUE(host_key, top_frame_site_key, name, path) index, while v24 drops
-// is_same_party, adds source_type + has_cross_site_ancestor, and widens the unique
-// index to include has_cross_site_ancestor, source_scheme, and source_port. Every
-// operation introspects the actual table and unique index via PRAGMA table_info /
-// PRAGMA index_list / PRAGMA index_info rather than hardcoding one column set.
+// Schema-version-aware I/O against Chrome's cookie store: reads snapshot the live
+// DB with a read-only VACUUM INTO; writes upsert in an IMMEDIATE transaction.
 
 const (
 	driverName    = "sqlite"
 	busyTimeoutMS = 250
 )
 
-var sidecarSuffixes = [...]string{"-wal", "-shm", "-journal"}
+var errNoCookiesTable = errors.New("cookies table is unreadable or absent")
 
 // rowFieldDefaults zero-fills the columns absent from older schemas, so a v18 row
 // (no last_update_utc, no has_cross_site_ancestor) still builds a full EncryptedRow.
@@ -148,7 +136,13 @@ func tableColumns(ctx context.Context, db *sql.DB) ([]string, error) {
 		}
 		columns = append(columns, name)
 	}
-	return columns, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if len(columns) == 0 {
+		return nil, errNoCookiesTable
+	}
+	return columns, nil
 }
 
 func uniqueIndexColumns(ctx context.Context, db *sql.DB) ([]string, error) {
@@ -201,48 +195,26 @@ func uniqueIndexColumns(ctx context.Context, db *sql.DB) ([]string, error) {
 	return columns, info.Err()
 }
 
-// copyFile copies the live cookie store (or one of its sidecars) to a private temp
-// dir. Both paths are the tool's own resolved browser layout and temp-dir-derived
-// copies, never user-supplied.
-func copyFile(src, dst string) error {
-	in, err := os.Open(src) //nolint:gosec // G304: src is the tool's own browser cookie DB / sidecar path, not user-supplied.
+// VACUUM INTO over a read-only connection takes proper shared locks, so a browser
+// mid-write is snapshotted consistently rather than byte-copied into a torn image.
+func snapshotDB(ctx context.Context, src, dst string) error {
+	db, err := sql.Open(driverName, "file:"+src+"?mode=ro")
 	if err != nil {
 		return err
 	}
-	defer func() { _ = in.Close() }()
-	out, err := os.Create(dst) //nolint:gosec // G304: dst is inside a freshly created private temp dir, not user-supplied.
-	if err != nil {
-		return err
+	defer func() { _ = db.Close() }()
+	if _, err := db.ExecContext(ctx, "VACUUM INTO ?", dst); err != nil {
+		return fmt.Errorf("snapshot cookie store: %w", err)
 	}
-	if _, err := io.Copy(out, in); err != nil {
-		_ = out.Close()
-		return err
-	}
-	return out.Close()
-}
-
-func copyWithSidecars(db, destDir string) (string, error) {
-	copyPath := filepath.Join(destDir, "Cookies")
-	if err := copyFile(db, copyPath); err != nil {
-		return "", err
-	}
-	for _, suffix := range sidecarSuffixes {
-		side := db + suffix
-		if info, err := os.Stat(side); err == nil && !info.IsDir() {
-			if err := copyFile(side, copyPath+suffix); err != nil {
-				return "", err
-			}
-		}
-	}
-	return copyPath, nil
+	return nil
 }
 
 // Read returns every cookie row in profile as a raw EncryptedRow, read off a
-// private copy of the live store. The Cookies DB and its WAL/journal sidecars are
-// copied to a temp dir and the copy is checkpointed before the read, so a row still
-// pinned in an uncheckpointed -wal sidecar (the state a running browser leaves on
-// disk) is visible. Only columns present in this store's schema are selected;
-// absent columns fall back to their defaults.
+// consistent snapshot of the live store taken with VACUUM INTO on a read-only
+// connection — a browser mid-write is captured through proper shared locks,
+// including rows still pending in an uncheckpointed WAL, rather than as a torn byte
+// copy, and the snapshot is opened immutable. Only columns present in this store's
+// schema are selected; absent columns fall back to their defaults.
 func Read(ctx context.Context, browser Browser, profile string) ([]EncryptedRow, error) {
 	tmpDir, err := os.MkdirTemp("", "cookiesync-")
 	if err != nil {
@@ -250,20 +222,16 @@ func Read(ctx context.Context, browser Browser, profile string) ([]EncryptedRow,
 	}
 	defer func() { _ = os.RemoveAll(tmpDir) }()
 
-	copyPath, err := copyWithSidecars(browser.CookiesDB(profile), tmpDir)
-	if err != nil {
+	snapshot := filepath.Join(tmpDir, "Cookies")
+	if err := snapshotDB(ctx, browser.CookiesDB(profile), snapshot); err != nil {
 		return nil, err
 	}
 
-	db, err := sql.Open(driverName, copyPath)
+	db, err := sql.Open(driverName, "file:"+snapshot+"?mode=ro&immutable=1")
 	if err != nil {
 		return nil, err
 	}
 	defer func() { _ = db.Close() }()
-
-	if _, err := db.ExecContext(ctx, "PRAGMA wal_checkpoint(TRUNCATE)"); err != nil {
-		return nil, fmt.Errorf("wal checkpoint: %w", err)
-	}
 
 	columns, err := tableColumns(ctx, db)
 	if err != nil {
@@ -332,7 +300,10 @@ func boolToInt(b bool) int64 {
 	return 0
 }
 
-func upsertSQL(columns, conflict []string) string {
+func upsertSQL(columns, conflict []string) (string, error) {
+	if len(columns) == 0 {
+		return "", errNoCookiesTable
+	}
 	placeholders := make([]string, len(columns))
 	for i, c := range columns {
 		placeholders[i] = ":" + c
@@ -353,7 +324,7 @@ func upsertSQL(columns, conflict []string) string {
 		strings.Join(placeholders, ", "),
 		strings.Join(conflict, ", "),
 		strings.Join(updates, ", "),
-	)
+	), nil
 }
 
 // Write encrypts and upserts cookies into profile's live Cookies DB and returns
@@ -364,15 +335,12 @@ func upsertSQL(columns, conflict []string) string {
 // creation_utc are preserved, never stamped to "now". On a locked database this
 // returns -1 (soft busy) rather than forcing a write.
 func Write(ctx context.Context, browser Browser, profile string, cookies []Cookie, key AesKey) (int, error) {
-	db, err := sql.Open(driverName, browser.CookiesDB(profile))
+	dsn := fmt.Sprintf("file:%s?_txlock=immediate&_pragma=busy_timeout(%d)", browser.CookiesDB(profile), busyTimeoutMS)
+	db, err := sql.Open(driverName, dsn)
 	if err != nil {
 		return 0, err
 	}
 	defer func() { _ = db.Close() }()
-
-	if _, err := db.ExecContext(ctx, fmt.Sprintf("PRAGMA busy_timeout = %d", busyTimeoutMS)); err != nil {
-		return 0, err
-	}
 
 	columns, err := tableColumns(ctx, db)
 	if err != nil {
@@ -382,11 +350,15 @@ func Write(ctx context.Context, browser Browser, profile string, cookies []Cooki
 	if err != nil {
 		return 0, err
 	}
-	query := upsertSQL(columns, conflict)
+	query, err := upsertSQL(columns, conflict)
+	if err != nil {
+		return 0, err
+	}
 
 	count, err := writeAll(ctx, db, query, columns, cookies, key)
 	if err != nil {
 		if isBusy(err) {
+			slog.WarnContext(ctx, "cookie store busy; skipping write", "browser", browser.Name, "profile", profile)
 			return -1, nil
 		}
 		return 0, err
@@ -395,6 +367,8 @@ func Write(ctx context.Context, browser Browser, profile string, cookies []Cooki
 }
 
 func writeAll(ctx context.Context, db *sql.DB, query string, columns []string, cookies []Cookie, key AesKey) (int, error) {
+	// BEGIN IMMEDIATE (via _txlock=immediate in the DSN): fail-fast on a locked DB
+	// rather than a DEFERRED tx that upgrades to a write lock mid-loop.
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return 0, err
