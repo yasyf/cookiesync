@@ -470,6 +470,14 @@ func (s *fakeStore) SaveRegistryUnlocked(_ context.Context, _ cregistry.Registry
 	return nil
 }
 
+func (s *fakeStore) Baselines(_ context.Context) (map[string]state.Baseline, error) {
+	return map[string]state.Baseline{}, nil
+}
+
+func (s *fakeStore) SaveBaselinesUnlocked(_ context.Context, _ map[string]state.Baseline) error {
+	return nil
+}
+
 // countingRecorder tracks the peak number of concurrent RecordApplied calls — the
 // first statement inside handleApply's per-endpoint critical section — holding each
 // call for hold so an unserialized overlap is observable, then forwards to inner.

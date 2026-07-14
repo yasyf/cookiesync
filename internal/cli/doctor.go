@@ -4,11 +4,13 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"sort"
 	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
 
+	"github.com/yasyf/cookiesync/internal/engine"
 	"github.com/yasyf/cookiesync/internal/helper"
 	"github.com/yasyf/cookiesync/internal/mesh"
 	"github.com/yasyf/cookiesync/internal/paths"
@@ -35,14 +37,15 @@ type check struct {
 // a live helper, or a registered mesh. The zero value is not usable; build it with
 // realDoctorEnv.
 type doctorEnv struct {
-	helper   func(ctx context.Context) check
-	socket   func(ctx context.Context) check
-	keyCache func(ctx context.Context) check
-	mesh     func(ctx context.Context) check
-	tcc      func(ctx context.Context) (check, bool)
-	manifest func(ctx context.Context) check
-	state    func(ctx context.Context) check
-	tracked  func(ctx context.Context) check
+	helper     func(ctx context.Context) check
+	socket     func(ctx context.Context) check
+	keyCache   func(ctx context.Context) check
+	mesh       func(ctx context.Context) check
+	tcc        func(ctx context.Context) (check, bool)
+	manifest   func(ctx context.Context) check
+	state      func(ctx context.Context) check
+	tracked    func(ctx context.Context) check
+	quarantine func(ctx context.Context) []check
 }
 
 // checks runs every probe in a fixed order so the report is deterministic.
@@ -56,11 +59,12 @@ func (e doctorEnv) checks(ctx context.Context) []check {
 	if tcc, ok := e.tcc(ctx); ok {
 		checks = append(checks, tcc)
 	}
-	return append(checks,
+	checks = append(checks,
 		e.manifest(ctx),
 		e.state(ctx),
 		e.tracked(ctx),
 	)
+	return append(checks, e.quarantine(ctx)...)
 }
 
 func newDoctorCmd() *cobra.Command {
@@ -105,9 +109,10 @@ func realDoctorEnv() doctorEnv {
 		tcc: func(ctx context.Context) (check, bool) {
 			return checkTCC(ctx, mesh.Resolve)
 		},
-		manifest: checkManifest,
-		state:    checkState,
-		tracked:  checkTracked,
+		manifest:   checkManifest,
+		state:      checkState,
+		tracked:    checkTracked,
+		quarantine: checkQuarantine,
 	}
 }
 
@@ -260,6 +265,39 @@ func checkTracked(ctx context.Context) check {
 		return check{label: "browsers", detail: "no browser endpoints tracked; run 'cookiesync browser add'"}
 	}
 	return check{label: "browsers", ok: true, detail: fmt.Sprintf("%d tracked", n)}
+}
+
+// checkQuarantine emits one failing line per endpoint the mass-drop quarantine holds
+// out of the merge, read from the persisted rowcount baselines. A healthy host emits
+// nothing.
+func checkQuarantine(ctx context.Context) []check {
+	st, err := state.New(paths.Config).Load(ctx)
+	if err != nil {
+		return []check{{label: "quarantine", detail: err.Error()}}
+	}
+	return quarantineChecks(st.Baselines)
+}
+
+// quarantineChecks renders one FAIL line per quarantined endpoint, sorted by id.
+func quarantineChecks(baselines map[string]state.Baseline) []check {
+	ids := make([]string, 0, len(baselines))
+	for id, baseline := range baselines {
+		if baseline.Quarantined {
+			ids = append(ids, id)
+		}
+	}
+	sort.Strings(ids)
+	checks := make([]check, 0, len(ids))
+	for _, id := range ids {
+		baseline := baselines[id]
+		recoverRows := int(float64(baseline.Rows) * engine.QuarantineRecoverFraction)
+		checks = append(checks, check{
+			label: "quarantine",
+			detail: fmt.Sprintf("%s: rowcount collapsed to %d vs baseline %d; excluded from merge inputs until it recovers to >= %d rows",
+				id, baseline.QuarantinedRows, baseline.Rows, recoverRows),
+		})
+	}
+	return checks
 }
 
 // noteHelper prints a one-line note on the signed key helper before install proceeds,

@@ -16,10 +16,12 @@ import (
 var newFetcher = func() converge.Fetcher[state.EndpointMeta] { return NewSSHFetcher() }
 
 // Store is the slice of the state store the orchestration needs: the convergent
-// registry read/write paths the Driver consumes, plus the flock the whole pass runs
-// under. The self target and peer mesh come from reposync, not this store.
+// registry read/write paths the Driver consumes, the rowcount ledger the mass-drop
+// quarantine consults, plus the flock the whole pass runs under. The self target and
+// peer mesh come from reposync, not this store.
 type Store interface {
 	registryStore
+	BaselineStore
 	WithLock(ctx context.Context, fn func() error) error
 }
 
@@ -98,6 +100,7 @@ func (e *Engine) run(ctx context.Context, origin string) ([]Result, error) {
 		SelfTarget:  self,
 		Cache:       e.cache,
 		Recorder:    e.recorder,
+		Baselines:   e.store,
 		LocalSource: NewCachedKeySource(e.cache, self),
 		SourceFor:   func(peer string) Source { return NewSSHBackend(e.runner, peer, self) },
 		LockFor:     e.ApplyLock,

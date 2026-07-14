@@ -3,8 +3,12 @@ package engine
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"os"
+	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 
 	_ "modernc.org/sqlite" // register the sqlite driver for the fixture cookie store
 
@@ -96,6 +100,77 @@ func TestWatchItemDeclaresCookiesDBFile(t *testing.T) {
 			}
 			if item.ID != string(ep.ID()) {
 				t.Fatalf("watchItem ID = %q, want %q", item.ID, ep.ID())
+			}
+		})
+	}
+}
+
+// singletonLock plants the SingletonLock symlink Chromium keeps at the data root,
+// targeting "<hostname>-<pid>".
+func singletonLock(t *testing.T, browser cookie.Browser, pid int) {
+	t.Helper()
+	if err := os.Symlink(fmt.Sprintf("laptop.local-%d", pid), filepath.Join(browser.DataRoot, "SingletonLock")); err != nil {
+		t.Fatalf("plant SingletonLock: %v", err)
+	}
+}
+
+// TestWatchItemBusyWhenBrowserMidWrite pins the busy signal: an item reports Busy only
+// when the owning browser is running (a live pid behind SingletonLock) AND the store
+// or a -journal/-wal sidecar was written within busyWriteWindow — either alone is not
+// enough, and a stale post-crash lock never counts as running.
+func TestWatchItemBusyWhenBrowserMidWrite(t *testing.T) {
+	const deadPID = 99999999
+	tests := []struct {
+		name       string
+		pid        int
+		staleStore bool
+		sidecar    string
+		wantBusy   bool
+	}{
+		{"running browser and fresh store is busy", os.Getpid(), false, "", true},
+		{"running browser and fresh journal sidecar is busy", os.Getpid(), true, "Cookies-journal", true},
+		{"running browser and fresh wal sidecar is busy", os.Getpid(), true, "Cookies-wal", true},
+		{"running browser but idle store is not busy", os.Getpid(), true, "", false},
+		{"fresh store without the browser is not busy", 0, false, "", false},
+		{"fresh store behind a stale crash lock is not busy", deadPID, false, "", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("HOME", t.TempDir())
+			browser, err := cookie.Lookup("chrome")
+			if err != nil {
+				t.Fatalf("lookup chrome: %v", err)
+			}
+			addChromeStore(t, browser, "Default")
+			if tt.pid != 0 {
+				singletonLock(t, browser, tt.pid)
+			}
+			if tt.staleStore {
+				old := time.Now().Add(-time.Minute)
+				if err := os.Chtimes(browser.CookiesDB("Default"), old, old); err != nil {
+					t.Fatalf("age store: %v", err)
+				}
+			}
+			if tt.sidecar != "" {
+				path := filepath.Join(browser.ProfileDir("Default"), tt.sidecar)
+				if err := os.WriteFile(path, []byte("x"), 0o600); err != nil {
+					t.Fatalf("plant sidecar: %v", err)
+				}
+			}
+
+			ep := state.Endpoint{Host: "me@laptop", Browser: "chrome", Profile: "Default"}
+			item, ok, err := watchItem(context.Background(), ep)
+			if err != nil || !ok {
+				t.Fatalf("watchItem ok=%v err=%v, want present item", ok, err)
+			}
+			if item.Busy != tt.wantBusy {
+				t.Fatalf("Busy = %v (reason %q), want %v", item.Busy, item.BusyReason, tt.wantBusy)
+			}
+			if tt.wantBusy && !strings.Contains(item.BusyReason, "Chrome") {
+				t.Fatalf("BusyReason = %q, want it to name the browser", item.BusyReason)
+			}
+			if !tt.wantBusy && item.BusyReason != "" {
+				t.Fatalf("idle item carries BusyReason %q", item.BusyReason)
 			}
 		})
 	}

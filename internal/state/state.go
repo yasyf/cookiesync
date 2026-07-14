@@ -21,7 +21,17 @@ const (
 	keySettings         = "settings"
 	keyConsentRoute     = "consent_route_to"
 	keyConsentRouteHard = "consent_route_hard"
+	keyBaselines        = "row_baselines"
 )
+
+// Baseline is one endpoint's last-known-good extracted cookie rowcount and its
+// mass-drop quarantine state, keyed by endpoint id in state.json. A collapse flips
+// Quarantined and records the collapsed count for doctor.
+type Baseline struct {
+	Rows            int  `json:"rows"`
+	Quarantined     bool `json:"quarantined,omitempty"`
+	QuarantinedRows int  `json:"quarantined_rows,omitempty"`
+}
 
 // State is cookiesync's full on-disk configuration for this host: how peers reach it,
 // the cadence settings, the optional consent route, and the convergent registry of
@@ -32,6 +42,7 @@ type State struct {
 	ConsentRouteTo   string
 	ConsentRouteHard bool
 	Browsers         cregistry.Registry[EndpointMeta]
+	Baselines        map[string]Baseline
 }
 
 // Endpoints returns the present (non-tombstoned) tracked endpoints, decoded from the
@@ -124,6 +135,26 @@ func (s *Store) LoadRegistry(_ context.Context) (cregistry.Registry[EndpointMeta
 func (s *Store) SaveRegistryUnlocked(_ context.Context, reg cregistry.Registry[EndpointMeta]) error {
 	return s.cfg.UpdateRawUnlocked(func(raw map[string]json.RawMessage) error {
 		return putBrowsers(raw, reg)
+	})
+}
+
+// Baselines reads the per-endpoint rowcount ledger out of state.json. A pure read that
+// never acquires the flock (the converge pass consulting it already holds it); an
+// absent key yields an empty, non-nil map.
+func (s *Store) Baselines(_ context.Context) (map[string]Baseline, error) {
+	raw, err := s.readRaw()
+	if err != nil {
+		return nil, err
+	}
+	return baselinesFromRaw(raw)
+}
+
+// SaveBaselinesUnlocked persists the rowcount ledger into the row_baselines key of
+// state.json, preserving every other key, WITHOUT acquiring the flock — the converge
+// pass writing it already holds the (non-reentrant) lock.
+func (s *Store) SaveBaselinesUnlocked(_ context.Context, baselines map[string]Baseline) error {
+	return s.cfg.UpdateRawUnlocked(func(raw map[string]json.RawMessage) error {
+		return putBaselines(raw, baselines)
 	})
 }
 
@@ -234,7 +265,26 @@ func stateFromRaw(raw map[string]json.RawMessage) (*State, error) {
 		return nil, err
 	}
 	st.Browsers = reg
+	baselines, err := baselinesFromRaw(raw)
+	if err != nil {
+		return nil, err
+	}
+	st.Baselines = baselines
 	return st, nil
+}
+
+// baselinesFromRaw decodes the rowcount ledger out of the row_baselines key, returning
+// an empty map when the key is absent.
+func baselinesFromRaw(raw map[string]json.RawMessage) (map[string]Baseline, error) {
+	baselines := map[string]Baseline{}
+	v, ok := raw[keyBaselines]
+	if !ok {
+		return baselines, nil
+	}
+	if err := json.Unmarshal(v, &baselines); err != nil {
+		return nil, fmt.Errorf("parse row_baselines: %w", err)
+	}
+	return baselines, nil
 }
 
 // browsersFromRaw decodes the convergent endpoint registry out of the browsers key,
@@ -260,6 +310,15 @@ func putBrowsers(raw map[string]json.RawMessage, reg cregistry.Registry[Endpoint
 		return fmt.Errorf("encode browsers registry: %w", err)
 	}
 	raw[keyBrowsers] = encoded
+	return nil
+}
+
+func putBaselines(raw map[string]json.RawMessage, baselines map[string]Baseline) error {
+	encoded, err := json.Marshal(baselines)
+	if err != nil {
+		return fmt.Errorf("encode row_baselines: %w", err)
+	}
+	raw[keyBaselines] = encoded
 	return nil
 }
 

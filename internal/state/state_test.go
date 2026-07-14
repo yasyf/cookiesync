@@ -304,3 +304,65 @@ func TestSettingsLoadToleratesRemovedOpTimeout(t *testing.T) {
 		t.Fatalf("settings = %+v, want %+v", st.Settings, want)
 	}
 }
+
+// TestBaselinesRoundTrip proves the rowcount ledger persists through the row_baselines
+// key and reads back identically via both Baselines and Load, coexisting with the
+// other state keys.
+func TestBaselinesRoundTrip(t *testing.T) {
+	ctx := context.Background()
+	store, path := newTestStore(t, time.Unix(1_700_000_000, 0))
+
+	ep := Endpoint{Host: "me@laptop", Browser: "chrome", Profile: "Default"}
+	if err := store.AddBrowser(ctx, "me@laptop", ep); err != nil {
+		t.Fatalf("AddBrowser: %v", err)
+	}
+
+	want := map[string]Baseline{
+		"me@laptop:chrome:Default": {Rows: 9000},
+		"me@laptop:arc:Default":    {Rows: 1200, Quarantined: true, QuarantinedRows: 12},
+	}
+	if err := store.SaveBaselinesUnlocked(ctx, want); err != nil {
+		t.Fatalf("SaveBaselinesUnlocked: %v", err)
+	}
+
+	got, err := store.Baselines(ctx)
+	if err != nil {
+		t.Fatalf("Baselines: %v", err)
+	}
+	if len(got) != len(want) {
+		t.Fatalf("Baselines() = %+v, want %+v", got, want)
+	}
+	for id, baseline := range want {
+		if got[id] != baseline {
+			t.Fatalf("Baselines()[%s] = %+v, want %+v", id, got[id], baseline)
+		}
+	}
+
+	st, err := store.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if st.Baselines["me@laptop:arc:Default"] != want["me@laptop:arc:Default"] {
+		t.Fatalf("Load().Baselines = %+v, want %+v", st.Baselines, want)
+	}
+	if _, ok := st.Browsers[string(ep.ID())]; !ok {
+		t.Fatalf("browsers key clobbered by the baselines write")
+	}
+	raw := readStateFile(t, path)
+	if _, ok := raw["row_baselines"]; !ok {
+		t.Fatalf("row_baselines key missing from state.json")
+	}
+}
+
+// TestBaselinesAbsentKeyIsEmpty proves a state.json without the row_baselines key
+// yields an empty, non-nil ledger.
+func TestBaselinesAbsentKeyIsEmpty(t *testing.T) {
+	store, _ := newTestStore(t, time.Unix(1_700_000_000, 0))
+	got, err := store.Baselines(context.Background())
+	if err != nil {
+		t.Fatalf("Baselines: %v", err)
+	}
+	if got == nil || len(got) != 0 {
+		t.Fatalf("Baselines() = %#v, want empty non-nil map", got)
+	}
+}
