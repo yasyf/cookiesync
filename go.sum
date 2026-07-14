@@ -103,8 +103,8 @@ github.com/vishvananda/netns v0.0.0-20200728191858-db3c7e526aae h1:4hwBBUfQCFe3C
 github.com/vishvananda/netns v0.0.0-20200728191858-db3c7e526aae/go.mod h1:DD4vA1DwXk04H54A1oHXtwZmA0grkVMdPxx/VGLCah0=
 github.com/xo/terminfo v0.0.0-20220910002029-abceb7e1c41e h1:JVG44RsyaB9T2KIHavMF/ppJZNG9ZpyihvCd0w101no=
 github.com/xo/terminfo v0.0.0-20220910002029-abceb7e1c41e/go.mod h1:RbqR21r5mrJuqunuUZ/Dhy/avygyECGrLceyNeo4LiM=
-github.com/yasyf/synckit v0.12.0 h1:h6Cmt5JYl7mWoXRRWGWBAoh3x616g2ulm3cMNG5G6H0=
-github.com/yasyf/synckit v0.12.0/go.mod h1:ANvxMrvFuqvytqZ9sFw8KnGgm6JpZe8FS0L3GlRy5sc=
+github.com/yasyf/synckit v0.14.0 h1:raAy3cPHGGYHrQP3xCzDxMFO58iwliSXRKrv9cWFCL8=
+github.com/yasyf/synckit v0.14.0/go.mod h1:ANvxMrvFuqvytqZ9sFw8KnGgm6JpZe8FS0L3GlRy5sc=
 go.yaml.in/yaml/v3 v3.0.4/go.mod h1:DhzuOOF2ATzADvBadXxruRBLzYTpT36CKvDb3+aBEFg=
 golang.org/x/crypto v0.48.0 h1:/VRzVqiRSggnhY7gNRxPauEQ5Drw9haKdM0jqfcCFts=
 golang.org/x/crypto v0.48.0/go.mod h1:r0kV5h3qnFPlQnBSrULhlsRfryS2pmewsg+XfMgkVos=

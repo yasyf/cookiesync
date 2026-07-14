@@ -23,10 +23,12 @@ cookiesync/
 
 The generic sync substrate (host registry, RPC over a unix socket, convergent
 registry, launchd service plumbing) lives in the shared
-`github.com/yasyf/synckit` module, vendored for development via a `replace` to
-`../synckit`. cookiesync drives it for its config dir, socket path, and peer
-registry; the cookie-specific subsystems (crypto, sqlite stores, merge, the Swift
-helper bridge, the watch daemon) live here.
+`github.com/yasyf/synckit` module, consumed as a published version pinned in
+go.mod (no local `replace`; to build against in-flight synckit changes, add a
+temporary `go mod edit -replace github.com/yasyf/synckit=../synckit` and drop
+it before committing). cookiesync drives it for its config dir, socket path,
+and peer registry; the cookie-specific subsystems (crypto, sqlite stores,
+merge, the Swift helper bridge, the watch daemon) live here.
 
 ## Ask Before Assuming
 
