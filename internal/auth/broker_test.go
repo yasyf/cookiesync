@@ -5,13 +5,17 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"reflect"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/yasyf/cookiesync/internal/cache"
 	"github.com/yasyf/cookiesync/internal/cookie"
 	"github.com/yasyf/cookiesync/internal/helper"
+	"github.com/yasyf/synckit/hostregistry"
 	"github.com/yasyf/synckit/presence"
 )
 
@@ -541,5 +545,100 @@ func TestKeyApproverProbeErrorClassifiesUnavailable(t *testing.T) {
 	}
 	if len(consent.promptedReasons) != 0 {
 		t.Fatalf("a failed probe must not prompt, got %v", consent.promptedReasons)
+	}
+}
+
+// localReleaseOutcome is every observable a hard-route ModeLocal release
+// leaves behind, comparable across runner scenarios.
+type localReleaseOutcome struct {
+	key        string
+	surface    Surface
+	errText    string
+	prompts    []string
+	unprompted int
+	cachedKey  string
+	warm       bool
+}
+
+// hardRouteLocalRelease runs one ModeLocal Key release for chrome with a hard
+// consent route to you@desktop and an attended local session, over the given
+// runner.
+func hardRouteLocalRelease(t *testing.T, runner SSHRunner) localReleaseOutcome {
+	t.Helper()
+	ctx := context.Background()
+	self := "me@laptop"
+	fakeMesh(t, self, "you@desktop")
+	st := stateWith(self, "you@desktop", stateEndpoint(self, "chrome", "Default"))
+	st.ConsentRouteHard = true
+	consent := &fakeConsent{key: cookie.DeriveKey(cookie.SafeStorageKey("peanuts"))}
+	c := newFakeCache()
+	b := newTestBroker(consent, c, staticProbe(liveSession(currentUser(t))), runner, st)
+
+	key, surface, err := b.Key(ctx, Req{Requestor: "local", Browser: "chrome", Profile: "Default", Reason: testConsentReason, Mode: ModeLocal})
+	errText := ""
+	if err != nil {
+		errText = err.Error()
+	}
+	cached, warm, cerr := c.Get(ctx, endpointID(self, "chrome", "Default"))
+	if cerr != nil {
+		t.Fatalf("cache get: %v", cerr)
+	}
+	return localReleaseOutcome{
+		key:        string(key),
+		surface:    surface,
+		errText:    errText,
+		prompts:    append([]string(nil), consent.promptedReasons...),
+		unprompted: consent.unpromptedCalled,
+		cachedKey:  string(cached),
+		warm:       warm,
+	}
+}
+
+// TestKeyHardRouteWhoamiSSHErrorMatchesNotLivePeer proves a hard consent route
+// whose whoami probe fails with an SSHError — even a non-255 remote exit, the
+// shape a transport flake produces — counts as peer-not-live: the local
+// release proceeds through Touch ID exactly as it does when the peer answers a
+// locked whoami, instead of bricking every local release on this host.
+func TestKeyHardRouteWhoamiSSHErrorMatchesNotLivePeer(t *testing.T) {
+	exit1 := exec.Command("/bin/sh", "-c", "exit 1").Run()
+	var exitErr *exec.ExitError
+	if !errors.As(exit1, &exitErr) {
+		t.Fatalf("fabricate exit-1: %v", exit1)
+	}
+	notLive := &approverMesh{}
+	flaky := &whoamiErrMesh{
+		approverMesh: &approverMesh{},
+		target:       "you@desktop",
+		err:          &hostregistry.SSHError{Addr: "you@desktop", Stderr: "whoami failed remotely", Err: exit1},
+	}
+
+	baseline := hardRouteLocalRelease(t, notLive)
+	if baseline.errText != "" || baseline.surface != SurfaceLocal || len(baseline.prompts) != 1 {
+		t.Fatalf("peer-not-live baseline must release locally, got %+v", baseline)
+	}
+	flaked := hardRouteLocalRelease(t, flaky)
+	if !reflect.DeepEqual(flaked, baseline) {
+		t.Fatalf("whoami ssh-error outcome = %+v, want the peer-not-live outcome %+v", flaked, baseline)
+	}
+	if asked := flaky.consentTargets(); len(asked) != 0 {
+		t.Fatalf("request_consent dials = %v, want none", asked)
+	}
+}
+
+// TestKeyHardRouteMalformedWhoamiIsFatal proves the probe-shaped carve-out
+// stays narrow: a hard-routed peer whose whoami reply does not parse fails the
+// release outright — no Touch ID prompt, no cached key.
+func TestKeyHardRouteMalformedWhoamiIsFatal(t *testing.T) {
+	runner := &approverMesh{whoami: map[string]string{"you@desktop": "not json"}}
+
+	got := hardRouteLocalRelease(t, runner)
+	if got.errText == "" || !strings.Contains(got.errText, "parse whoami from you@desktop") {
+		t.Fatalf("malformed whoami err = %q, want a fatal parse failure", got.errText)
+	}
+	if len(got.prompts) != 0 || got.unprompted != 0 {
+		t.Fatalf("a fatal probe failure must not prompt, got %+v", got)
+	}
+	if got.warm {
+		t.Fatalf("a fatal probe failure must not cache a key")
 	}
 }

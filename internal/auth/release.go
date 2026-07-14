@@ -64,16 +64,19 @@ func (b *Broker) releaseKey(ctx context.Context, st *state.State, req Req, self,
 // gate to a peer instead of prompting Touch ID locally: a hard consent route
 // (ConsentRouteHard) to a live ConsentRouteTo peer wins outright — this host
 // routes even when it looks locally attended — and a cold local session routes
-// to the active peer. It is derived once inside each release flight
+// to the active peer. A hard-routed peer whose whoami leg failed at ssh
+// (probeRoutesAround) counts as not live — exactly like routedRelease's probe
+// loop — never as a fatal local-release failure; a whoami reply that does not
+// parse stays fatal. It is derived once inside each release flight
 // (releaseKey), never snapshotted at call start, so the routed/local split a
 // caller observes is always the one its flight actually used.
 func (b *Broker) routesConsent(ctx context.Context, st *state.State) (bool, error) {
 	if st.ConsentRouteHard && st.ConsentRouteTo != "" {
 		live, err := b.peerIsLive(ctx, st.ConsentRouteTo)
-		if err != nil {
+		if err != nil && !probeRoutesAround(err) {
 			return false, err
 		}
-		if live {
+		if err == nil && live {
 			return true, nil
 		}
 	}
