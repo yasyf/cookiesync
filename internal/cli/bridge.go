@@ -1,10 +1,13 @@
 package cli
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -30,6 +33,16 @@ type bridgeOpenResult struct {
 	ExpiresIn  float64 `json:"expires_in"`
 }
 
+// bridgeOpenJSON is the `bridge open --json` shape: the endpoint fields a consumer
+// needs, without the management capability openBridge persists client-side.
+type bridgeOpenJSON struct {
+	URL       string  `json:"url"`
+	Endpoint  string  `json:"endpoint"`
+	Browser   string  `json:"browser"`
+	Profile   string  `json:"profile"`
+	ExpiresIn float64 `json:"expires_in"`
+}
+
 // bridgeStatusResult is the frozen bridge_status reply; empty when the session
 // is gone.
 type bridgeStatusResult struct {
@@ -40,6 +53,60 @@ type bridgeStatusResult struct {
 	PID       int     `json:"pid"`
 }
 
+// bridgeStopResult is the --json shape of a completed stop: the endpoint torn
+// down and the closed flag.
+type bridgeStopResult struct {
+	Endpoint string `json:"endpoint"`
+	Closed   bool   `json:"closed"`
+}
+
+// openBridge runs the tapped, consent-gated bridge_open behind both `bridge
+// open` and the plugin's browser.launch, persisting the capability and tearing
+// the session down if it can't be saved. A package var for the plugin tests' stub.
+var openBridge = func(ctx context.Context, host, browser, profile string, headed bool) (bridgeOpenResult, error) {
+	key := bridgeCapKey(host, browser, profile)
+	params := map[string]any{
+		"browser": browser,
+		"profile": profile,
+		"host":    host,
+		"headed":  headed,
+	}
+	if r, ok := resolveRequestor(); ok {
+		params["requestor"] = r
+	}
+	if capability, ok := loadCap(key); ok {
+		params["capability"] = capability
+	}
+	var resp bridgeOpenResult
+	if err := rpc.CallJSON(ctx, "bridge_open", params, &resp); err != nil {
+		return bridgeOpenResult{}, err
+	}
+	if err := saveCap(key, resp.Capability); err != nil {
+		var closed struct {
+			Closed bool `json:"closed"`
+		}
+		_ = rpc.CallJSON(ctx, "bridge_close", map[string]any{"capability": resp.Capability}, &closed)
+		return bridgeOpenResult{}, err
+	}
+	return resp, nil
+}
+
+// stopBridge closes the saved bridge for key host:browser:profile and drops its
+// capability, behind both `bridge stop` and the plugin's browser.close.
+var stopBridge = func(ctx context.Context, key string) error {
+	capability, ok := loadCap(key)
+	if !ok {
+		return fmt.Errorf("no saved bridge for %s", key)
+	}
+	var resp struct {
+		Closed bool `json:"closed"`
+	}
+	if err := rpc.CallJSON(ctx, "bridge_close", map[string]any{"capability": capability}, &resp); err != nil {
+		return err
+	}
+	return removeCap(key)
+}
+
 // newBridgeCmd builds the bridge command tree: open a live, cookie-seeded Chrome
 // DevTools bridge, list running sessions, and stop one.
 func newBridgeCmd() *cobra.Command {
@@ -47,12 +114,12 @@ func newBridgeCmd() *cobra.Command {
 		Use:   "bridge",
 		Short: "Open a live, cookie-seeded Chrome DevTools bridge for agent-browser.",
 	}
-	cmd.AddCommand(newBridgeOpenCmd(), newBridgeLsCmd(), newBridgeStopCmd())
+	cmd.AddCommand(newBridgeOpenCmd(), newBridgeLsCmd(), newBridgeStopCmd(), newBridgePluginCmd())
 	return cmd
 }
 
 func newBridgeOpenCmd() *cobra.Command {
-	var headed, headless bool
+	var headed, headless, asJSON bool
 	var browser, profile string
 	cmd := &cobra.Command{
 		Use:   "open [host:browser:profile]",
@@ -63,32 +130,18 @@ func newBridgeOpenCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			key := bridgeCapKey(host, br, prof)
-			params := map[string]any{
-				"browser": br,
-				"profile": prof,
-				"host":    host,
-				"headed":  headed && !headless,
-			}
-			if r, ok := resolveRequestor(); ok {
-				params["requestor"] = r
-			}
-			if capability, ok := loadCap(key); ok {
-				params["capability"] = capability
-			}
-			var resp bridgeOpenResult
-			if err := rpc.CallJSON(cmd.Context(), "bridge_open", params, &resp); err != nil {
+			resp, err := openBridge(cmd.Context(), host, br, prof, headed && !headless)
+			if err != nil {
 				return err
 			}
-			if err := saveCap(key, resp.Capability); err != nil {
-				// The saved capability is the only handle to stop the session;
-				// unsaved, tear the just-opened browser down rather than orphan a
-				// live, logged-in session until its lease expires.
-				var closed struct {
-					Closed bool `json:"closed"`
-				}
-				_ = rpc.CallJSON(cmd.Context(), "bridge_close", map[string]any{"capability": resp.Capability}, &closed)
-				return err
+			if asJSON {
+				return writeBridgeJSON(cmd.OutOrStdout(), bridgeOpenJSON{
+					URL:       resp.URL,
+					Endpoint:  resp.Endpoint,
+					Browser:   resp.Browser,
+					Profile:   resp.Profile,
+					ExpiresIn: resp.ExpiresIn,
+				})
 			}
 			printBridgeReady(cmd, resp)
 			return nil
@@ -98,11 +151,13 @@ func newBridgeOpenCmd() *cobra.Command {
 	cmd.Flags().BoolVar(&headless, "headless", false, "Run Chrome headless (--headless=new).")
 	cmd.Flags().StringVar(&browser, "browser", "", "The browser to seed the bridge from.")
 	cmd.Flags().StringVar(&profile, "profile", "", "The profile to seed the bridge from.")
+	cmd.Flags().BoolVar(&asJSON, "json", false, "Emit the bridge endpoint as JSON.")
 	return cmd
 }
 
 func newBridgeLsCmd() *cobra.Command {
-	return &cobra.Command{
+	var asJSON bool
+	cmd := &cobra.Command{
 		Use:   "ls",
 		Short: "List live bridge sessions.",
 		Args:  cobra.NoArgs,
@@ -111,6 +166,7 @@ func newBridgeLsCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
+			live := []bridgeStatusResult{}
 			for _, entry := range caps {
 				var st bridgeStatusResult
 				if err := rpc.CallJSON(cmd.Context(), "bridge_status", map[string]any{"capability": entry.capability}, &st); err != nil {
@@ -120,15 +176,24 @@ func newBridgeLsCmd() *cobra.Command {
 					_ = os.Remove(entry.path)
 					continue
 				}
+				live = append(live, st)
+			}
+			if asJSON {
+				return writeBridgeJSON(cmd.OutOrStdout(), live)
+			}
+			for _, st := range live {
 				cmd.Printf("%s · expires in %s · pid %d\n", st.Endpoint, formatTTL(st.ExpiresIn), st.PID)
 			}
 			return nil
 		},
 	}
+	cmd.Flags().BoolVar(&asJSON, "json", false, "Emit the live bridge sessions as JSON.")
+	return cmd
 }
 
 func newBridgeStopCmd() *cobra.Command {
 	var browser, profile string
+	var asJSON bool
 	cmd := &cobra.Command{
 		Use:   "stop [host:browser:profile]",
 		Short: "Tear down a live bridge session.",
@@ -139,18 +204,11 @@ func newBridgeStopCmd() *cobra.Command {
 				return err
 			}
 			key := bridgeCapKey(host, br, prof)
-			capability, ok := loadCap(key)
-			if !ok {
-				return fmt.Errorf("no saved bridge for %s", key)
-			}
-			var resp struct {
-				Closed bool `json:"closed"`
-			}
-			if err := rpc.CallJSON(cmd.Context(), "bridge_close", map[string]any{"capability": capability}, &resp); err != nil {
+			if err := stopBridge(cmd.Context(), key); err != nil {
 				return err
 			}
-			if err := removeCap(key); err != nil {
-				return err
+			if asJSON {
+				return writeBridgeJSON(cmd.OutOrStdout(), bridgeStopResult{Endpoint: key, Closed: true})
 			}
 			cmd.Printf("bridge closed · %s\n", key)
 			return nil
@@ -158,6 +216,7 @@ func newBridgeStopCmd() *cobra.Command {
 	}
 	cmd.Flags().StringVar(&browser, "browser", "", "The browser whose bridge to stop.")
 	cmd.Flags().StringVar(&profile, "profile", "", "The profile whose bridge to stop.")
+	cmd.Flags().BoolVar(&asJSON, "json", false, "Emit the closed endpoint as JSON.")
 	return cmd
 }
 
@@ -208,6 +267,17 @@ func printBridgeReady(cmd *cobra.Command, r bridgeOpenResult) {
 
 func formatTTL(seconds float64) string {
 	return time.Duration(seconds * float64(time.Second)).Round(time.Second).String()
+}
+
+// writeBridgeJSON marshals v as indented JSON with a trailing newline — the
+// --json shape across the bridge subcommands, mirroring browser ls --json.
+func writeBridgeJSON(w io.Writer, v any) error {
+	out, err := json.MarshalIndent(v, "", "  ")
+	if err != nil {
+		return err
+	}
+	_, err = w.Write(append(out, '\n'))
+	return err
 }
 
 // capEntry is one saved capability file and its contents, for ls.
