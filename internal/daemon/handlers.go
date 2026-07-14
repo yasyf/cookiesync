@@ -303,6 +303,48 @@ func (d *Daemon) handleRequestConsent(ctx context.Context, params map[string]any
 	}
 }
 
+// handleRequestBridgeConsent approves a routed live-bridge seed for a peer: a
+// STRICT biometric prompt (no passcode) to the person here, whose key is
+// discarded, echoing the requester's nonce + endpoint VERBATIM to bind the
+// approval. No key crosses the wire. Returns {"status":"approved", nonce,
+// endpoint} on a live tap, {"status":"denied"} when declined, or
+// {"status":"unavailable"} when this host has no live session, a locked keybag,
+// or no enrolled bridge vault — so the requester's routing advances to another
+// peer. Other release failures propagate to the RPC caller.
+func (d *Daemon) handleRequestBridgeConsent(ctx context.Context, params map[string]any) (any, error) {
+	browserID, err := stringParam(params, "browser")
+	if err != nil {
+		return nil, err
+	}
+	profile := optionalString(params, "profile", defaultProfile)
+	nonce, err := stringParam(params, "nonce")
+	if err != nil {
+		return nil, err
+	}
+	endpoint, err := stringParam(params, "endpoint")
+	if err != nil {
+		return nil, err
+	}
+	host, _, _ := strings.Cut(endpoint, ":")
+	approveErr := d.broker.ApproveBridge(ctx, auth.Req{
+		Requestor: "host:" + host,
+		Browser:   browserID,
+		Profile:   profile,
+		Origin:    host,
+		Mode:      auth.ModeApprover,
+	})
+	switch auth.ClassifyBridgeApproval(approveErr) {
+	case auth.VerdictOK:
+		return map[string]any{"status": "approved", "nonce": nonce, "endpoint": endpoint}, nil
+	case auth.VerdictDenied:
+		return map[string]any{"status": "denied"}, nil
+	case auth.VerdictUnavailable:
+		return map[string]any{"status": "unavailable"}, nil
+	default:
+		return nil, approveErr
+	}
+}
+
 // handleGetCookies renders cookies for one or more urls, merged into one set. With a
 // "browser" param it reads that one endpoint via getCookiesSingle — the frozen
 // {"cookies": [...]} path a peer's ssh leg drives. With no "browser" it unions every

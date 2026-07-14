@@ -8,17 +8,21 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
 	"github.com/yasyf/cookiesync/internal/auth"
 	"github.com/yasyf/cookiesync/internal/bridge"
 	"github.com/yasyf/cookiesync/internal/cookie"
+	"github.com/yasyf/cookiesync/internal/engine"
+	"github.com/yasyf/cookiesync/internal/mesh"
 	"github.com/yasyf/cookiesync/internal/paths"
 )
 
@@ -40,6 +44,20 @@ const (
 // register a session no shutdown will ever tear down, the open unwinds itself.
 var errBridgeShutdown = errors.New("bridge: daemon shutting down")
 
+// session is one live bridge the daemon owns and tears down through a uniform
+// seam: a local *bridgeSession fronting a cookie-seeded Chrome here, or a
+// *proxyBridgeSession fronting a peer's bridge over an ssh -L tunnel. The
+// registry, reaper, and shutdown drain hold sessions only through this seam.
+type session interface {
+	Capability() string
+	Endpoint() string
+	Expiry() time.Time
+	Live() bool
+	OpenResult() map[string]any
+	StatusResult() map[string]any
+	Teardown()
+}
+
 // bridgeSession is one live CDP-bridge session the daemon owns: its wire
 // identity, the capability that proves possession, the browser and WS relay,
 // and the detached cancel that unwinds it.
@@ -51,6 +69,7 @@ type bridgeSession struct {
 	browser    string
 	profile    string
 	wsURL      string
+	proxyPort  int // loopback port an ssh -L forwards; 0 (absent) on a local open
 	expiry     time.Time
 	proc       *bridge.Proc
 	server     *bridge.Server
@@ -58,15 +77,29 @@ type bridgeSession struct {
 	dataDir    string
 }
 
-// bridgeRecord is the on-disk record the orphan sweep reaps by: the process
-// group to kill (PID == pgid via Setpgid), the dir to remove, and the launch-time
-// identity (Start, Comm) that the sweep re-matches so pid reuse is never killed.
+// bridgeRecordKind distinguishes the two crash-durable record shapes the orphan
+// sweep reaps: a local Chrome, or a proxy fronting a peer's bridge over ssh -L.
+type bridgeRecordKind string
+
+const (
+	bridgeRecordLocal bridgeRecordKind = "local"
+	bridgeRecordProxy bridgeRecordKind = "proxy"
+)
+
+// bridgeRecord is the on-disk record the orphan sweep reaps by: the process group
+// to kill (PID == pgid via Setpgid), the dir to remove, and the launch-time
+// identity (Start, Comm) the sweep re-matches so pid reuse is never killed. A
+// Proxy record also carries the peer Host and Capability the sweep remote-closes
+// B by, so an origin crash never strands B's logged-in Chrome until its TTL.
 type bridgeRecord struct {
-	PID      int    `json:"pid"`
-	Endpoint string `json:"endpoint"`
-	DataDir  string `json:"data_dir"`
-	Start    string `json:"start"`
-	Comm     string `json:"comm"`
+	Kind       bridgeRecordKind `json:"kind"`
+	PID        int              `json:"pid"`
+	Endpoint   string           `json:"endpoint"`
+	DataDir    string           `json:"data_dir"`
+	Start      string           `json:"start"`
+	Comm       string           `json:"comm"`
+	Host       string           `json:"host,omitempty"`
+	Capability string           `json:"capability,omitempty"`
 }
 
 // procIdentity pins a live process by its launch time and executable, the pair
@@ -76,9 +109,18 @@ type procIdentity struct {
 	comm  string
 }
 
-// live reports whether the session is leased into the future and its relay is
+// Capability is the secret that proves possession of this session.
+func (s *bridgeSession) Capability() string { return s.capability }
+
+// Endpoint is the host:browser:profile identity a re-attach must match.
+func (s *bridgeSession) Endpoint() string { return s.endpoint }
+
+// Expiry is when the lease lapses.
+func (s *bridgeSession) Expiry() time.Time { return s.expiry }
+
+// Live reports whether the session is leased into the future and its relay is
 // not yet torn down by a client disconnect.
-func (s *bridgeSession) live() bool {
+func (s *bridgeSession) Live() bool {
 	if !s.expiry.After(time.Now()) {
 		return false
 	}
@@ -90,9 +132,10 @@ func (s *bridgeSession) live() bool {
 	}
 }
 
-// openResult renders the frozen bridge_open reply.
-func (s *bridgeSession) openResult() map[string]any {
-	return map[string]any{
+// OpenResult renders the frozen bridge_open reply. proxy_port is present only on
+// a cross-host open (advertise set), so a local open stays byte-identical.
+func (s *bridgeSession) OpenResult() map[string]any {
+	result := map[string]any{
 		"url":        s.wsURL,
 		"endpoint":   s.endpoint,
 		"browser":    s.browser,
@@ -100,6 +143,29 @@ func (s *bridgeSession) openResult() map[string]any {
 		"capability": s.capability,
 		"expires_in": time.Until(s.expiry).Seconds(),
 	}
+	if s.proxyPort != 0 {
+		result["proxy_port"] = s.proxyPort
+	}
+	return result
+}
+
+// StatusResult renders the frozen bridge_status reply.
+func (s *bridgeSession) StatusResult() map[string]any {
+	return map[string]any{
+		"endpoint":   s.endpoint,
+		"browser":    s.browser,
+		"profile":    s.profile,
+		"expires_in": time.Until(s.expiry).Seconds(),
+		"pid":        s.proc.Pid(),
+	}
+}
+
+// Teardown cancels the detached session context and closes its relay and Chrome;
+// the caller removes the registry entry.
+func (s *bridgeSession) Teardown() {
+	s.cancel()
+	_ = s.server.Close()
+	_ = s.proc.Close()
 }
 
 // handleBridgeOpen launches a cookie-seeded CDP bridge and registers its
@@ -121,30 +187,44 @@ func (d *Daemon) handleBridgeOpen(ctx context.Context, params map[string]any) (a
 		return nil, fmt.Errorf("unknown browser %q", browser)
 	}
 
-	self, err := meshSelf(ctx)
+	self, peers, err := mesh.Resolve(ctx)
 	if err != nil {
 		return nil, err
 	}
-	if host := optionalString(params, "host", self); host != self {
-		return nil, fmt.Errorf("cross-host bridge not yet available; run it on %s", host)
+	host := optionalString(params, "host", self)
+	if host != self && !peerKnown(peers, host) {
+		return nil, fmt.Errorf("unknown host %q: not a mesh peer", host)
 	}
 
-	profile, err := resolveBridgeProfile(browserObj, optionalString(params, "profile", defaultProfile))
-	if err != nil {
-		return nil, err
-	}
 	headed := optionalBool(params, "headed", true)
-	endpoint := endpointID(self, browser, profile)
+	// origin names the originating host in the consent prompt (display only);
+	// advertise (host:port) is baked into /json/version for an ssh -L client and
+	// signals this open serves a cross-host proxy.
+	origin := optionalString(params, "origin", "")
+	advertise := optionalString(params, "advertise", "")
+	// A cannot see B's profiles, so a cross-host open keeps the requested profile
+	// verbatim; only a local open validates it against the real profiles on disk.
+	profile := optionalString(params, "profile", defaultProfile)
+	endpoint := endpointID(host, browser, profile)
 
-	// The capability is proof-of-possession: re-attach never taps or extends.
+	// The capability is proof-of-possession: re-attach never taps or extends, and
+	// it short-circuits ahead of the cross-host dispatch so a live proxy is reused.
 	if capability := optionalString(params, "capability", ""); capability != "" {
 		if resp, ok := d.reattachBridge(capability, endpoint); ok {
 			return resp, nil
 		}
 	}
 
+	if host != self {
+		return d.remoteBridgeOpen(ctx, self, host, browser, profile, headed)
+	}
+
+	resolved, err := resolveBridgeProfile(browserObj, profile)
+	if err != nil {
+		return nil, err
+	}
 	// Never collapsed: a shared open would piggyback one tap and share its token.
-	return d.openBridge(ctx, requestor, endpoint, browser, profile, browserObj, headed)
+	return d.openBridge(ctx, requestor, endpoint, browser, resolved, browserObj, headed, origin, advertise)
 }
 
 // reattachBridge returns the live session's reply when capability keys it and
@@ -153,16 +233,16 @@ func (d *Daemon) reattachBridge(capability, endpoint string) (any, bool) {
 	d.bridgeMu.Lock()
 	sess, ok := d.bridges[capability]
 	d.bridgeMu.Unlock()
-	if !ok || sess.endpoint != endpoint || !sess.live() {
+	if !ok || sess.Endpoint() != endpoint || !sess.Live() {
 		return nil, false
 	}
-	return sess.openResult(), true
+	return sess.OpenResult(), true
 }
 
 // openBridge is the fresh-open critical path: the biometric tap, the seed read,
 // launch, CDP seed, and WS relay. A deferred cleanup installed before launch
 // tears down a half-open browser on any failure.
-func (d *Daemon) openBridge(ctx context.Context, requestor, endpoint, browser, profile string, browserObj cookie.Browser, headed bool) (any, error) {
+func (d *Daemon) openBridge(ctx context.Context, requestor, endpoint, browser, profile string, browserObj cookie.Browser, headed bool, origin, advertise string) (any, error) {
 	st, err := d.state.Load(ctx)
 	if err != nil {
 		return nil, err
@@ -172,6 +252,7 @@ func (d *Daemon) openBridge(ctx context.Context, requestor, endpoint, browser, p
 		Requestor: requestor,
 		Browser:   browser,
 		Profile:   profile,
+		Origin:    origin,
 		Mode:      auth.ModeLocal,
 	})
 	if err != nil {
@@ -239,9 +320,18 @@ func (d *Daemon) openBridge(ctx context.Context, requestor, endpoint, browser, p
 	if err != nil {
 		return nil, err
 	}
-	server, err = proc.Serve(sessionCtx, token, "")
+	server, err = proc.Serve(sessionCtx, token, advertise)
 	if err != nil {
 		return nil, fmt.Errorf("serve bridge: %w", err)
+	}
+	// A cross-host open advertises the origin's forwarded port; the loopback
+	// listener port it forwards to is server.Addr(). A local open leaves it 0.
+	proxyPort := 0
+	if advertise != "" {
+		proxyPort, err = portOf(server.Addr())
+		if err != nil {
+			return nil, err
+		}
 	}
 	capability, err := mintSecret()
 	if err != nil {
@@ -256,6 +346,7 @@ func (d *Daemon) openBridge(ctx context.Context, requestor, endpoint, browser, p
 		browser:    browser,
 		profile:    profile,
 		wsURL:      server.URL(),
+		proxyPort:  proxyPort,
 		expiry:     time.Now().Add(ttl),
 		proc:       proc,
 		server:     server,
@@ -274,7 +365,7 @@ func (d *Daemon) openBridge(ctx context.Context, requestor, endpoint, browser, p
 
 	go d.watchBridge(sessionCtx, capability, server, sess.expiry)
 
-	result := sess.openResult()
+	result := sess.OpenResult()
 	result["skipped"] = skipped
 	return result, nil
 }
@@ -320,9 +411,7 @@ func (d *Daemon) teardownBridge(capability string) bool {
 	if !ok {
 		return false
 	}
-	sess.cancel()
-	_ = sess.server.Close()
-	_ = sess.proc.Close()
+	sess.Teardown()
 	return true
 }
 
@@ -336,16 +425,10 @@ func (d *Daemon) handleBridgeStatus(_ context.Context, params map[string]any) (a
 	d.bridgeMu.Lock()
 	sess, ok := d.bridges[capability]
 	d.bridgeMu.Unlock()
-	if !ok || !sess.live() {
+	if !ok || !sess.Live() {
 		return map[string]any{}, nil
 	}
-	return map[string]any{
-		"endpoint":   sess.endpoint,
-		"browser":    sess.browser,
-		"profile":    sess.profile,
-		"expires_in": time.Until(sess.expiry).Seconds(),
-		"pid":        sess.proc.Pid(),
-	}, nil
+	return sess.StatusResult(), nil
 }
 
 // handleBridgeClose tears down the session the capability keys.
@@ -371,9 +454,17 @@ func (d *Daemon) closeAllBridges(_ context.Context) {
 		caps = append(caps, capability)
 	}
 	d.bridgeMu.Unlock()
+	// Concurrently: a proxy teardown makes a bounded best-effort ssh close, so
+	// serial teardown of several unreachable peers would blow the shutdown budget.
+	var wg sync.WaitGroup
 	for _, capability := range caps {
-		d.teardownBridge(capability)
+		wg.Add(1)
+		go func(capability string) {
+			defer wg.Done()
+			d.teardownBridge(capability)
+		}(capability)
 	}
+	wg.Wait()
 	if d.bridgeLock != nil {
 		_ = d.bridgeLock.Close() // releases the daemon-ownership flock
 		d.bridgeLock = nil
@@ -403,7 +494,7 @@ func (d *Daemon) reapExpiredBridges() {
 	d.bridgeMu.Lock()
 	expired := make([]string, 0, len(d.bridges))
 	for capability, sess := range d.bridges {
-		if !sess.expiry.After(now) {
+		if !sess.Expiry().After(now) {
 			expired = append(expired, capability)
 		}
 	}
@@ -426,15 +517,16 @@ func (d *Daemon) sweepOrphanBridges(ctx context.Context) error {
 		return fmt.Errorf("scan orphan bridges: %w", err)
 	}
 	for _, path := range matches {
-		reapOrphanBridge(ctx, path)
+		reapOrphanBridge(ctx, d.runner, path)
 	}
 	return nil
 }
 
-// reapOrphanBridge group-kills a recorded bridge's Chrome only when the live pid
-// still matches the launch-time identity — a recycled pid now belongs to some
-// unrelated process and must not be killed — then always removes the session dir.
-func reapOrphanBridge(ctx context.Context, recordPath string) {
+// reapOrphanBridge group-kills a recorded bridge's process group only when the
+// live pid still matches the launch-time identity — a recycled pid now belongs to
+// some unrelated process and must not be killed — best-effort remote-closes a
+// proxy record's peer bridge, then always removes the session dir.
+func reapOrphanBridge(ctx context.Context, runner engine.SSHRunner, recordPath string) {
 	sessionDir := filepath.Dir(recordPath)
 	raw, err := os.ReadFile(recordPath) //nolint:gosec // G304: recordPath is a glob match under our own 0700 config dir.
 	if err != nil {
@@ -448,6 +540,9 @@ func reapOrphanBridge(ctx context.Context, recordPath string) {
 	}
 	if id, ok, err := probeProcess(ctx, rec.PID); err == nil && ok && id.start == rec.Start && id.comm == rec.Comm {
 		_ = syscall.Kill(-rec.PID, syscall.SIGKILL)
+	}
+	if rec.Kind == bridgeRecordProxy {
+		remoteBridgeClose(ctx, runner, rec.Host, rec.Capability)
 	}
 	_ = os.RemoveAll(sessionDir)
 }
@@ -518,19 +613,44 @@ func resolveBridgeProfile(browser cookie.Browser, profile string) (string, error
 // writeBridgeRecord persists the crash-durability record, capturing the freshly
 // launched pid's identity so the sweep can distinguish it from a recycled pid.
 func writeBridgeRecord(ctx context.Context, dataDir string, pid int, endpoint string) error {
-	id, ok, err := probeProcess(ctx, pid)
+	return writeRecord(ctx, dataDir, bridgeRecord{Kind: bridgeRecordLocal, PID: pid, Endpoint: endpoint, DataDir: dataDir})
+}
+
+// writeProxyBridgeRecord persists a cross-host bridge's forward: the ssh child pid
+// plus the peer host and capability the sweep remote-closes B by.
+func writeProxyBridgeRecord(ctx context.Context, dataDir string, pid int, endpoint, host, capability string) error {
+	return writeRecord(ctx, dataDir, bridgeRecord{
+		Kind: bridgeRecordProxy, PID: pid, Endpoint: endpoint, DataDir: dataDir, Host: host, Capability: capability,
+	})
+}
+
+// writeRecord probes the live pid for its launch-time identity and persists the
+// crash-durable record the orphan sweep reaps by.
+func writeRecord(ctx context.Context, dataDir string, rec bridgeRecord) error {
+	// Bound the ps probe so a wedged ps can't stretch the spawn→record window.
+	pctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	id, ok, err := probeProcess(pctx, rec.PID)
 	if err != nil {
 		return fmt.Errorf("probe bridge process: %w", err)
 	}
 	if !ok {
-		return fmt.Errorf("bridge process %d exited before it could be recorded", pid)
+		return fmt.Errorf("bridge process %d exited before it could be recorded", rec.PID)
 	}
-	raw, err := json.Marshal(bridgeRecord{PID: pid, Endpoint: endpoint, DataDir: dataDir, Start: id.start, Comm: id.comm})
+	rec.Start, rec.Comm = id.start, id.comm
+	raw, err := json.Marshal(rec)
 	if err != nil {
 		return fmt.Errorf("marshal bridge record: %w", err)
 	}
-	if err := os.WriteFile(filepath.Join(dataDir, bridgeRecordFile), raw, 0o600); err != nil {
+	// Write-then-rename so a crash (or a re-dial overwrite) never leaves a partial
+	// record the sweep discards while its process leaks.
+	final := filepath.Join(dataDir, bridgeRecordFile)
+	tmp := final + ".tmp"
+	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
 		return fmt.Errorf("write bridge record: %w", err)
+	}
+	if err := os.Rename(tmp, final); err != nil {
+		return fmt.Errorf("commit bridge record: %w", err)
 	}
 	return nil
 }
@@ -552,6 +672,19 @@ func mintID() (string, error) {
 		return "", fmt.Errorf("mint bridge id: %w", err)
 	}
 	return hex.EncodeToString(b[:]), nil
+}
+
+// portOf parses the numeric port out of a 127.0.0.1:<port> listener address.
+func portOf(addr string) (int, error) {
+	_, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return 0, fmt.Errorf("parse bridge listener addr %q: %w", addr, err)
+	}
+	p, err := strconv.Atoi(port)
+	if err != nil {
+		return 0, fmt.Errorf("parse bridge listener port %q: %w", port, err)
+	}
+	return p, nil
 }
 
 // optionalBool reads a bool param, returning fallback when absent or mistyped.

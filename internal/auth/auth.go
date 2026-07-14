@@ -76,14 +76,15 @@ const (
 )
 
 // Req names one key request: the principal it acts for, the browser and profile
-// whose Safe Storage key it wants, the Touch ID prompt reason, and the release
-// mode.
+// whose Safe Storage key it wants, the Touch ID prompt reason, the release mode,
+// and, for a cross-host bridge, the originating host named in the consent prompt.
 type Req struct {
 	Requestor string
 	Browser   string
 	Profile   string
 	Reason    string
 	Mode      Mode
+	Origin    string
 }
 
 // Outcome is one local endpoint's result from a LocalKeys sweep. Under
@@ -173,6 +174,16 @@ func Classify(err error) Verdict {
 		return VerdictDenied
 	}
 	return VerdictFatal
+}
+
+// ClassifyBridgeApproval maps a bridge-approval error to a verdict, differing
+// from Classify only for a missing bridge vault: Unavailable (so routed consent
+// advances to another approver) rather than Denied (which ends the loop).
+func ClassifyBridgeApproval(err error) Verdict {
+	if errors.Is(err, cookie.ErrBridgeVaultMissing) {
+		return VerdictUnavailable
+	}
+	return Classify(err)
 }
 
 // Cache is the slice of the key cache the broker owns: the warmth read, the put

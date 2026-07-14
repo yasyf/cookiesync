@@ -4,6 +4,20 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- `cookiesync bridge open --host <peer>` opens a live CDP bridge on another Mac in the mesh
+  and forwards it back over ssh. The peer runs its own consent tap (strict biometric, or
+  routed to a third host per the peer's own config) and seeds the bridge with its own
+  cookies locally — the Safe Storage key is read and used entirely on the peer and never
+  crosses the wire. The origin spawns a detached `ssh -N -L` loopback forward, proves it up
+  against the peer's token-gated `/json/version` before publishing the ws endpoint, and
+  supervises it with a keepalive so the peer reaps the bridge the moment the origin goes
+  away; the peer's ≤10-minute lease is the crash-durable ceiling if a hard power-off outruns
+  the keepalive. `bridge ls` and `bridge stop` manage a cross-host bridge by the same
+  host:browser:profile target as a local one.
+
 ## [0.11.1] - 2026-07-13
 
 ### Fixed

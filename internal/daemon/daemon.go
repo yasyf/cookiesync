@@ -82,13 +82,18 @@ type Daemon struct {
 	state    StateLoader
 	registry RegistryLoader
 
-	// seedSource and hostBinary are the two bridge test seams: the profile read
+	// seedSource and hostBinary are the local-bridge test seams: the profile read
 	// and the Chrome resolver, defaulted in New and overridden in tests.
 	seedSource func(context.Context, cookie.Browser, string, cookie.AesKey) (cookie.StorageState, int, error)
 	hostBinary func() (string, error)
 
+	// openTunnel and openKeepalive are the cross-host bridge seams: the ssh -L
+	// forward and the keepalive supervisor, defaulted in New and faked in tests.
+	openTunnel    func(context.Context, bridge.TunnelSpec, func(pid int) error) (bridgeTunnel, error)
+	openKeepalive func(context.Context, string, string) (bridgeKeepalive, error)
+
 	bridgeMu       sync.Mutex
-	bridges        map[string]*bridgeSession
+	bridges        map[string]session
 	bridgeShutdown bool
 	bridgeLock     *os.File
 	bridgeStop     chan struct{}
@@ -162,10 +167,24 @@ func New(consent cookie.Consent, c Cache, eng *engine.Engine, probe Probe, runne
 		runner:     runner,
 		state:      st,
 		registry:   reg,
-		bridges:    map[string]*bridgeSession{},
+		bridges:    map[string]session{},
 		bridgeStop: make(chan struct{}),
 		seedSource: cookie.SeedState,
 		hostBinary: bridge.ResolveHostBinary,
+		openTunnel: func(ctx context.Context, spec bridge.TunnelSpec, onSpawn func(pid int) error) (bridgeTunnel, error) {
+			t, err := bridge.OpenTunnel(ctx, spec, onSpawn)
+			if err != nil {
+				return nil, err
+			}
+			return t, nil
+		},
+		openKeepalive: func(ctx context.Context, addr, capability string) (bridgeKeepalive, error) {
+			k, err := bridge.OpenKeepalive(ctx, addr, capability)
+			if err != nil {
+				return nil, err
+			}
+			return k, nil
+		},
 	}
 }
 
@@ -197,11 +216,13 @@ func (d *Daemon) Dispatcher() *synckit.Dispatcher {
 	dispatcher.Register("get_web_storage", d.handleGetWebStorage)
 	dispatcher.Register("auth_status", d.handleAuthStatus)
 	dispatcher.Register("request_consent", d.handleRequestConsent)
+	dispatcher.Register("request_bridge_consent", d.handleRequestBridgeConsent)
 	// Bridge methods stay concurrent (plain Register): a mid-flight routed
 	// consent must keep answering while a bridge open is in progress.
 	dispatcher.Register("bridge_open", d.handleBridgeOpen)
 	dispatcher.Register("bridge_status", d.handleBridgeStatus)
 	dispatcher.Register("bridge_close", d.handleBridgeClose)
+	dispatcher.Register("bridge_keepalive", d.handleBridgeKeepalive)
 	return dispatcher
 }
 

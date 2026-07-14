@@ -333,11 +333,18 @@ func sshTransportFailure(addr string) error {
 
 // consentTargets lists the targets that received a request_consent, in order.
 func (r *approverMesh) consentTargets() []string {
+	return r.consentTargetsFor("request_consent")
+}
+
+// consentTargetsFor lists the targets asked via the given consent verb, in order
+// — request_bridge_consent for the bridge handshake, which request_consent is
+// not a substring of.
+func (r *approverMesh) consentTargetsFor(verb string) []string {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	var targets []string
 	for _, c := range r.calls {
-		if strings.Contains(c.cmd, "request_consent") {
+		if strings.Contains(c.cmd, verb) {
 			targets = append(targets, c.target)
 		}
 	}

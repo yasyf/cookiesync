@@ -20,6 +20,17 @@ import (
 // exit code the routed-consent failover treats as a transport failure.
 const sshConnFailureExit = 255
 
+// consentMethod names the approver RPC the routed handshake shells: a cookie
+// release taps request_consent (passcode-or-biometric), a bridge seed taps
+// request_bridge_consent (strict biometric). The handshake, echo binding, and
+// unprompted own-key release are otherwise identical.
+type consentMethod string
+
+const (
+	consentCookie consentMethod = "request_consent"
+	consentBridge consentMethod = "request_bridge_consent"
+)
+
 // consentTimeout bounds the request_consent ssh leg, which may block on a
 // routed human consent — a Touch ID tap on the peer. Derived from the peer
 // handler's own rpc.DispatchTimeout: the human keeps nearly that full window,
@@ -61,6 +72,24 @@ func newNonce() (string, error) {
 // ObtainKeyUnprompted) — it never crosses the wire. Candidates exhausted is
 // AuthRequired.
 func (b *Broker) routedRelease(ctx context.Context, browser cookie.Browser, browserID, profile string) (cookie.AesKey, error) {
+	return b.routedConsent(ctx, consentCookie, browser, browserID, profile)
+}
+
+// routedBridgeRelease routes the bridge-seed presence gate exactly like
+// routedRelease, but the approver taps request_bridge_consent (strict biometric).
+// After a verified approval this host reads its OWN key non-interactively; the
+// key never crosses the wire and is neither cached nor granted — a bridge seeds
+// once and discards it.
+func (b *Broker) routedBridgeRelease(ctx context.Context, browser cookie.Browser, browserID, profile string) (cookie.AesKey, error) {
+	return b.routedConsent(ctx, consentBridge, browser, browserID, profile)
+}
+
+// routedConsent is the shared candidate loop both routed releases run: it walks
+// the approver candidates — a set consent_route_to first, then every mesh peer —
+// shelling method on the first live one, and releases this host's own key
+// (ObtainKeyUnprompted) after the first bound approval. Failover, denial, and
+// nonce/endpoint-echo binding are as documented on requestConsent.
+func (b *Broker) routedConsent(ctx context.Context, method consentMethod, browser cookie.Browser, browserID, profile string) (cookie.AesKey, error) {
 	st, err := b.state.Load(ctx)
 	if err != nil {
 		return nil, err
@@ -88,7 +117,7 @@ func (b *Broker) routedRelease(ctx context.Context, browser cookie.Browser, brow
 		if err != nil || !live {
 			continue
 		}
-		key, next, err := b.requestConsent(ctx, peer, browser, browserID, profile, endpoint)
+		key, next, err := b.requestConsent(ctx, method, peer, browser, browserID, profile, endpoint)
 		if !next {
 			return key, err
 		}
@@ -106,14 +135,14 @@ func (b *Broker) routedRelease(ctx context.Context, browser cookie.Browser, brow
 // answered an explicit unavailable; next false carries the terminal outcome:
 // the released key, a denial, an unbound approval's AuthRequired, or a fatal
 // protocol failure (an unparseable reply or an unexpected status).
-func (b *Broker) requestConsent(ctx context.Context, peer string, browser cookie.Browser, browserID, profile, endpoint string) (key cookie.AesKey, next bool, err error) {
+func (b *Broker) requestConsent(ctx context.Context, method consentMethod, peer string, browser cookie.Browser, browserID, profile, endpoint string) (key cookie.AesKey, next bool, err error) {
 	nonce, err := b.Nonce()
 	if err != nil {
 		return nil, false, err
 	}
 	cmd := fmt.Sprintf(
-		"cookiesync rpc request_consent --browser %s --profile %s --nonce %s --endpoint %s",
-		hostregistry.ShellQuote(browserID), hostregistry.ShellQuote(profile),
+		"cookiesync rpc %s --browser %s --profile %s --nonce %s --endpoint %s",
+		method, hostregistry.ShellQuote(browserID), hostregistry.ShellQuote(profile),
 		hostregistry.ShellQuote(nonce), hostregistry.ShellQuote(endpoint),
 	)
 	cctx, cancel := context.WithTimeout(ctx, consentTimeout)
@@ -123,7 +152,7 @@ func (b *Broker) requestConsent(ctx context.Context, peer string, browser cookie
 		if routesAround(err) {
 			return nil, true, &AuthRequired{Msg: fmt.Sprintf("consent unreachable at %s: %v", peer, err)}
 		}
-		return nil, false, fmt.Errorf("request_consent to %s: %w", peer, err)
+		return nil, false, fmt.Errorf("%s to %s: %w", method, peer, err)
 	}
 	var resp struct {
 		Status   string `json:"status"`
@@ -131,7 +160,7 @@ func (b *Broker) requestConsent(ctx context.Context, peer string, browser cookie
 		Endpoint string `json:"endpoint"`
 	}
 	if err := json.Unmarshal([]byte(out), &resp); err != nil {
-		return nil, false, fmt.Errorf("parse request_consent from %s: %w", peer, err)
+		return nil, false, fmt.Errorf("parse %s from %s: %w", method, peer, err)
 	}
 	switch resp.Status {
 	case "denied":
@@ -140,7 +169,7 @@ func (b *Broker) requestConsent(ctx context.Context, peer string, browser cookie
 		return nil, true, &AuthRequired{Msg: fmt.Sprintf("consent unavailable from %s", peer)}
 	case "approved":
 	default:
-		return nil, false, fmt.Errorf("request_consent from %s answered unexpected status %q", peer, resp.Status)
+		return nil, false, fmt.Errorf("%s from %s answered unexpected status %q", method, peer, resp.Status)
 	}
 	if resp.Nonce != nonce || resp.Endpoint != endpoint {
 		return nil, false, &AuthRequired{Msg: fmt.Sprintf("consent approved from %s did not echo this request's nonce and endpoint", peer)}

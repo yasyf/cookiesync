@@ -1,9 +1,13 @@
 package cli
 
 import (
+	"bufio"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"strings"
 
 	"github.com/spf13/cobra"
 
@@ -24,8 +28,10 @@ func newRPCCmd() *cobra.Command {
 		newRPCReconcileCmd(),
 		newRPCWhoamiCmd(),
 		newRPCRequestConsentCmd(),
+		newRPCBridgeConsentCmd(),
 		newRPCBridgeOpenCmd(),
 		newRPCBridgeCloseCmd(),
+		newRPCBridgeKeepaliveCmd(),
 	)
 	return cmd
 }
@@ -235,8 +241,33 @@ func newRPCRequestConsentCmd() *cobra.Command {
 	return cmd
 }
 
+func newRPCBridgeConsentCmd() *cobra.Command {
+	var browser, profile, nonce, endpoint string
+	cmd := &cobra.Command{
+		Use:   "request_bridge_consent",
+		Short: "Approve a live browser bridge here behind a strict biometric tap and echo the requester's nonce + endpoint.",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			return rpcPassthrough(cmd, "request_bridge_consent", map[string]any{
+				"browser":  browser,
+				"profile":  profile,
+				"nonce":    nonce,
+				"endpoint": endpoint,
+			})
+		},
+	}
+	cmd.Flags().StringVar(&browser, "browser", "", "The browser to gate the bridge seed for.")
+	cmd.Flags().StringVar(&profile, "profile", "Default", "The profile to gate the bridge seed for.")
+	cmd.Flags().StringVar(&nonce, "nonce", "", "Opaque nonce the peer echoes back to bind the request.")
+	cmd.Flags().StringVar(&endpoint, "endpoint", "", "The endpoint id the consent is bound to.")
+	_ = cmd.MarkFlagRequired("browser")
+	_ = cmd.MarkFlagRequired("nonce")
+	_ = cmd.MarkFlagRequired("endpoint")
+	return cmd
+}
+
 func newRPCBridgeOpenCmd() *cobra.Command {
-	var browser, profile, host string
+	var browser, profile, host, origin, advertise string
 	var headless bool
 	cmd := &cobra.Command{
 		Use:   "bridge_open",
@@ -244,10 +275,12 @@ func newRPCBridgeOpenCmd() *cobra.Command {
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			return rpcPassthrough(cmd, "bridge_open", map[string]any{
-				"host":    host,
-				"browser": browser,
-				"profile": profile,
-				"headed":  !headless,
+				"host":      host,
+				"browser":   browser,
+				"profile":   profile,
+				"headed":    !headless,
+				"origin":    origin,
+				"advertise": advertise,
 			})
 		},
 	}
@@ -255,21 +288,88 @@ func newRPCBridgeOpenCmd() *cobra.Command {
 	cmd.Flags().StringVar(&profile, "profile", "Default", "The profile to seed the bridge from.")
 	cmd.Flags().StringVar(&host, "host", "", "The host that owns the browser (empty = local).")
 	cmd.Flags().BoolVar(&headless, "headless", false, "Run Chrome headless.")
+	cmd.Flags().StringVar(&origin, "origin", "", "Originating host named in the bridge consent prompt (display only).")
+	cmd.Flags().StringVar(&advertise, "advertise", "", "host:port baked into /json/version for a cross-host ssh -L client.")
 	_ = cmd.MarkFlagRequired("browser")
 	return cmd
+}
+
+func newRPCBridgeKeepaliveCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "bridge_keepalive",
+		Short: "Hold a cross-host bridge alive: read its capability from stdin, then block until the origin closes the pipe.",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			return runBridgeKeepalive(cmd)
+		},
+	}
+	return cmd
+}
+
+// runBridgeKeepalive reads the bridge capability off stdin (never argv), holds the
+// daemon-side supervisor open, and exits — closing the socket so the peer reaps the
+// bridge — on the first of the origin closing our stdin (its EOF) or the hold
+// returning (the peer's daemon restarted or timed out; without this the ssh child
+// would linger and the origin would never see the drop).
+func runBridgeKeepalive(cmd *cobra.Command) error {
+	reader := bufio.NewReader(cmd.InOrStdin())
+	line, err := reader.ReadString('\n')
+	capability := strings.TrimSpace(line)
+	if capability == "" {
+		if err != nil {
+			return fmt.Errorf("read bridge capability from stdin: %w", err)
+		}
+		return errors.New("bridge_keepalive: empty capability on stdin")
+	}
+	callDone := make(chan struct{})
+	go func() {
+		_, _ = rpc.Call(context.Background(), "bridge_keepalive", map[string]any{"capability": capability})
+		close(callDone)
+	}()
+	stdinDone := make(chan struct{})
+	go func() {
+		_, _ = io.Copy(io.Discard, reader)
+		close(stdinDone)
+	}()
+	select {
+	case <-callDone:
+	case <-stdinDone:
+	}
+	return nil
 }
 
 func newRPCBridgeCloseCmd() *cobra.Command {
 	var capability string
 	cmd := &cobra.Command{
 		Use:   "bridge_close",
-		Short: "Ask the daemon to tear down a bridge session by its capability.",
+		Short: "Ask the daemon to tear down a bridge session by its capability (--capability, or on stdin when omitted).",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			return rpcPassthrough(cmd, "bridge_close", map[string]any{"capability": capability})
+			resolved, err := bridgeCapability(cmd, capability)
+			if err != nil {
+				return err
+			}
+			return rpcPassthrough(cmd, "bridge_close", map[string]any{"capability": resolved})
 		},
 	}
-	cmd.Flags().StringVar(&capability, "capability", "", "The bridge capability to close.")
-	_ = cmd.MarkFlagRequired("capability")
+	cmd.Flags().StringVar(&capability, "capability", "", "The bridge capability to close (omit to read it from stdin).")
 	return cmd
+}
+
+// bridgeCapability resolves the bridge capability from the --capability flag or, when
+// empty, one line of stdin — the cross-host close path pipes it over ssh stdin so it
+// never appears in the peer's process args; the local path passes the flag.
+func bridgeCapability(cmd *cobra.Command, flag string) (string, error) {
+	if flag != "" {
+		return flag, nil
+	}
+	line, err := bufio.NewReader(cmd.InOrStdin()).ReadString('\n')
+	capability := strings.TrimSpace(line)
+	if capability == "" {
+		if err != nil && !errors.Is(err, io.EOF) {
+			return "", fmt.Errorf("read bridge capability from stdin: %w", err)
+		}
+		return "", errors.New("bridge_close: a --capability or a stdin capability is required")
+	}
+	return capability, nil
 }

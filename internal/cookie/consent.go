@@ -27,6 +27,12 @@ const reasonCap = 160
 // so callers branch on it via errors.Is.
 var ErrKeybagLocked = errors.New("keychain keybag locked")
 
+// ErrBridgeVaultMissing reports that the strict-biometric bridge vault has no
+// enrolled item — nothing to release, re-enroll needed. A routed approver treats
+// it as unavailable (route on to another peer), never a denial. Callers branch
+// on it via errors.Is.
+var ErrBridgeVaultMissing = errors.New("bridge vault missing")
+
 // ConsentError reports that the user explicitly declined the Touch ID / passcode
 // prompt, or that a Keychain read or vault enrollment failed.
 type ConsentError struct {
@@ -164,7 +170,7 @@ func (c TouchIDConsent) ObtainKeyBiometric(ctx context.Context, browser Browser,
 	case helper.CodePresenceUnavailable:
 		return nil, &ConsentError{Msg: "biometric authentication unavailable (no enrolled biometry, locked out, or screen locked)", Err: ErrKeybagLocked}
 	case 2:
-		return nil, &ConsentError{Msg: "bridge vault missing — re-enroll"}
+		return nil, &ConsentError{Msg: "bridge vault missing — re-enroll", Err: ErrBridgeVaultMissing}
 	default:
 		return nil, fmt.Errorf("vault-retrieve-biometric exited %d: %s", res.Code, bytes.TrimSpace(res.Stderr))
 	}

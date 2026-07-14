@@ -392,12 +392,13 @@ type recordingRunner struct {
 type runnerCall struct {
 	target string
 	cmd    string
+	stdin  string
 }
 
-func (r *recordingRunner) Run(_ context.Context, target, cmd string, _ []byte) (string, error) {
+func (r *recordingRunner) Run(_ context.Context, target, cmd string, stdin []byte) (string, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.calls = append(r.calls, runnerCall{target: target, cmd: cmd})
+	r.calls = append(r.calls, runnerCall{target: target, cmd: cmd, stdin: string(stdin)})
 	if r.err != nil {
 		return "", r.err
 	}
