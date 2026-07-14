@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"sync"
+	"time"
 
 	"github.com/yasyf/cookiesync/internal/state"
 	"github.com/yasyf/synckit/converge"
@@ -20,6 +21,13 @@ const (
 	// anchor a converge until the user authenticates.
 	OutcomeSkippedCold converge.Outcome = "skipped-cold"
 )
+
+// tombstoneCompactHorizon bounds how long a removed-endpoint tombstone is retained
+// before the reconcile pass drops it. A peer offline longer than this that still carries
+// the endpoint as a live add resurrects it on the next merge, since the dropped
+// tombstone no longer out-orders the stale add. This mesh's hosts converge daily, so 30d
+// sits far above any expected offline window; do not lower it casually.
+const tombstoneCompactHorizon = 30 * 24 * time.Hour
 
 // registryStore is the slice of the state store the Driver needs: the convergent
 // registry read/write split into the lock-free paths the converge orchestration
@@ -47,6 +55,7 @@ type Driver struct {
 	store      registryStore
 	selfTarget string
 	deps       ConvergeDeps
+	now        func() time.Time
 
 	mu     sync.Mutex
 	merged cregistry.Registry[state.EndpointMeta]
@@ -55,7 +64,7 @@ type Driver struct {
 
 // NewDriver builds the cookie Driver over store and the converge collaborators.
 func NewDriver(store registryStore, selfTarget string, deps ConvergeDeps) *Driver {
-	return &Driver{store: store, selfTarget: selfTarget, deps: deps, counts: map[string]int{}}
+	return &Driver{store: store, selfTarget: selfTarget, deps: deps, now: time.Now, counts: map[string]int{}}
 }
 
 // Counts returns a copy of the merged cookie count recorded for each endpoint this
@@ -77,10 +86,13 @@ func (d *Driver) LoadRegistry(ctx context.Context) (cregistry.Registry[state.End
 	return d.store.LoadRegistry(ctx)
 }
 
-// SaveRegistry persists the merged registry back into state.json through the lock-free
-// path (the orchestration already holds the flock) and stashes it so Reconcile can
-// enumerate sibling endpoints.
+// SaveRegistry compacts tombstones older than tombstoneCompactHorizon out of the merged
+// registry, then persists it back into state.json through the lock-free path (the
+// orchestration already holds the flock) and stashes it so Reconcile can enumerate
+// sibling endpoints. Compaction keeps every present entry, so the stashed set and the
+// per-item fan-out are unchanged.
 func (d *Driver) SaveRegistry(ctx context.Context, reg cregistry.Registry[state.EndpointMeta]) error {
+	reg = reg.Compact(cregistry.UnixMicros(d.now()), cregistry.Micros(tombstoneCompactHorizon.Microseconds()))
 	if err := d.store.SaveRegistryUnlocked(ctx, reg); err != nil {
 		return err
 	}

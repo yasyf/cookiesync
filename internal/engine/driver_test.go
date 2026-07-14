@@ -10,19 +10,21 @@ import (
 
 	"github.com/yasyf/cookiesync/internal/cookie"
 	"github.com/yasyf/cookiesync/internal/state"
+	"github.com/yasyf/cookiesync/internal/testutil"
 	"github.com/yasyf/synckit/converge"
 	"github.com/yasyf/synckit/cregistry"
 	"github.com/yasyf/synckit/hostregistry"
 )
 
-// newStore builds a real state.Store rooted at a temp XDG dir, so the Driver writes
+// newStore builds a real state.Store rooted at a temp config dir, so the Driver writes
 // through the genuine flock + foreign-key-preserving raw writer — which is what the
-// no-self-deadlock proof needs.
+// no-self-deadlock proof needs. The isolation guard keeps the store off the developer's
+// real config.
 func newStore(t *testing.T) *state.Store {
 	t.Helper()
-	dir := t.TempDir()
-	t.Setenv("XDG_CONFIG_HOME", dir)
-	return state.NewWithClock(hostregistry.Config{Name: "cookiesync"}, func() time.Time {
+	cfg := hostregistry.Config{Name: "cookiesync"}
+	testutil.IsolateHostConfig(t, cfg)
+	return state.NewWithClock(cfg, func() time.Time {
 		return time.Unix(1_700_000_000, 0)
 	})
 }
@@ -84,13 +86,16 @@ func TestDriverLoadSaveRoundTrip(t *testing.T) {
 	ctx := context.Background()
 	store := newStore(t)
 	driver := NewDriver(store, "me@laptop", ConvergeDeps{Cache: warmCache{}})
+	now := time.Unix(1_700_000_000, 0)
+	driver.now = func() time.Time { return now }
+	nowMicros := cregistry.UnixMicros(now)
 
 	reg := cregistry.New[state.EndpointMeta]()
 	present := state.Endpoint{Host: "me@laptop", Browser: "chrome", Profile: "Default"}
 	gone := state.Endpoint{Host: "you@desktop", Browser: "arc", Profile: "Default"}
-	reg.Add(string(present.ID()), present.Meta(), 100)
-	reg.Add(string(gone.ID()), gone.Meta(), 100)
-	reg.Remove(string(gone.ID()), 200)
+	reg.Add(string(present.ID()), present.Meta(), nowMicros)
+	reg.Add(string(gone.ID()), gone.Meta(), nowMicros-2)
+	reg.Remove(string(gone.ID()), nowMicros-1)
 
 	if err := driver.SaveRegistry(ctx, reg); err != nil {
 		t.Fatalf("SaveRegistry: %v", err)
@@ -107,6 +112,53 @@ func TestDriverLoadSaveRoundTrip(t *testing.T) {
 	}
 	if !got[string(present.ID())].Present() {
 		t.Fatalf("present endpoint lost in round-trip")
+	}
+}
+
+// TestSaveRegistryCompactsExpiredTombstones proves the reconcile pass drops a tombstone
+// older than tombstoneCompactHorizon — including the Added==0 phantom a remove with no
+// prior add leaves — while keeping present entries and tombstones within the horizon,
+// reading the persisted state.json back through the real store.
+func TestSaveRegistryCompactsExpiredTombstones(t *testing.T) {
+	ctx := context.Background()
+	store := newStore(t)
+	driver := NewDriver(store, "me@laptop", ConvergeDeps{Cache: warmCache{}})
+	now := time.Unix(1_700_000_000, 0)
+	driver.now = func() time.Time { return now }
+
+	nowMicros := cregistry.UnixMicros(now)
+	day := cregistry.Micros((24 * time.Hour).Microseconds())
+
+	reg := cregistry.New[state.EndpointMeta]()
+	live := state.Endpoint{Host: "me@laptop", Browser: "chrome", Profile: "Default"}
+	reg.Add(string(live.ID()), live.Meta(), nowMicros)
+
+	recent := state.Endpoint{Host: "me@laptop", Browser: "arc", Profile: "Default"}
+	reg.Add(string(recent.ID()), recent.Meta(), nowMicros-2*day)
+	reg.Remove(string(recent.ID()), nowMicros-day)
+
+	phantom := "gone@host:chrome:Default"
+	reg.Remove(phantom, nowMicros-31*day)
+
+	if err := driver.SaveRegistry(ctx, reg); err != nil {
+		t.Fatalf("SaveRegistry: %v", err)
+	}
+	got, err := driver.LoadRegistry(ctx)
+	if err != nil {
+		t.Fatalf("LoadRegistry: %v", err)
+	}
+
+	if entry, ok := got[string(live.ID())]; !ok || !entry.Present() {
+		t.Fatalf("live endpoint dropped or not present: ok=%v entry=%+v", ok, entry)
+	}
+	if entry, ok := got[string(recent.ID())]; !ok || entry.Present() {
+		t.Fatalf("recent tombstone should survive as a tombstone: ok=%v entry=%+v", ok, entry)
+	}
+	if _, ok := got[phantom]; ok {
+		t.Fatalf("expired phantom tombstone %q should be compacted away", phantom)
+	}
+	if len(got) != 2 {
+		t.Fatalf("compacted registry has %d entries, want 2 (live + recent tombstone)", len(got))
 	}
 }
 

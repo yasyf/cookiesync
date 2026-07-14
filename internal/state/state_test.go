@@ -8,19 +8,20 @@ import (
 	"testing"
 	"time"
 
+	"github.com/yasyf/cookiesync/internal/testutil"
 	"github.com/yasyf/synckit/cregistry"
 	"github.com/yasyf/synckit/hostregistry"
 )
 
-// newTestStore builds a Store rooted at a temp XDG config dir with a fixed clock, so
-// registry stamps are deterministic. It returns the store and the state.json path.
+// newTestStore builds a Store rooted at a temp config dir with a fixed clock, so
+// registry stamps are deterministic. The isolation guard neutralizes any leaked
+// config-dir override. It returns the store and the state.json path.
 func newTestStore(t *testing.T, now time.Time) (*Store, string) {
 	t.Helper()
-	dir := t.TempDir()
-	t.Setenv("XDG_CONFIG_HOME", dir)
 	cfg := hostregistry.Config{Name: "cookiesync"}
+	dir := testutil.IsolateHostConfig(t, cfg)
 	store := NewWithClock(cfg, func() time.Time { return now })
-	return store, filepath.Join(dir, "cookiesync", "state.json")
+	return store, filepath.Join(dir, "state.json")
 }
 
 func readStateFile(t *testing.T, path string) map[string]json.RawMessage {

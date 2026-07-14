@@ -11,9 +11,15 @@ import "github.com/yasyf/synckit/hostregistry"
 // and is the single source for the hostregistry Config the path helpers drive.
 const ToolName = "cookiesync"
 
+// ConfigDirEnv is the environment variable that pins cookiesync's config directory
+// verbatim when set; it threads into Config so every consumer, state.New(Config)
+// included, honors the override, while the shared synckit mesh is left in place.
+const ConfigDirEnv = "COOKIESYNC_CONFIG_DIR"
+
 // Config is cookiesync's host-registry handle, naming the tool so hostregistry
-// resolves the config dir and the daemon socket path.
-var Config = hostregistry.Config{Name: ToolName}
+// resolves the config dir and the daemon socket path, with ConfigDirEnv as the
+// per-tool config-dir override.
+var Config = hostregistry.Config{Name: ToolName, DirEnv: ConfigDirEnv}
 
 // Dir returns cookiesync's config directory (~/.config/cookiesync).
 func Dir() (string, error) {

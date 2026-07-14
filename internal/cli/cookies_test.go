@@ -9,6 +9,7 @@ import (
 
 	"github.com/yasyf/cookiesync/internal/paths"
 	"github.com/yasyf/cookiesync/internal/state"
+	"github.com/yasyf/cookiesync/internal/testutil"
 )
 
 // writeCookieStore creates an empty cookie store file at path, making its parent dirs.
@@ -40,7 +41,7 @@ func TestCookiesProfileWithoutBrowserErrors(t *testing.T) {
 // primary profile per installed browser: Chrome with no Default but a "Profile 3" store
 // registers chrome:Profile 3, and Arc with a Default store registers arc:Default.
 func TestEnsureLocalEndpointsRegistersInstalledBrowsers(t *testing.T) {
-	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	testutil.IsolateHostConfig(t, paths.Config)
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	seedRegistry(t, "me@laptop")
@@ -76,7 +77,7 @@ func TestEnsureLocalEndpointsRegistersInstalledBrowsers(t *testing.T) {
 // TestEnsureLocalEndpointsNoOpWhenLocalPresent proves a pre-existing local endpoint short
 // circuits the auto-register: nothing new is added even with installed browsers unread.
 func TestEnsureLocalEndpointsNoOpWhenLocalPresent(t *testing.T) {
-	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	testutil.IsolateHostConfig(t, paths.Config)
 	t.Setenv("HOME", t.TempDir())
 	seedRegistry(t, "me@laptop")
 	store := state.New(paths.Config)
@@ -100,7 +101,7 @@ func TestEnsureLocalEndpointsNoOpWhenLocalPresent(t *testing.T) {
 // TestEnsureLocalEndpointsErrorsWithNoInstalledBrowsers proves an empty HOME (no browser
 // stores) errors rather than registering nothing silently.
 func TestEnsureLocalEndpointsErrorsWithNoInstalledBrowsers(t *testing.T) {
-	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	testutil.IsolateHostConfig(t, paths.Config)
 	t.Setenv("HOME", t.TempDir())
 	seedRegistry(t, "me@laptop")
 
