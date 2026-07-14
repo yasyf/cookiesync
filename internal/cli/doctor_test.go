@@ -13,6 +13,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/yasyf/cookiesync/internal/paths"
+	"github.com/yasyf/cookiesync/internal/state"
 	"github.com/yasyf/synckit/manifest"
 )
 
@@ -22,14 +23,15 @@ func passing() doctorEnv {
 		return func(context.Context) check { return check{label: label, ok: true, detail: "ok"} }
 	}
 	return doctorEnv{
-		helper:   ok("key helper"),
-		socket:   ok("helper socket"),
-		keyCache: ok("key cache"),
-		mesh:     ok("mesh"),
-		tcc:      func(context.Context) (check, bool) { return check{}, false },
-		manifest: ok("manifest"),
-		state:    ok("state"),
-		tracked:  ok("browsers"),
+		helper:     ok("key helper"),
+		socket:     ok("helper socket"),
+		keyCache:   ok("key cache"),
+		mesh:       ok("mesh"),
+		tcc:        func(context.Context) (check, bool) { return check{}, false },
+		manifest:   ok("manifest"),
+		state:      ok("state"),
+		tracked:    ok("browsers"),
+		quarantine: func(context.Context) []check { return nil },
 	}
 }
 
@@ -283,4 +285,47 @@ func runRootCmd(t *testing.T, args ...string) string {
 		t.Fatalf("%v: %v\n%s", args, err, out.String())
 	}
 	return out.String()
+}
+
+// TestDoctorQuarantineLines proves quarantineChecks renders one FAIL line per
+// quarantined endpoint (sorted, with both counts and the recovery bar), none for a
+// healthy ledger, and that a quarantined endpoint fails the doctor run.
+func TestDoctorQuarantineLines(t *testing.T) {
+	baselines := map[string]state.Baseline{
+		"me@laptop:chrome:Default": {Rows: 9000},
+		"me@laptop:arc:Default":    {Rows: 9000, Quarantined: true, QuarantinedRows: 12},
+		"me@laptop:arc:Work":       {Rows: 1000, Quarantined: true},
+	}
+	checks := quarantineChecks(baselines)
+	if len(checks) != 2 {
+		t.Fatalf("quarantineChecks = %d checks, want 2: %+v", len(checks), checks)
+	}
+	want := []string{
+		"me@laptop:arc:Default: rowcount collapsed to 12 vs baseline 9000; excluded from merge inputs until it recovers to >= 4500 rows",
+		"me@laptop:arc:Work: rowcount collapsed to 0 vs baseline 1000; excluded from merge inputs until it recovers to >= 500 rows",
+	}
+	for i, c := range checks {
+		if c.ok {
+			t.Fatalf("quarantine check %d is OK, want FAIL", i)
+		}
+		if c.label != "quarantine" || c.detail != want[i] {
+			t.Fatalf("check %d = %q: %q, want quarantine: %q", i, c.label, c.detail, want[i])
+		}
+	}
+	if healthy := quarantineChecks(map[string]state.Baseline{"me@laptop:chrome:Default": {Rows: 9000}}); len(healthy) != 0 {
+		t.Fatalf("healthy ledger rendered %d quarantine lines, want 0", len(healthy))
+	}
+
+	env := passing()
+	env.quarantine = func(context.Context) []check { return checks }
+	var out bytes.Buffer
+	cmd := &cobra.Command{}
+	cmd.SetOut(&out)
+	err := runDoctor(cmd, env)
+	if err == nil {
+		t.Fatal("runDoctor with a quarantined endpoint = nil error, want non-nil")
+	}
+	if !strings.Contains(out.String(), "FAIL quarantine: "+want[0]) {
+		t.Fatalf("doctor output missing quarantine FAIL line:\n%s", out.String())
+	}
 }

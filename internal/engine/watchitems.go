@@ -4,13 +4,24 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sort"
+	"strconv"
+	"strings"
+	"syscall"
+	"time"
 
 	"github.com/yasyf/cookiesync/internal/cookie"
 	"github.com/yasyf/cookiesync/internal/mesh"
 	"github.com/yasyf/cookiesync/internal/state"
 	"github.com/yasyf/synckit/syncservice"
 )
+
+// busyWriteWindow is how recently the cookie store (or a -journal/-wal sidecar) must
+// have been written, with the owning browser running, for the item to report Busy —
+// the signal synckitd's busy-gate defers on rather than fingerprinting a mid-write
+// store.
+const busyWriteWindow = 5 * time.Second
 
 // WatchItems resolves this host's local endpoints from the mesh self, fingerprints each
 // present one's cookie store decryption-free, and returns the watch items synckitd's
@@ -76,9 +87,52 @@ func watchItem(ctx context.Context, ep state.Endpoint) (syncservice.WatchItem, b
 	if err != nil {
 		return syncservice.WatchItem{}, false, err
 	}
-	return syncservice.WatchItem{
+	item := syncservice.WatchItem{
 		ID:          string(ep.ID()),
 		WatchDirs:   []string{browser.CookiesDB(ep.Profile)},
 		Fingerprint: string(cookie.LogicalDigest(rows)),
-	}, true, nil
+	}
+	if reason, busy := storeBusy(browser, ep.Profile, time.Now()); busy {
+		item.Busy = true
+		item.BusyReason = reason
+	}
+	return item, true, nil
+}
+
+// storeBusy reports whether the endpoint's store is plausibly mid-write: the Cookies
+// file or a rollback-journal/WAL sidecar has an mtime within busyWriteWindow AND the
+// owning browser is running. The mtime probe runs first — three stats — so an idle
+// store never pays the process check.
+func storeBusy(browser cookie.Browser, profile string, now time.Time) (string, bool) {
+	db := browser.CookiesDB(profile)
+	freshest := time.Duration(-1)
+	for _, path := range []string{db, db + "-journal", db + "-wal"} {
+		info, err := os.Stat(path)
+		if err != nil {
+			continue
+		}
+		if age := now.Sub(info.ModTime()); age < busyWriteWindow && (freshest < 0 || age < freshest) {
+			freshest = age
+		}
+	}
+	if freshest < 0 || !browserRunning(browser) {
+		return "", false
+	}
+	return fmt.Sprintf("%s running and cookie store written %s ago", browser.Display, freshest.Round(time.Millisecond)), true
+}
+
+// browserRunning reports whether the browser owning this data root is up, read from
+// the SingletonLock symlink Chromium keeps there (target "<hostname>-<pid>"). One
+// readlink plus one signal-0 probe — no subprocess, unlike pgrep — and the pid probe
+// discards a lock left stale by a crash.
+func browserRunning(browser cookie.Browser) bool {
+	target, err := os.Readlink(filepath.Join(browser.DataRoot, "SingletonLock"))
+	if err != nil {
+		return false
+	}
+	pid, err := strconv.Atoi(target[strings.LastIndexByte(target, '-')+1:])
+	if err != nil || pid <= 0 {
+		return false
+	}
+	return syscall.Kill(pid, 0) == nil
 }

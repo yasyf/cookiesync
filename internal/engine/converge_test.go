@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"fmt"
 	"slices"
 	"sync"
 	"testing"
@@ -31,6 +32,31 @@ func (s *fakeSource) Apply(_ context.Context, _, _ string, cookies []cookie.Cook
 	s.cookies = append([]cookie.Cookie(nil), cookies...)
 	s.applies = append(s.applies, append([]cookie.Cookie(nil), cookies...))
 	return len(cookies), nil
+}
+
+// memBaselines is an in-memory BaselineStore, seedable and inspectable, counting saves
+// so a test can assert the ledger is only persisted when it changed.
+type memBaselines struct {
+	baselines map[string]state.Baseline
+	saves     int
+}
+
+func newMemBaselines() *memBaselines {
+	return &memBaselines{baselines: map[string]state.Baseline{}}
+}
+
+func (b *memBaselines) Baselines(_ context.Context) (map[string]state.Baseline, error) {
+	out := make(map[string]state.Baseline, len(b.baselines))
+	for id, baseline := range b.baselines {
+		out[id] = baseline
+	}
+	return out, nil
+}
+
+func (b *memBaselines) SaveBaselinesUnlocked(_ context.Context, baselines map[string]state.Baseline) error {
+	b.baselines = baselines
+	b.saves++
+	return nil
 }
 
 // warmCache is a KeyCache that reports every endpoint warm, returning a dummy key. The
@@ -98,6 +124,7 @@ func TestConvergeValueUnionNewestWins(t *testing.T) {
 		SelfTarget:  self,
 		Cache:       warmCache{},
 		Recorder:    rec,
+		Baselines:   newMemBaselines(),
 		LocalSource: local,
 		SourceFor:   func(string) Source { return peer },
 		LockFor:     testLockFor(),
@@ -137,9 +164,10 @@ func TestConvergeValueUnionNewestWins(t *testing.T) {
 	}
 }
 
-// TestConvergeIdempotentOnRerun proves a second converge over an already-converged
-// group writes nothing and records nothing: the row sets already match the union, so
-// apply_to is a no-op — the property the anti-echo relies on.
+// TestConvergeIdempotentOnRerun proves a rerun over an already-converged group writes
+// nothing, records nothing, and re-persists no baseline: the row sets already match
+// the union, so apply_to is a no-op — the property the anti-echo relies on — and the
+// rowcount ledger is saved only on the pass that changed it.
 func TestConvergeIdempotentOnRerun(t *testing.T) {
 	ctx := context.Background()
 	self := "me@laptop"
@@ -148,10 +176,12 @@ func TestConvergeIdempotentOnRerun(t *testing.T) {
 	local := &fakeSource{cookies: []cookie.Cookie{ck(".x.com", "sid", "new", 200)}}
 	peer := &fakeSource{cookies: []cookie.Cookie{ck(".x.com", "sid", "new", 200)}}
 	rec := &countingRecorder{}
+	baselines := newMemBaselines()
 	deps := ConvergeDeps{
 		SelfTarget:  self,
 		Cache:       warmCache{},
 		Recorder:    rec,
+		Baselines:   baselines,
 		LocalSource: local,
 		SourceFor:   func(string) Source { return peer },
 		LockFor:     testLockFor(),
@@ -159,14 +189,19 @@ func TestConvergeIdempotentOnRerun(t *testing.T) {
 	anchor := state.Endpoint{Host: self, Browser: "chrome", Profile: "Default"}
 	peerEP := state.Endpoint{Host: peerHost, Browser: "chrome", Profile: "Default"}
 
-	if _, err := Converge(ctx, anchor, []state.Endpoint{peerEP}, "", deps); err != nil {
-		t.Fatalf("first converge: %v", err)
+	for pass := 1; pass <= 2; pass++ {
+		if _, err := Converge(ctx, anchor, []state.Endpoint{peerEP}, "", deps); err != nil {
+			t.Fatalf("converge pass %d: %v", pass, err)
+		}
 	}
 	if len(local.applies) != 0 || len(peer.applies) != 0 {
 		t.Fatalf("already-equal endpoints should not be written: local=%d peer=%d", len(local.applies), len(peer.applies))
 	}
 	if len(rec.recorded) != 0 {
 		t.Fatalf("no write means no recorded digest, got %d", len(rec.recorded))
+	}
+	if baselines.saves != 1 {
+		t.Fatalf("baseline ledger saved %d times, want 1 (first pass only; the rerun changed nothing)", baselines.saves)
 	}
 }
 
@@ -186,6 +221,7 @@ func TestConvergeAntiEchoSuppressesSelfWrite(t *testing.T) {
 		SelfTarget:  self,
 		Cache:       warmCache{},
 		Recorder:    rec,
+		Baselines:   newMemBaselines(),
 		LocalSource: local,
 		SourceFor:   func(string) Source { return peer },
 		LockFor:     testLockFor(),
@@ -229,6 +265,7 @@ func TestConvergeSkipsOriginHost(t *testing.T) {
 		SelfTarget:  self,
 		Cache:       warmCache{},
 		Recorder:    &countingRecorder{},
+		Baselines:   newMemBaselines(),
 		LocalSource: local,
 		SourceFor:   func(string) Source { return originSrc },
 		LockFor:     testLockFor(),
@@ -264,6 +301,7 @@ func TestConvergeSkipsColdSameHostPeer(t *testing.T) {
 		SelfTarget:  self,
 		Cache:       warmCache{cold: map[string]bool{string(coldPeer.ID()): true}},
 		Recorder:    &countingRecorder{},
+		Baselines:   newMemBaselines(),
 		LocalSource: local,
 		SourceFor:   func(string) Source { t.Fatal("no ssh source for a same-host peer"); return nil },
 		LockFor:     testLockFor(),
@@ -284,6 +322,7 @@ func TestConvergeColdAnchorNeedsAuth(t *testing.T) {
 		SelfTarget:  self,
 		Cache:       warmCache{cold: map[string]bool{string(anchor.ID()): true}},
 		Recorder:    &countingRecorder{},
+		Baselines:   newMemBaselines(),
 		LocalSource: &fakeSource{},
 		SourceFor:   func(string) Source { return &fakeSource{} },
 	}
@@ -310,6 +349,7 @@ func TestConvergeLocksLocalWritesOnly(t *testing.T) {
 		SelfTarget:  self,
 		Cache:       warmCache{},
 		Recorder:    &countingRecorder{},
+		Baselines:   newMemBaselines(),
 		LocalSource: local,
 		SourceFor:   func(string) Source { return peer },
 		LockFor: func(endpointID string) *sync.Mutex {
@@ -332,5 +372,195 @@ func TestConvergeLocksLocalWritesOnly(t *testing.T) {
 		if !locks.locks[id].TryLock() {
 			t.Fatalf("apply lock for %s still held after Converge", id)
 		}
+	}
+}
+
+// manyCk builds n distinct-name cookies stamped at lastUpdate, for baselines big
+// enough to trip the quarantine thresholds.
+func manyCk(n int, lastUpdate cookie.ChromeMicros) []cookie.Cookie {
+	cookies := make([]cookie.Cookie, 0, n)
+	for i := range n {
+		cookies = append(cookies, ck(".x.com", fmt.Sprintf("bulk%04d", i), "v", lastUpdate))
+	}
+	return cookies
+}
+
+// quarantineDeps builds ConvergeDeps over local, peer, and a seeded baseline ledger.
+func quarantineDeps(self string, local, peer *fakeSource, baselines *memBaselines) ConvergeDeps {
+	return ConvergeDeps{
+		SelfTarget:  self,
+		Cache:       warmCache{},
+		Recorder:    &countingRecorder{},
+		Baselines:   baselines,
+		LocalSource: local,
+		SourceFor:   func(string) Source { return peer },
+		LockFor:     testLockFor(),
+	}
+}
+
+// TestConvergeQuarantinesMassDrop proves the merge-boundary quarantine: a local source
+// whose extracted rowcount collapsed against its durable baseline is excluded from the
+// merge inputs — its freshly-regenerated newest-stamped rows must not win per-key —
+// while it still receives the merged union; sources above the thresholds stay in the
+// merge and just track their baseline.
+func TestConvergeQuarantinesMassDrop(t *testing.T) {
+	self := "me@laptop"
+	anchor := state.Endpoint{Host: self, Browser: "chrome", Profile: "Default"}
+	peerEP := state.Endpoint{Host: "you@desktop", Browser: "chrome", Profile: "Default"}
+	anchorID := string(anchor.ID())
+
+	tests := []struct {
+		name         string
+		baseline     int
+		local        []cookie.Cookie
+		wantSID      string
+		wantBaseline state.Baseline
+	}{
+		{
+			name:     "collapsed local is excluded from merge but receives the union",
+			baseline: 1000,
+			local: []cookie.Cookie{
+				ck(".x.com", "sid", "razed", 999),
+				ck(".x.com", "regen", "R", 999),
+			},
+			wantSID:      "good",
+			wantBaseline: state.Baseline{Rows: 1000, Quarantined: true, QuarantinedRows: 2},
+		},
+		{
+			name:         "small baseline never quarantines",
+			baseline:     100,
+			local:        []cookie.Cookie{ck(".x.com", "sid", "razed", 999)},
+			wantSID:      "razed",
+			wantBaseline: state.Baseline{Rows: 1},
+		},
+		{
+			name:         "drop above the collapse fraction stays healthy and re-baselines",
+			baseline:     1000,
+			local:        manyCk(60, 999),
+			wantSID:      "good",
+			wantBaseline: state.Baseline{Rows: 60},
+		},
+		{
+			name:         "first pass records the baseline",
+			baseline:     0,
+			local:        []cookie.Cookie{ck(".x.com", "sid", "razed", 999)},
+			wantSID:      "razed",
+			wantBaseline: state.Baseline{Rows: 1},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			local := &fakeSource{cookies: append([]cookie.Cookie(nil), tt.local...)}
+			peer := &fakeSource{cookies: []cookie.Cookie{ck(".x.com", "sid", "good", 200)}}
+			baselines := newMemBaselines()
+			if tt.baseline > 0 {
+				baselines.baselines[anchorID] = state.Baseline{Rows: tt.baseline}
+			}
+
+			merged, err := Converge(ctx, anchor, []state.Endpoint{peerEP}, "", quarantineDeps(self, local, peer, baselines))
+			if err != nil {
+				t.Fatalf("Converge: %v", err)
+			}
+
+			values := map[string]string{}
+			for _, c := range merged {
+				values[c.Name] = c.Value
+			}
+			if values["sid"] != tt.wantSID {
+				t.Fatalf("merged sid = %q, want %q", values["sid"], tt.wantSID)
+			}
+			if got := baselines.baselines[anchorID]; got != tt.wantBaseline {
+				t.Fatalf("baseline = %+v, want %+v", got, tt.wantBaseline)
+			}
+
+			if !tt.wantBaseline.Quarantined {
+				return
+			}
+			// Quarantined: no local-only row leaked into the union, yet the local store
+			// still received the merged union.
+			if _, ok := values["regen"]; ok {
+				t.Fatalf("quarantined source's rows leaked into the merge: %v", values)
+			}
+			if len(local.applies) != 1 {
+				t.Fatalf("quarantined source received %d applies, want 1 (the union write-back)", len(local.applies))
+			}
+			if !rowSetEqual(local.cookies, merged) {
+				t.Fatalf("quarantined source holds %d rows after write-back, want the %d-row union", len(local.cookies), len(merged))
+			}
+		})
+	}
+}
+
+// TestConvergeQuarantineSelfClears proves the union write-back heals a quarantined
+// store past the recovery fraction, so the next pass clears the quarantine, resumes
+// the baseline, and re-admits the source's rows to the merge.
+func TestConvergeQuarantineSelfClears(t *testing.T) {
+	ctx := context.Background()
+	self := "me@laptop"
+	anchor := state.Endpoint{Host: self, Browser: "chrome", Profile: "Default"}
+	peerEP := state.Endpoint{Host: "you@desktop", Browser: "chrome", Profile: "Default"}
+	anchorID := string(anchor.ID())
+
+	local := &fakeSource{cookies: []cookie.Cookie{ck(".x.com", "sid", "razed", 999)}}
+	peer := &fakeSource{cookies: append(manyCk(600, 100), ck(".x.com", "sid", "good", 200))}
+	baselines := newMemBaselines()
+	baselines.baselines[anchorID] = state.Baseline{Rows: 1000}
+	deps := quarantineDeps(self, local, peer, baselines)
+
+	if _, err := Converge(ctx, anchor, []state.Endpoint{peerEP}, "", deps); err != nil {
+		t.Fatalf("first converge: %v", err)
+	}
+	if got := baselines.baselines[anchorID]; !got.Quarantined {
+		t.Fatalf("first pass should quarantine, baseline = %+v", got)
+	}
+	if len(local.cookies) != 601 {
+		t.Fatalf("union write-back left %d rows, want 601", len(local.cookies))
+	}
+
+	// The write-back restored 601 rows (>= 50%% of the 1000 baseline). The next pass
+	// clears the quarantine and re-admits local rows: a new local-only cookie survives
+	// into the union.
+	local.cookies = append(local.cookies, ck(".x.com", "fresh", "F", 300))
+	merged, err := Converge(ctx, anchor, []state.Endpoint{peerEP}, "", deps)
+	if err != nil {
+		t.Fatalf("second converge: %v", err)
+	}
+	if got, want := baselines.baselines[anchorID], (state.Baseline{Rows: 602}); got != want {
+		t.Fatalf("post-recovery baseline = %+v, want %+v", got, want)
+	}
+	found := false
+	for _, c := range merged {
+		if c.Name == "fresh" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("recovered source's rows missing from the merge")
+	}
+}
+
+// TestConvergeAllSourcesQuarantinedSkipsApply proves a converge with every source
+// quarantined merges nothing and writes nothing — an empty union must never be applied
+// over the one store that still has rows to recover elsewhere.
+func TestConvergeAllSourcesQuarantinedSkipsApply(t *testing.T) {
+	ctx := context.Background()
+	self := "me@laptop"
+	anchor := state.Endpoint{Host: self, Browser: "chrome", Profile: "Default"}
+	anchorID := string(anchor.ID())
+
+	local := &fakeSource{cookies: []cookie.Cookie{ck(".x.com", "sid", "razed", 999)}}
+	baselines := newMemBaselines()
+	baselines.baselines[anchorID] = state.Baseline{Rows: 1000}
+
+	merged, err := Converge(ctx, anchor, nil, "", quarantineDeps(self, local, &fakeSource{}, baselines))
+	if err != nil {
+		t.Fatalf("Converge: %v", err)
+	}
+	if merged != nil {
+		t.Fatalf("all-quarantined converge merged %d rows, want none", len(merged))
+	}
+	if len(local.applies) != 0 {
+		t.Fatalf("all-quarantined converge wrote %d applies, want none", len(local.applies))
 	}
 }

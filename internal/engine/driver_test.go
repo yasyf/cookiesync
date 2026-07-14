@@ -175,6 +175,7 @@ func TestReconcilePassConvergesWarmLocalSkipsRemote(t *testing.T) {
 		SelfTarget:  self,
 		Cache:       warmCache{},
 		Recorder:    &countingRecorder{},
+		Baselines:   store,
 		LocalSource: local,
 		SourceFor:   func(string) Source { return peer },
 		LockFor:     testLockFor(),
