@@ -710,6 +710,26 @@ func TestReadTornDBReturnsCleanError(t *testing.T) {
 	assertNoTornCopyNoise(t, err)
 }
 
+// TestReadHotJournalIsBusy plants a rollback-journal sidecar next to the live store,
+// so the read-only VACUUM INTO snapshot refuses recovery with SQLITE_READONLY_ROLLBACK.
+// Read must classify that as ErrStoreBusy (a caller-branchable sentinel) and never leak
+// the raw 'readonly database' code to callers.
+func TestReadHotJournalIsBusy(t *testing.T) {
+	forEachSchema(t, func(t *testing.T, browser Browser, profile string) {
+		journal := browser.CookiesDB(profile) + "-journal"
+		if err := os.WriteFile(journal, []byte("hot-journal"), 0o600); err != nil {
+			t.Fatalf("plant journal: %v", err)
+		}
+		_, err := Read(context.Background(), browser, profile)
+		if !errors.Is(err, ErrStoreBusy) {
+			t.Fatalf("Read err = %v, want ErrStoreBusy", err)
+		}
+		if strings.Contains(err.Error(), "readonly database") {
+			t.Fatalf("busy error leaks readonly-database noise to callers: %v", err)
+		}
+	})
+}
+
 // TestReadMissingCookiesTableCleanError opens a valid SQLite DB with no cookies
 // table; the empty-columns guard must surface errNoCookiesTable rather than build a
 // 'SELECT  FROM cookies' that fails with 'near "FROM"'.

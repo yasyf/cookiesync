@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -73,7 +74,9 @@ type StateLoader interface {
 // store. The digest keys on (host_key, name, path, last_update_utc) and never decrypts,
 // so a self-induced write (which preserves last_update_utc) reproduces it — that is what
 // lets synckitd dedup cookiesync's own apply without a cross-process seed. An absent
-// profile dir yields ok=false.
+// profile dir yields ok=false. A store the owning browser is mid-writing reports Busy
+// with an empty digest — synckitd's busy gate defers it rather than fingerprinting a
+// torn read, so the busy determination runs before (and in place of) the snapshot.
 func watchItem(ctx context.Context, ep state.Endpoint) (syncservice.WatchItem, bool, error) {
 	browser, err := cookie.Lookup(cookie.BrowserName(ep.Browser))
 	if err != nil {
@@ -83,19 +86,24 @@ func watchItem(ctx context.Context, ep state.Endpoint) (syncservice.WatchItem, b
 	if info, statErr := os.Stat(dir); statErr != nil || !info.IsDir() {
 		return syncservice.WatchItem{}, false, nil
 	}
-	rows, err := cookie.Read(ctx, browser, ep.Profile)
-	if err != nil {
-		return syncservice.WatchItem{}, false, err
-	}
 	item := syncservice.WatchItem{
-		ID:          string(ep.ID()),
-		WatchDirs:   []string{browser.CookiesDB(ep.Profile)},
-		Fingerprint: string(cookie.LogicalDigest(rows)),
+		ID:        string(ep.ID()),
+		WatchDirs: []string{browser.CookiesDB(ep.Profile)},
 	}
 	if reason, busy := storeBusy(browser, ep.Profile, time.Now()); busy {
-		item.Busy = true
-		item.BusyReason = reason
+		item.Busy, item.BusyReason = true, reason
+		return item, true, nil
 	}
+	rows, err := cookie.Read(ctx, browser, ep.Profile)
+	if err != nil {
+		if errors.Is(err, cookie.ErrStoreBusy) {
+			item.Busy = true
+			item.BusyReason = fmt.Sprintf("%s cookie store went busy mid-read", browser.Display)
+			return item, true, nil
+		}
+		return syncservice.WatchItem{}, false, err
+	}
+	item.Fingerprint = string(cookie.LogicalDigest(rows))
 	return item, true, nil
 }
 

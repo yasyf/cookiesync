@@ -25,6 +25,12 @@ const (
 
 var errNoCookiesTable = errors.New("cookies table is unreadable or absent")
 
+// ErrStoreBusy signals that a cookie store could not be snapshotted because the
+// owning browser is mid-write: a hot rollback journal a read-only connection may not
+// recover, or a held lock. Callers branch on it with errors.Is and retry after the
+// browser quiesces rather than falling back to a torn byte copy.
+var ErrStoreBusy = errors.New("cookie store busy: owning browser is mid-write")
+
 // rowFieldDefaults zero-fills the columns absent from older schemas, so a v18 row
 // (no last_update_utc, no has_cross_site_ancestor) still builds a full EncryptedRow.
 var rowFieldDefaults = map[string]any{
@@ -86,6 +92,18 @@ func isBusy(err error) bool {
 	var serr *sqlite.Error
 	if !errors.As(err, &serr) {
 		return false
+	}
+	code := serr.Code() & 0xFF
+	return code == sqlite3.SQLITE_BUSY || code == sqlite3.SQLITE_LOCKED
+}
+
+func snapshotBusy(err error) bool {
+	var serr *sqlite.Error
+	if !errors.As(err, &serr) {
+		return false
+	}
+	if serr.Code() == sqlite3.SQLITE_READONLY_ROLLBACK {
+		return true
 	}
 	code := serr.Code() & 0xFF
 	return code == sqlite3.SQLITE_BUSY || code == sqlite3.SQLITE_LOCKED
@@ -204,6 +222,9 @@ func snapshotDB(ctx context.Context, src, dst string) error {
 	}
 	defer func() { _ = db.Close() }()
 	if _, err := db.ExecContext(ctx, "VACUUM INTO ?", dst); err != nil {
+		if snapshotBusy(err) {
+			return ErrStoreBusy
+		}
 		return fmt.Errorf("snapshot cookie store: %w", err)
 	}
 	return nil

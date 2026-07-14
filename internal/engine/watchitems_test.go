@@ -169,6 +169,9 @@ func TestWatchItemBusyWhenBrowserMidWrite(t *testing.T) {
 			if tt.wantBusy && !strings.Contains(item.BusyReason, "Chrome") {
 				t.Fatalf("BusyReason = %q, want it to name the browser", item.BusyReason)
 			}
+			if tt.wantBusy && item.Fingerprint != "" {
+				t.Fatalf("busy item carries fingerprint %q, want empty (no torn read)", item.Fingerprint)
+			}
 			if !tt.wantBusy && item.BusyReason != "" {
 				t.Fatalf("idle item carries BusyReason %q", item.BusyReason)
 			}
