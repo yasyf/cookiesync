@@ -2,8 +2,6 @@ package daemon
 
 import (
 	"context"
-	"os"
-	"path/filepath"
 	"testing"
 	"time"
 
@@ -50,9 +48,8 @@ func TestPrimeAuthGrantsArePerRequestor(t *testing.T) {
 		t.Fatalf("granted repeats = %d evaluations, want 2 (each requestor is silent inside its window)", len(consent.batchCalls))
 	}
 
-	d.grantMu.Lock()
-	d.grants["host:h1:chrome"] = time.Now().Add(-time.Second)
-	d.grantMu.Unlock()
+	// Re-grant with a negative ttl: the overwrite expires host:h1's grant.
+	d.grant("host:h1", []cookie.BrowserName{"chrome"}, -time.Second)
 	if _, _, err := d.primeAuth(ctx, "host:h1", "chrome", "Default", consentReason, releaseLocal); err != nil {
 		t.Fatalf("A's prime after expiry: %v", err)
 	}
@@ -132,7 +129,7 @@ func TestGetCookiesUngrantedRequestorPromptsThenSilent(t *testing.T) {
 	consent := &fakeConsent{key: key}
 	cache := newFakeCache()
 	d := New(consent, cache, nil, staticProbe(liveSession(currentUser(t))), &recordingRunner{}, fixedState{st: st}, fixedState{st: st})
-	_ = cache.Put(ctx, endpointID(self, "chrome", "Default"), []byte(key), 0)
+	_, _ = cache.Put(ctx, endpointID(self, "chrome", "Default"), []byte(key), 0)
 
 	got, err := d.handleGetCookies(ctx, map[string]any{"browser": "chrome", "url": "https://x.com/"})
 	if err != nil {
@@ -202,39 +199,6 @@ func TestPeerRequestor(t *testing.T) {
 	}
 }
 
-// TestRequestorReasonNamesTheProcess proves the best-effort prompt polish under the
-// new signature: a "req:" requestor names itself from its token with zero subprocess
-// (proven by feeding a live pid it must ignore), a captured peer pid resolves the
-// calling process's name, and every failure or nameless requestor leaves the reason
-// untouched.
-func TestRequestorReasonNamesTheProcess(t *testing.T) {
-	exe, err := os.Executable()
-	if err != nil {
-		t.Fatalf("resolve executable: %v", err)
-	}
-	tests := []struct {
-		name      string
-		requestor string
-		pid       int
-		hasPID    bool
-		want      string
-	}{
-		{"req token names itself with zero subprocess", "req:claude", os.Getpid(), true, consentReason + " for claude"},
-		{"req composite token renders verbatim", "req:Claude Code · a3283ae1", os.Getpid(), true, consentReason + " for Claude Code · a3283ae1"},
-		{"sid requestor with a live pid gains the process name", "sid:1", os.Getpid(), true, consentReason + " for " + filepath.Base(exe)},
-		{"sid requestor with no pid unchanged", "sid:1", 0, false, consentReason},
-		{"sid requestor with a dead pid unchanged", "sid:1", 99999999, true, consentReason},
-		{"local with no pid unchanged", "local", 0, false, consentReason},
-	}
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := requestorReason(context.Background(), tc.requestor, consentReason, tc.pid, tc.hasPID); got != tc.want {
-				t.Fatalf("requestorReason(%q, pid=%d/%v) = %q, want %q", tc.requestor, tc.pid, tc.hasPID, got, tc.want)
-			}
-		})
-	}
-}
-
 // TestPrimeAuthForgedOriginCannotRideHostGrant is the forgery regression for the local
 // prime path: a same-uid caller that forges an origin param must not resolve to
 // "host:<forged>" and ride a live host grant. With the endpoint pre-warmed AND a live
@@ -249,7 +213,7 @@ func TestPrimeAuthForgedOriginCannotRideHostGrant(t *testing.T) {
 	consent := &fakeConsent{key: key}
 	cache := newFakeCache()
 	d := New(consent, cache, nil, staticProbe(liveSession(currentUser(t))), &recordingRunner{}, fixedState{st: st}, fixedState{st: st})
-	_ = cache.Put(ctx, endpointID(self, "chrome", "Default"), []byte(key), 0)
+	_, _ = cache.Put(ctx, endpointID(self, "chrome", "Default"), []byte(key), 0)
 	d.grant("host:evil", []cookie.BrowserName{"chrome"}, time.Hour)
 
 	if _, err := d.handlePrimeAuth(ctx, map[string]any{"browser": "chrome", "origin": "evil"}); err != nil {
@@ -288,7 +252,7 @@ func TestGetCookiesUnionForgedOriginCannotRideHostGrant(t *testing.T) {
 	consent := &fakeConsent{key: key}
 	cache := newFakeCache()
 	d := New(consent, cache, nil, staticProbe(liveSession(currentUser(t))), &recordingRunner{}, fixedState{st: st}, fixedState{st: st})
-	_ = cache.Put(ctx, endpointID(self, "chrome", "Default"), []byte(key), 0)
+	_, _ = cache.Put(ctx, endpointID(self, "chrome", "Default"), []byte(key), 0)
 	d.grant("host:evil", []cookie.BrowserName{"chrome"}, time.Hour)
 
 	got, err := d.handleGetCookies(ctx, map[string]any{"url": "https://x.com/", "origin": "evil"})
@@ -303,75 +267,5 @@ func TestGetCookiesUnionForgedOriginCannotRideHostGrant(t *testing.T) {
 	}
 	if !d.granted("local", "chrome") {
 		t.Fatalf("the forged-origin union get_cookies must resolve to the local requestor and grant local:chrome")
-	}
-}
-
-// TestEffectiveTTLDerivation proves the single TTL derivation point: the configured
-// AuthTTL rules while the cache is healthy, and degradation caps it at 5m without
-// ever raising a shorter configured value.
-func TestEffectiveTTLDerivation(t *testing.T) {
-	tests := []struct {
-		name       string
-		degraded   bool
-		configured time.Duration
-		want       time.Duration
-	}{
-		{"healthy uses the configured hour", false, time.Hour, time.Hour},
-		{"degraded caps to 5m", true, time.Hour, degradedAuthTTL},
-		{"degraded keeps a shorter configured value", true, 3 * time.Minute, 3 * time.Minute},
-		{"healthy keeps a custom value", false, 7 * time.Minute, 7 * time.Minute},
-	}
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			cache := newFakeCache()
-			cache.degraded = tc.degraded
-			d := New(&fakeConsent{}, cache, nil, staticProbe(SessionSnapshot{}), &recordingRunner{}, fixedState{}, fixedState{})
-			if got := d.effectiveTTL(tc.configured); got != tc.want {
-				t.Fatalf("effectiveTTL(%v) with degraded=%v = %v, want %v", tc.configured, tc.degraded, got, tc.want)
-			}
-		})
-	}
-}
-
-// TestReleaseUsesEffectiveTTLForCacheAndGrant proves one release feeds the same
-// derived TTL to both sides: the cache.Put TTL and the grant window are the 1h
-// default while healthy and the 5m cap while the cache is degraded to memory.
-func TestReleaseUsesEffectiveTTLForCacheAndGrant(t *testing.T) {
-	tests := []struct {
-		name     string
-		degraded bool
-		want     time.Duration
-	}{
-		{"healthy uses the 1h default", false, time.Hour},
-		{"degraded caps both at 5m", true, degradedAuthTTL},
-	}
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			ctx := context.Background()
-			self := "me@laptop"
-			fakeMesh(t, self)
-			st := stateWith(self, "")
-			consent := &fakeConsent{key: cookie.DeriveKey(cookie.SafeStorageKey("peanuts"))}
-			cache := newFakeCache()
-			cache.degraded = tc.degraded
-			d := New(consent, cache, nil, staticProbe(liveSession(currentUser(t))), &recordingRunner{}, fixedState{st: st}, fixedState{st: st})
-
-			before := time.Now()
-			if _, _, err := d.primeAuth(ctx, "local", "chrome", "Default", consentReason, releaseLocal); err != nil {
-				t.Fatalf("primeAuth: %v", err)
-			}
-			if got := cache.putTTL(endpointID(self, "chrome", "Default")); got != tc.want {
-				t.Fatalf("cache.Put ttl = %v, want %v", got, tc.want)
-			}
-			d.grantMu.Lock()
-			expiry, ok := d.grants["local:chrome"]
-			d.grantMu.Unlock()
-			if !ok {
-				t.Fatalf("the release must grant local:chrome")
-			}
-			if window := expiry.Sub(before); window <= tc.want-time.Minute || window > tc.want+time.Minute {
-				t.Fatalf("grant window = %v, want ~%v", window, tc.want)
-			}
-		})
 	}
 }

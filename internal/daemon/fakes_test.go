@@ -13,10 +13,34 @@ import (
 	"testing"
 	"time"
 
+	"github.com/yasyf/cookiesync/internal/auth"
+	"github.com/yasyf/cookiesync/internal/cache"
 	"github.com/yasyf/cookiesync/internal/cookie"
 	"github.com/yasyf/cookiesync/internal/state"
 	"github.com/yasyf/synckit/cregistry"
 )
+
+// releaseLocal keeps the pre-broker release-mode name these tests exercise.
+const releaseLocal = auth.ModeLocal
+
+// AuthRequired keeps the pre-broker error name resolvable in these tests.
+type AuthRequired = auth.AuthRequired
+
+// primeAuth drives the broker release the way the pre-broker daemon seam did,
+// so the release tests keep their call shape.
+func (d *Daemon) primeAuth(ctx context.Context, requestor, browser, profile, reason string, mode auth.Mode) (cookie.AesKey, auth.Surface, error) {
+	return d.broker.Key(ctx, auth.Req{Requestor: requestor, Browser: browser, Profile: profile, Reason: reason, Mode: mode})
+}
+
+// grant seeds a broker grant, the pre-broker test seam.
+func (d *Daemon) grant(requestor string, browsers []cookie.BrowserName, ttl time.Duration) {
+	d.broker.Grant(requestor, browsers, ttl)
+}
+
+// granted reads a broker grant, the pre-broker test seam.
+func (d *Daemon) granted(requestor string, browser cookie.BrowserName) bool {
+	return d.broker.Granted(requestor, browser)
+}
 
 // fakeMesh seeds the shared synckit host registry with this self target and peers, so
 // the handlers key on the mesh self and the consent scan probes the mesh's peers — not
@@ -144,13 +168,12 @@ func (c *gateConsent) ObtainKeyUnprompted(_ context.Context, _ cookie.Browser) (
 	panic("gateConsent: unexpected unprompted release")
 }
 
-// partialGateConsent gates the batch like gateConsent — the leader blocks in
-// ObtainKeys while a waiter joins its flight — and reports one named browser as failed
-// (Missing, or Err when failErr is set) while every other browser releases OK. It is
-// the double for the F5 waiter path: a waiter for a distinct browser rides the same
-// single evaluation as a leader whose own browser is denied. batches counts ObtainKeys
-// invocations, so a regression that re-leads instead of sharing the flight trips it. A
-// canceled flight ctx is a whole-batch failure, returned as ctx.Err().
+// partialGateConsent gates the batch like gateConsent — each ObtainKeys parks
+// until release closes — and reports one named browser as failed (Missing, or
+// Err when failErr is set) while every other browser releases OK. batches
+// counts ObtainKeys invocations, so a test asserts exactly how many flights
+// evaluated consent. A canceled flight ctx is a whole-batch failure, returned
+// as ctx.Err().
 type partialGateConsent struct {
 	key     cookie.AesKey
 	failFor cookie.BrowserName
@@ -262,19 +285,16 @@ func (c *fakeCache) Get(_ context.Context, id string) ([]byte, bool, error) {
 	return key, ok, nil
 }
 
-func (c *fakeCache) Put(_ context.Context, id string, key []byte, ttl time.Duration) error {
+func (c *fakeCache) Put(_ context.Context, id string, key []byte, ttl time.Duration) (bool, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.degraded && ttl > cache.DegradedTTL {
+		ttl = cache.DegradedTTL
+	}
 	c.entries[id] = key
 	c.puts = append(c.puts, id)
 	c.ttls[id] = ttl
-	return nil
-}
-
-func (c *fakeCache) putTTL(id string) time.Duration {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.ttls[id]
+	return c.degraded, nil
 }
 
 func (c *fakeCache) getCalls() int {
@@ -293,6 +313,17 @@ func (c *fakeCache) Degraded() bool {
 	return c.degraded
 }
 
+// staleRescanCache is a fakeCache that stores Puts but reports every Get as a miss —
+// the double for a demote that staleifies the whole cache between a successful release
+// and primeAuthAll's verification rescan.
+type staleRescanCache struct {
+	*fakeCache
+}
+
+func (c *staleRescanCache) Get(_ context.Context, _ string) ([]byte, bool, error) {
+	return nil, false, nil
+}
+
 // blockingGetCache is a fakeCache whose Get parks until its context is cancelled, the
 // stand-in for a cache read that outruns authStatusTimeout.
 type blockingGetCache struct {
@@ -302,28 +333,6 @@ type blockingGetCache struct {
 func (c *blockingGetCache) Get(ctx context.Context, _ string) ([]byte, bool, error) {
 	<-ctx.Done()
 	return nil, false, ctx.Err()
-}
-
-// raceEvictCache drops every entry once, right after the Put for evictOn lands —
-// the concurrent heal-EvictAll race the requested-endpoint-last verify re-Put in
-// releaseAllLocal guards against.
-type raceEvictCache struct {
-	*fakeCache
-	evictOn string
-	fired   bool
-}
-
-func (c *raceEvictCache) Put(ctx context.Context, id string, key []byte, ttl time.Duration) error {
-	if err := c.fakeCache.Put(ctx, id, key, ttl); err != nil {
-		return err
-	}
-	if id == c.evictOn && !c.fired {
-		c.fired = true
-		c.mu.Lock()
-		clear(c.entries)
-		c.mu.Unlock()
-	}
-	return nil
 }
 
 // fixedState is a StateLoader and RegistryLoader returning a fixed snapshot. Its

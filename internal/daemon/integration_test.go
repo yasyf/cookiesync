@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -20,6 +21,7 @@ import (
 	"github.com/yasyf/cookiesync/internal/helper"
 	"github.com/yasyf/cookiesync/internal/paths"
 	"github.com/yasyf/cookiesync/internal/state"
+	"github.com/yasyf/synckit/hostregistry"
 )
 
 // v24Schema is a Chrome v24 cookie store schema, enough for a real extract/apply/
@@ -106,7 +108,7 @@ func TestGetCookiesMergesURLsFromCachedKey(t *testing.T) {
 	st := stateWith("me@laptop", "")
 	fakeMesh(t, "me@laptop")
 	d := New(&fakeConsent{}, cache, nil, staticProbe(SessionSnapshot{}), &recordingRunner{}, fixedState{st: st}, fixedState{st: st})
-	_ = cache.Put(ctx, endpointID("me@laptop", "chrome", "Default"), []byte(key), 0)
+	_, _ = cache.Put(ctx, endpointID("me@laptop", "chrome", "Default"), []byte(key), 0)
 	d.grant("local", []cookie.BrowserName{"chrome"}, time.Hour)
 
 	got, err := d.handleGetCookies(ctx, map[string]any{
@@ -141,7 +143,7 @@ func TestGetCookiesHostFilters(t *testing.T) {
 	cache := newFakeCache()
 	fakeMesh(t, "me@laptop")
 	d := New(&fakeConsent{}, cache, nil, staticProbe(SessionSnapshot{}), &recordingRunner{}, fixedState{st: stateWith("me@laptop", "")}, fixedState{st: stateWith("me@laptop", "")})
-	_ = cache.Put(ctx, endpointID("me@laptop", "chrome", "Default"), []byte(key), 0)
+	_, _ = cache.Put(ctx, endpointID("me@laptop", "chrome", "Default"), []byte(key), 0)
 	d.grant("local", []cookie.BrowserName{"chrome"}, time.Hour)
 
 	got, err := d.handleGetCookies(ctx, map[string]any{"browser": "chrome", "url": "https://x.com/"})
@@ -183,7 +185,7 @@ func TestGetCookiesUnionLocalAndRemote(t *testing.T) {
 	cache := newFakeCache()
 	consent := &fakeConsent{key: key}
 	d := New(consent, cache, nil, staticProbe(SessionSnapshot{}), runner, fixedState{st: st}, fixedState{st: st})
-	_ = cache.Put(ctx, endpointID(self, "chrome", "Default"), []byte(key), 0)
+	_, _ = cache.Put(ctx, endpointID(self, "chrome", "Default"), []byte(key), 0)
 	d.grant("local", []cookie.BrowserName{"chrome"}, time.Hour)
 
 	got, err := d.handleGetCookies(ctx, map[string]any{"url": "https://x.com/"})
@@ -211,15 +213,24 @@ func TestGetCookiesUnionLocalAndRemote(t *testing.T) {
 	}
 }
 
-// TestGetCookiesUnionWedgedPeerSkippedAtDeadline proves the union's remote leg gives a
-// wedged peer only unionReadTimeout — not the full consent window — before skipping it
-// with a consent-hinting warning, while every healthy endpoint still contributes its
-// cookies. A plain (non-deadline) ssh failure keeps the generic skip with no consent hint.
-func TestGetCookiesUnionWedgedPeerSkippedAtDeadline(t *testing.T) {
-	restore := unionReadTimeout
-	unionReadTimeout = 25 * time.Millisecond
-	t.Cleanup(func() { unionReadTimeout = restore })
+// timeoutDiagnosticRunner parks until the union deadline kills the call, then
+// returns the *hostregistry.SSHError ExecSSH produces on a ctx-deadline group
+// kill: the ctx error as the cause with the peer's captured stderr alongside.
+type timeoutDiagnosticRunner struct {
+	diagnostic string
+}
 
+func (r *timeoutDiagnosticRunner) Run(ctx context.Context, target, _ string, _ []byte) (string, error) {
+	<-ctx.Done()
+	return "", &hostregistry.SSHError{Addr: target, Stderr: r.diagnostic + "\n", Err: ctx.Err()}
+}
+
+func unionRemoteCookie() cookie.Cookie {
+	return cookie.Cookie{HostKey: "x.com", Name: "rem", Value: "there", Path: "/", LastUpdateUTC: 13_350_000_000_000_000, SameSite: 2, IsSecure: true, SourceScheme: 2, SourcePort: 443}
+}
+
+func unionWarning(t *testing.T, peers []string, runner engine.SSHRunner, wantRemote bool) string {
+	t.Helper()
 	ctx := context.Background()
 	browser := chromeStoreUnderHome(t)
 	key := cookie.DeriveKey(cookie.SafeStorageKey("peanuts"))
@@ -227,102 +238,124 @@ func TestGetCookiesUnionWedgedPeerSkippedAtDeadline(t *testing.T) {
 	if _, err := cookie.Apply(ctx, local, browser, "Default", key); err != nil {
 		t.Fatalf("seed apply: %v", err)
 	}
-	remote := cookie.Cookie{HostKey: "x.com", Name: "rem", Value: "there", Path: "/", LastUpdateUTC: 13_350_000_000_000_000, SameSite: 2, IsSecure: true, SourceScheme: 2, SourcePort: 443}
 
 	self := "me@laptop"
-	wedged := "wedged@desktop"
-	healthy := "healthy@desktop"
+	fakeMesh(t, self, peers...)
+	endpoints := make([]state.Endpoint, 0, 1+len(peers))
+	endpoints = append(endpoints, stateEndpoint(self, "chrome", "Default"))
+	for _, peer := range peers {
+		endpoints = append(endpoints, stateEndpoint(peer, "chrome", "Default"))
+	}
+	st := stateWith(self, "", endpoints...)
+	cache := newFakeCache()
+	d := New(&fakeConsent{key: key}, cache, nil, staticProbe(SessionSnapshot{}), runner, fixedState{st: st}, fixedState{st: st})
+	_, _ = cache.Put(ctx, endpointID(self, "chrome", "Default"), []byte(key), 0)
+	d.grant("local", []cookie.BrowserName{"chrome"}, time.Hour)
+
+	start := time.Now()
+	got, err := d.handleGetCookies(ctx, map[string]any{"url": "https://x.com/"})
+	if err != nil {
+		t.Fatalf("handleGetCookies union: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("union waited %v on a wedged peer; unionReadTimeout must bound it", elapsed)
+	}
+	cookies := wireCookieNames(t, got)
+	if cookies["loc"].Value != "here" {
+		t.Fatalf("union dropped the warm local cookie: %+v", cookies)
+	}
+	if _, gotRemote := cookies["rem"]; gotRemote != wantRemote {
+		t.Fatalf("union rem present = %v, want %v: %+v", gotRemote, wantRemote, cookies)
+	}
+	warnings := decodeWarnings(t, got)
+	if len(warnings) != 1 {
+		t.Fatalf("want exactly one skip warning, got %v", warnings)
+	}
+	return warnings[0]
+}
+
+// TestUnionSkipPreservesPeerStderrOnTimeout proves the stderr an SSHError
+// captured on the ctx-deadline kill is retained verbatim in the skip warning.
+func TestUnionSkipPreservesPeerStderrOnTimeout(t *testing.T) {
+	restore := unionReadTimeout
+	unionReadTimeout = 25 * time.Millisecond
+	t.Cleanup(func() { unionReadTimeout = restore })
+
+	host := "wedged@desktop"
+	diagnostic := "cookiesync: profile locked by another process"
+	warning := unionWarning(t, []string{host}, &timeoutDiagnosticRunner{diagnostic: diagnostic}, false)
+	if !strings.Contains(warning, "peer reported: "+diagnostic) {
+		t.Fatalf("warning = %q, want the captured peer stderr %q verbatim", warning, diagnostic)
+	}
+}
+
+// TestUnionSkipDistinguishesPeerErrorFromTimeout proves a bare timeout carries the
+// consent, doctor, and TCC hints while a real peer error carries its error and daemon hint.
+func TestUnionSkipDistinguishesPeerErrorFromTimeout(t *testing.T) {
+	restore := unionReadTimeout
+	unionReadTimeout = 25 * time.Millisecond
+	t.Cleanup(func() { unionReadTimeout = restore })
 
 	tests := []struct {
-		name    string
-		peers   []string
-		runner  engine.SSHRunner
-		wantRem bool
-		check   func(t *testing.T, warning string)
+		name       string
+		peers      []string
+		runner     func(t *testing.T) engine.SSHRunner
+		wantRemote bool
+		contains   []string
+		absent     []string
 	}{
 		{
-			name:    "wedged only peer",
-			peers:   []string{wedged},
-			runner:  &wedgedTargetRunner{inner: &recordingRunner{}, wedged: wedged},
-			wantRem: false,
-			check: func(t *testing.T, warning string) {
-				if !strings.Contains(warning, endpointID(wedged, "chrome", "Default")) {
-					t.Fatalf("warning must name the wedged endpoint: %q", warning)
-				}
-				if !strings.Contains(warning, "consent") {
-					t.Fatalf("warning must hint at a pending consent: %q", warning)
-				}
+			name:  "bare timeout",
+			peers: []string{"wedged@desktop"},
+			runner: func(*testing.T) engine.SSHRunner {
+				return &wedgedTargetRunner{inner: &recordingRunner{}, wedged: "wedged@desktop"}
 			},
+			contains: []string{endpointID("wedged@desktop", "chrome", "Default"), "consent may be pending", "cookiesync doctor on wedged@desktop", "TCC / Full Disk Access"},
+			absent:   []string{"is the daemon running"},
 		},
 		{
-			name:  "wedged beside healthy peer",
-			peers: []string{wedged, healthy},
-			runner: &wedgedTargetRunner{
-				inner:  &recordingRunner{perTarget: map[string]string{healthy: peerExtractReply(t, remote)}},
-				wedged: wedged,
-			},
-			wantRem: true,
-			check: func(t *testing.T, warning string) {
-				if !strings.Contains(warning, endpointID(wedged, "chrome", "Default")) {
-					t.Fatalf("warning must name the wedged endpoint: %q", warning)
-				}
-				if strings.Contains(warning, endpointID(healthy, "chrome", "Default")) {
-					t.Fatalf("the healthy endpoint must not appear in the skip warning: %q", warning)
+			name:  "bare timeout beside healthy peer",
+			peers: []string{"wedged@desktop", "healthy@desktop"},
+			runner: func(t *testing.T) engine.SSHRunner {
+				return &wedgedTargetRunner{
+					inner:  &recordingRunner{perTarget: map[string]string{"healthy@desktop": peerExtractReply(t, unionRemoteCookie())}},
+					wedged: "wedged@desktop",
 				}
 			},
+			wantRemote: true,
+			contains:   []string{endpointID("wedged@desktop", "chrome", "Default"), "consent may be pending"},
+			absent:     []string{endpointID("healthy@desktop", "chrome", "Default")},
 		},
 		{
-			name:    "plain ssh failure keeps generic skip",
-			peers:   []string{wedged},
-			runner:  &recordingRunner{err: errors.New("ssh: connect refused")},
-			wantRem: false,
-			check: func(t *testing.T, warning string) {
-				wantPrefix := "skip " + endpointID(wedged, "chrome", "Default") + ": "
-				if !strings.HasPrefix(warning, wantPrefix) {
-					t.Fatalf("plain ssh failure must keep the generic skip prefix %q: %q", wantPrefix, warning)
-				}
-				if strings.Contains(warning, "consent") {
-					t.Fatalf("a non-deadline ssh failure must not carry a consent hint: %q", warning)
-				}
+			name:  "peer error",
+			peers: []string{"wedged@desktop"},
+			runner: func(*testing.T) engine.SSHRunner {
+				return &recordingRunner{err: errors.New("ssh: connect refused")}
 			},
+			contains: []string{endpointID("wedged@desktop", "chrome", "Default"), "ssh: connect refused", "is the daemon running on wedged@desktop?"},
+			absent:   []string{"consent may be pending", "cookiesync doctor"},
 		},
 	}
 
+	warnings := make(map[string]string, len(tests))
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			fakeMesh(t, self, tc.peers...)
-			endpoints := []state.Endpoint{stateEndpoint(self, "chrome", "Default")}
-			for _, p := range tc.peers {
-				endpoints = append(endpoints, stateEndpoint(p, "chrome", "Default"))
+			warning := unionWarning(t, tc.peers, tc.runner(t), tc.wantRemote)
+			for _, want := range tc.contains {
+				if !strings.Contains(warning, want) {
+					t.Fatalf("warning = %q, want it to contain %q", warning, want)
+				}
 			}
-			st := stateWith(self, "", endpoints...)
-			cache := newFakeCache()
-			consent := &fakeConsent{key: key}
-			d := New(consent, cache, nil, staticProbe(SessionSnapshot{}), tc.runner, fixedState{st: st}, fixedState{st: st})
-			_ = cache.Put(ctx, endpointID(self, "chrome", "Default"), []byte(key), 0)
-			d.grant("local", []cookie.BrowserName{"chrome"}, time.Hour)
-
-			start := time.Now()
-			got, err := d.handleGetCookies(ctx, map[string]any{"url": "https://x.com/"})
-			if err != nil {
-				t.Fatalf("handleGetCookies union: %v", err)
+			for _, unwanted := range tc.absent {
+				if strings.Contains(warning, unwanted) {
+					t.Fatalf("warning = %q, want it not to contain %q", warning, unwanted)
+				}
 			}
-			if elapsed := time.Since(start); elapsed > 2*time.Second {
-				t.Fatalf("union waited %v on a wedged peer; unionReadTimeout must bound it", elapsed)
-			}
-			cookies := wireCookieNames(t, got)
-			if cookies["loc"].Value != "here" {
-				t.Fatalf("union dropped the warm local cookie: %+v", cookies)
-			}
-			if _, gotRem := cookies["rem"]; gotRem != tc.wantRem {
-				t.Fatalf("union rem present = %v, want %v: %+v", gotRem, tc.wantRem, cookies)
-			}
-			warnings := decodeWarnings(t, got)
-			if len(warnings) != 1 {
-				t.Fatalf("want exactly one skip warning, got %v", warnings)
-			}
-			tc.check(t, warnings[0])
+			warnings[tc.name] = warning
 		})
+	}
+	if warnings["bare timeout"] == warnings["peer error"] {
+		t.Fatalf("bare timeout and peer error warnings must differ: %q", warnings["bare timeout"])
 	}
 }
 
@@ -359,7 +392,7 @@ func TestGetCookiesUnionLocalWinsTie(t *testing.T) {
 	}}
 	cache := newFakeCache()
 	d := New(&fakeConsent{key: key}, cache, nil, staticProbe(SessionSnapshot{}), runner, fixedState{st: st}, fixedState{st: st})
-	_ = cache.Put(ctx, endpointID(self, "chrome", "Default"), []byte(key), 0)
+	_, _ = cache.Put(ctx, endpointID(self, "chrome", "Default"), []byte(key), 0)
 	d.grant("local", []cookie.BrowserName{"chrome"}, time.Hour)
 
 	got, err := d.handleGetCookies(ctx, map[string]any{"url": "https://x.com/"})
@@ -498,7 +531,7 @@ func TestGetCookiesUnionBrokenLocalStoreSkipped(t *testing.T) {
 	key := cookie.DeriveKey(cookie.SafeStorageKey("peanuts"))
 	cache := newFakeCache()
 	d := New(&fakeConsent{key: key}, cache, nil, staticProbe(SessionSnapshot{}), runner, fixedState{st: st}, fixedState{st: st})
-	_ = cache.Put(ctx, endpointID(self, "chrome", "Ghost"), []byte(key), 0)
+	_, _ = cache.Put(ctx, endpointID(self, "chrome", "Ghost"), []byte(key), 0)
 	d.grant("local", []cookie.BrowserName{"chrome"}, time.Hour)
 
 	got, err := d.handleGetCookies(ctx, map[string]any{"url": "https://x.com/"})
@@ -587,7 +620,7 @@ func TestGetCookiesSinglePeerDrivenGrantKeysOrigin(t *testing.T) {
 	consent := &fakeConsent{key: key}
 	cache := newFakeCache()
 	d := New(consent, cache, nil, staticProbe(SessionSnapshot{}), &recordingRunner{}, fixedState{st: st}, fixedState{st: st})
-	_ = cache.Put(ctx, endpointID(self, "chrome", "Default"), []byte(key), 0)
+	_, _ = cache.Put(ctx, endpointID(self, "chrome", "Default"), []byte(key), 0)
 	d.grant("host:you@desktop", []cookie.BrowserName{"chrome"}, time.Hour)
 
 	got, err := d.handleGetCookies(ctx, map[string]any{"browser": "chrome", "url": "https://x.com/", "origin": "you@desktop"})
@@ -757,7 +790,7 @@ func TestExtractApplyRoundTripWireContract(t *testing.T) {
 	chromeStoreUnderHome(t)
 	key := cookie.DeriveKey(cookie.SafeStorageKey("peanuts"))
 	cache := newFakeCache()
-	_ = cache.Put(ctx, endpointID("me@laptop", "chrome", "Default"), []byte(key), 0)
+	_, _ = cache.Put(ctx, endpointID("me@laptop", "chrome", "Default"), []byte(key), 0)
 	st := stateWith("me@laptop", "")
 	fakeMesh(t, "me@laptop")
 	d := New(&fakeConsent{key: key}, cache, newRealEngine(t, cache), staticProbe(liveSession(currentUser(t))), &recordingRunner{}, fixedState{st: st}, fixedState{st: st})
@@ -796,7 +829,7 @@ func TestApplySerializesPerEndpoint(t *testing.T) {
 	key := cookie.DeriveKey(cookie.SafeStorageKey("peanuts"))
 	fakeMesh(t, "me@laptop")
 	cache := newFakeCache()
-	_ = cache.Put(ctx, endpointID("me@laptop", "chrome", "Default"), []byte(key), 0)
+	_, _ = cache.Put(ctx, endpointID("me@laptop", "chrome", "Default"), []byte(key), 0)
 	st := stateWith("me@laptop", "")
 	recorder := &countingRecorder{inner: engine.NewDigestRecorder(), hold: 20 * time.Millisecond}
 	d := New(&fakeConsent{}, cache, engine.New(nil, cache, nil, recorder), staticProbe(SessionSnapshot{}), &recordingRunner{}, fixedState{st: st}, fixedState{st: st})
@@ -841,8 +874,8 @@ func TestApplyDistinctEndpointsOverlap(t *testing.T) {
 	key := cookie.DeriveKey(cookie.SafeStorageKey("peanuts"))
 	fakeMesh(t, "me@laptop")
 	cache := newFakeCache()
-	_ = cache.Put(ctx, endpointID("me@laptop", "chrome", "Default"), []byte(key), 0)
-	_ = cache.Put(ctx, endpointID("me@laptop", "chrome", "Work"), []byte(key), 0)
+	_, _ = cache.Put(ctx, endpointID("me@laptop", "chrome", "Default"), []byte(key), 0)
+	_, _ = cache.Put(ctx, endpointID("me@laptop", "chrome", "Work"), []byte(key), 0)
 	st := stateWith("me@laptop", "")
 	arrived := make(chan string, 2)
 	release := make(chan struct{})
@@ -896,7 +929,7 @@ func newConvergeFixture(t *testing.T) *convergeFixture {
 	localEP := state.Endpoint{Host: "me@laptop", Browser: "chrome", Profile: "Default"}
 	peerEP := state.Endpoint{Host: "you@desktop", Browser: "chrome", Profile: "Default"}
 	localID := string(localEP.ID())
-	_ = cache.Put(ctx, localID, []byte(key), 0)
+	_, _ = cache.Put(ctx, localID, []byte(key), 0)
 	store := &fakeStore{
 		withLock: func(_ context.Context, fn func() error) error { return fn() },
 		registry: newRegistry(localEP, peerEP),
@@ -979,7 +1012,7 @@ func TestConvergeLocalWriteOverlapsDistinctApply(t *testing.T) {
 	addChromeProfileStore(t, browser, "Work")
 	fx := newConvergeFixture(t)
 	workID := endpointID("me@laptop", "chrome", "Work")
-	_ = fx.cache.Put(ctx, workID, []byte(fx.key), 0)
+	_, _ = fx.cache.Put(ctx, workID, []byte(fx.key), 0)
 	syncDone := fx.holdConvergeMidLocalWrite(ctx, t)
 
 	payload := wireArrayToAny(t, []cookie.WireCookie{
@@ -1070,7 +1103,7 @@ func TestPrimeAuthStragglerAfterWarmCacheDoesNotReprompt(t *testing.T) {
 	consent := &fakeConsent{key: cookie.DeriveKey(cookie.SafeStorageKey("peanuts"))}
 	cache := newFakeCache()
 	d := New(consent, cache, nil, staticProbe(liveSession(currentUser(t))), &recordingRunner{}, fixedState{st: st}, fixedState{st: st})
-	_ = cache.Put(ctx, endpointID("me@laptop", "chrome", "Default"), []byte(consent.key), 0)
+	_, _ = cache.Put(ctx, endpointID("me@laptop", "chrome", "Default"), []byte(consent.key), 0)
 	d.grant("local", []cookie.BrowserName{"chrome"}, time.Hour)
 
 	key, _, err := d.primeAuth(ctx, "local", "chrome", "Default", consentReason, releaseLocal)
@@ -1293,13 +1326,12 @@ func TestConcurrentDistinctEndpointPrimesCollapseToOneEvaluation(t *testing.T) {
 	}
 }
 
-// TestPrimeAuthPartialBatchServesWaiterWhileLeaderBrowserDenied proves the F5 waiter
-// path: one requestor primes two DISTINCT browsers concurrently — the leader's browser
-// is denied (Missing) while the waiter's releases OK — and they share ONE consent
-// evaluation. The leader fails with its own browser's ConsentError; the waiter still
-// gets its key. The distinct-PROFILE collapse test never reaches this, since there
-// every browser in the batch resolves to one shared outcome.
-func TestPrimeAuthPartialBatchServesWaiterWhileLeaderBrowserDenied(t *testing.T) {
+// TestConcurrentDistinctBrowserPrimesLeadOwnFlights pins the per-browser flight
+// key: one requestor primes two DISTINCT browsers concurrently, so each leads
+// its own flight — the leader's denial (chrome Missing) is its own outcome,
+// never delivered to the arc prime, which releases via its own evaluation once
+// promptGate serializes it behind the leader's sheet.
+func TestConcurrentDistinctBrowserPrimesLeadOwnFlights(t *testing.T) {
 	self := "me@laptop"
 	fakeMesh(t, self)
 	st := stateWith(self, "",
@@ -1313,7 +1345,12 @@ func TestPrimeAuthPartialBatchServesWaiterWhileLeaderBrowserDenied(t *testing.T)
 		release: make(chan struct{}),
 	}
 	cache := newFakeCache()
-	d := New(consent, cache, nil, staticProbe(liveSession(currentUser(t))), &recordingRunner{}, fixedState{st: st}, fixedState{st: st})
+	var probes atomic.Int32
+	probe := func(_ context.Context) (SessionSnapshot, error) {
+		probes.Add(1)
+		return liveSession(currentUser(t)), nil
+	}
+	d := New(consent, cache, nil, probe, &recordingRunner{}, fixedState{st: st}, fixedState{st: st})
 
 	leaderDone := make(chan error, 1)
 	go func() {
@@ -1326,11 +1363,13 @@ func TestPrimeAuthPartialBatchServesWaiterWhileLeaderBrowserDenied(t *testing.T)
 	go func() {
 		key, _, err := d.primeAuth(context.Background(), "sid:1", "arc", "Default", consentReason, releaseLocal)
 		if err == nil && string(key) != string(consent.key) {
-			err = errors.New("waiter got the wrong key")
+			err = errors.New("arc prime got the wrong key")
 		}
 		waiterDone <- err
 	}()
-
+	// The arc flight's routing probe fires after its grant re-probe, so once it
+	// lands the flight is committed to its own evaluation.
+	waitFor(t, func() bool { return probes.Load() >= 2 })
 	close(consent.release)
 
 	var declined *cookie.ConsentError
@@ -1338,13 +1377,13 @@ func TestPrimeAuthPartialBatchServesWaiterWhileLeaderBrowserDenied(t *testing.T)
 		t.Fatalf("leader prime for the denied browser = %v, want *cookie.ConsentError", leaderErr)
 	}
 	if err := <-waiterDone; err != nil {
-		t.Fatalf("waiter prime for the released browser: %v", err)
+		t.Fatalf("concurrent prime for the released browser: %v", err)
 	}
-	if got := consent.batches.Load(); got != 1 {
-		t.Errorf("consent evaluations = %d, want 1 (the waiter must ride the leader's batch, not re-lead)", got)
+	if got := consent.batches.Load(); got != 2 {
+		t.Errorf("consent evaluations = %d, want 2 (distinct browsers lead their own flights)", got)
 	}
 	if _, ok, _ := cache.Get(context.Background(), endpointID(self, "arc", "Default")); !ok {
-		t.Errorf("the waiter's browser must be warmed by the shared batch")
+		t.Errorf("the arc flight must warm its own browser")
 	}
 	if _, ok, _ := cache.Get(context.Background(), endpointID(self, "chrome", "Default")); ok {
 		t.Errorf("the denied browser must not be cached")
@@ -1456,67 +1495,34 @@ func TestConcurrentCookiesAndPrimeShareOneSheet(t *testing.T) {
 	}
 }
 
-// TestRequestedEndpointRePutSurvivesEvictAllRace proves the verify-and-re-Put tail of
-// releaseAllLocal: when an EvictAll races in right after the requested endpoint's Put
-// (a concurrent Put healing the degraded wrapper mid-batch), the requested endpoint
-// is re-Put and ends warm — the one endpoint the prime was for never comes out cold.
-func TestRequestedEndpointRePutSurvivesEvictAllRace(t *testing.T) {
-	ctx := context.Background()
-	self := "me@laptop"
-	fakeMesh(t, self)
-	requested := endpointID(self, "chrome", "Default")
-	st := stateWith(self, "",
-		stateEndpoint(self, "chrome", "Default"),
-		stateEndpoint(self, "chrome", "Work"),
-	)
-	consent := &fakeConsent{key: cookie.DeriveKey(cookie.SafeStorageKey("peanuts"))}
-	cache := &raceEvictCache{fakeCache: newFakeCache(), evictOn: requested}
-	d := New(consent, cache, nil, staticProbe(liveSession(currentUser(t))), &recordingRunner{}, fixedState{st: st}, fixedState{st: st})
-
-	key, _, err := d.primeAuth(ctx, "local", "chrome", "Default", consentReason, releaseLocal)
-	if err != nil {
-		t.Fatalf("primeAuth: %v", err)
-	}
-	if string(key) != string(consent.key) {
-		t.Fatalf("primeAuth returned the wrong key")
-	}
-	work := endpointID(self, "chrome", "Work")
-	wantPuts := []string{work, requested, requested}
-	if len(cache.puts) != len(wantPuts) {
-		t.Fatalf("cache puts = %v, want %v (bulk, requested last, re-Put after the evict)", cache.puts, wantPuts)
-	}
-	for i, want := range wantPuts {
-		if cache.puts[i] != want {
-			t.Fatalf("cache puts = %v, want %v (bulk, requested last, re-Put after the evict)", cache.puts, wantPuts)
-		}
-	}
-	if _, ok, _ := cache.Get(ctx, requested); !ok {
-		t.Fatalf("the requested endpoint must be re-Put after the racing EvictAll")
-	}
-}
-
 // TestRequestedEndpointLastSurvivesRealCacheHeal pins the requested-last Put ordering
-// against the REAL key cache: a KeyCache opened degraded (keybag locked) heals on the
-// requested endpoint's Put — the last of the batch — whose swap runs EvictAll. The
-// bulk Puts before it are dropped by the heal, but the requested endpoint, being
-// last, survives Enclave-wrapped; were it put any earlier, the prime's own endpoint
-// would come out cold.
+// in releaseAllLocal against the REAL key cache: a KeyCache opened degraded (keybag
+// locked) heals on the requested endpoint's Put — the last of the batch — whose epoch
+// swap evicts every pre-heal entry. The bulk Puts before it are dropped by the heal,
+// but the requested endpoint, being last, survives Enclave-wrapped; were it put any
+// earlier, the prime's own endpoint would come out cold.
 func TestRequestedEndpointLastSurvivesRealCacheHeal(t *testing.T) {
 	ctx := context.Background()
 	self := "me@laptop"
 	fakeMesh(t, self)
-	// One open probe + two bulk Puts stay degraded; the fourth probe — the requested
-	// endpoint's Put — heals.
+	// One open probe + two bulk Puts' probes stay refused; the fourth probe — the
+	// requested endpoint's Put — heals.
 	binary := writeHealingCacheHelper(t, 4)
 	restore := paths.SetHelperBinaryForTest(binary)
 	t.Cleanup(restore)
 
-	wrapper, err := cache.OpenWrapper(ctx, helper.Bridge{})
-	if !errors.Is(err, cache.ErrSEPresenceUnavailable) {
-		t.Fatalf("OpenWrapper = %v, want ErrSEPresenceUnavailable", err)
+	keyCache, err := cache.Open(ctx, helper.Bridge{})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
 	}
-	keyCache := cache.NewKeyCache(wrapper)
-	t.Cleanup(func() { _ = wrapper.Close(context.Background()) })
+	if !keyCache.Degraded() {
+		t.Fatalf("the cache must open degraded under the locked keybag")
+	}
+	t.Cleanup(func() {
+		if err := keyCache.Close(context.Background()); err != nil {
+			t.Errorf("Close: %v", err)
+		}
+	})
 
 	st := stateWith(self, "",
 		stateEndpoint(self, "chrome", "Default"),
@@ -1546,7 +1552,7 @@ func TestRequestedEndpointLastSurvivesRealCacheHeal(t *testing.T) {
 	}
 	for _, dropped := range []string{endpointID(self, "chrome", "Work"), endpointID(self, "arc", "Default")} {
 		if _, ok, _ := keyCache.Get(ctx, dropped); ok {
-			t.Errorf("bulk endpoint %s survived the heal EvictAll — the requested endpoint was not put last", dropped)
+			t.Errorf("bulk endpoint %s survived the heal eviction — the requested endpoint was not put last", dropped)
 		}
 	}
 }

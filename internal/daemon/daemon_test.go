@@ -3,7 +3,6 @@ package daemon
 import (
 	"bytes"
 	"context"
-	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -14,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/yasyf/cookiesync/internal/auth"
 	"github.com/yasyf/cookiesync/internal/cache"
 	"github.com/yasyf/cookiesync/internal/cookie"
 	"github.com/yasyf/cookiesync/internal/engine"
@@ -72,20 +72,20 @@ func TestBuildOpensAndDropsTheEnclaveKey(t *testing.T) {
 	fakeMesh(t, "me@laptop")
 	ctx := context.Background()
 
-	d, closer, err := Build(ctx)
+	_, keyCache, err := build(ctx)
 	if err != nil {
 		t.Fatalf("Build: %v", err)
 	}
 
 	// A key cached after startup is gone after shutdown (the closer evicts the cache).
 	id := endpointID("me@laptop", "chrome", "Default")
-	if err := d.cache.Put(ctx, id, []byte("k"), 5_000_000_000); err != nil {
+	if _, err := keyCache.Put(ctx, id, []byte("k"), 5_000_000_000); err != nil {
 		t.Fatalf("cache Put: %v", err)
 	}
-	if err := closer(ctx); err != nil {
+	if err := keyCache.Close(ctx); err != nil {
 		t.Fatalf("closer: %v", err)
 	}
-	if _, ok, _ := d.cache.Get(ctx, id); ok {
+	if _, ok, _ := keyCache.Get(ctx, id); ok {
 		t.Fatalf("cache not evicted on shutdown")
 	}
 
@@ -111,10 +111,9 @@ func TestBuildOpensAndDropsTheEnclaveKey(t *testing.T) {
 }
 
 // TestBuildDegradedPresenceStartsWithMemoryCache proves a cache-newkey presence
-// refusal (helper exit 3: screen locked or screen-shared, errSecInteractionNotAllowed)
-// does not kill the daemon: Build warns exactly once — carrying the helper's OSStatus
-// diagnostic — and serves with the in-memory wrapper, whose cached keys round-trip in
-// process memory and leave the helper untouched after the one newkey probe.
+// refusal (helper exit 3) does not kill the daemon: the open warns exactly once —
+// carrying the helper's OSStatus diagnostic — and serves degraded, with cached keys
+// round-tripping in process memory and the helper touched only for newkey probes.
 func TestBuildDegradedPresenceStartsWithMemoryCache(t *testing.T) {
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	binary, logPath := writeStubHelper(t, 3, "keyhelper: cache-newkey failed: interaction not allowed (OSStatus -25308)")
@@ -128,12 +127,12 @@ func TestBuildDegradedPresenceStartsWithMemoryCache(t *testing.T) {
 	t.Cleanup(func() { slog.SetDefault(prev) })
 
 	ctx := context.Background()
-	d, closer, err := Build(ctx)
+	_, keyCache, err := build(ctx)
 	if err != nil {
 		t.Fatalf("Build with a presence-unavailable helper must degrade, got %v", err)
 	}
 
-	const warn = "Secure Enclave presence unavailable — screen-shared/locked; using in-memory key cache this session"
+	const warn = "Secure Enclave presence unavailable — screen locked or no user present; caching keys in process memory until the keybag unlocks"
 	if got := strings.Count(logs.String(), warn); got != 1 {
 		t.Fatalf("degraded Build must WARN exactly once, got %d in:\n%s", got, logs.String())
 	}
@@ -142,19 +141,19 @@ func TestBuildDegradedPresenceStartsWithMemoryCache(t *testing.T) {
 	}
 
 	id := endpointID("me@laptop", "chrome", "Default")
-	if err := d.cache.Put(ctx, id, []byte("k"), 5*time.Minute); err != nil {
-		t.Fatalf("cache Put on the memory wrapper: %v", err)
+	if _, err := keyCache.Put(ctx, id, []byte("k"), 5*time.Minute); err != nil {
+		t.Fatalf("cache Put on the degraded cache: %v", err)
 	}
-	if key, ok, err := d.cache.Get(ctx, id); err != nil || !ok || string(key) != "k" {
+	if key, ok, err := keyCache.Get(ctx, id); err != nil || !ok || string(key) != "k" {
 		t.Fatalf("cache Get = %q, %v, %v, want k true nil", key, ok, err)
 	}
-	if !d.cache.Degraded() {
+	if !keyCache.Degraded() {
 		t.Fatalf("the cache must report Degraded while the keybag stays locked")
 	}
-	if err := closer(ctx); err != nil {
+	if err := keyCache.Close(ctx); err != nil {
 		t.Fatalf("closer: %v", err)
 	}
-	if _, ok, _ := d.cache.Get(ctx, id); ok {
+	if _, ok, _ := keyCache.Get(ctx, id); ok {
 		t.Fatalf("cache not evicted on shutdown")
 	}
 	// The helper is touched only for newkey probes — the open probe plus the Put's
@@ -193,26 +192,24 @@ func TestBuildNoEnclaveStaysFatal(t *testing.T) {
 }
 
 // TestHandleAuthStatusLockedUnwrapRefusalReportsLocked reproduces the live incident over
-// the real cache: the daemon opens the Enclave key and caches a wrapped key while
-// unlocked, then the screen locks and cache-unwrap refuses the per-boot key (exit 3,
-// errSecInteractionNotAllowed). auth_status must return the structured locked reply —
-// authenticated:false, degraded:false (the cache opened healthy), locked:true — not
-// propagate the refusal as an RPC error the doctor would render FAIL.
+// the real cache: a wrapped key cached while unlocked, then the screen locks and
+// cache-unwrap refuses the per-boot key (exit 3). The refusal demotes the cache — the
+// two-way degrade — so auth_status reports authenticated:false, degraded:true,
+// locked:true instead of a raw RPC error.
 func TestHandleAuthStatusLockedUnwrapRefusalReportsLocked(t *testing.T) {
 	fakeMesh(t, "me@laptop")
 	binary := writeUnwrapRefusingHelper(t, 3, "keyhelper: SecKeyCreateDecryptedData failed: interaction not allowed (OSStatus -25308)")
 	ctx := context.Background()
 
-	wrapper, err := cache.OpenWrapper(ctx, helper.Bridge{Binary: binary})
+	keyCache, err := cache.Open(ctx, helper.Bridge{Binary: binary})
 	if err != nil {
-		t.Fatalf("OpenWrapper: %v", err)
+		t.Fatalf("Open: %v", err)
 	}
-	keyCache := cache.NewKeyCache(wrapper)
 	st := stateWith("me@laptop", "")
 	d := New(&fakeConsent{}, keyCache, nil, staticProbe(SessionSnapshot{OnConsole: true, Locked: true}), &recordingRunner{}, fixedState{st: st}, fixedState{st: st})
 
 	id := endpointID("me@laptop", "chrome", "Default")
-	if err := keyCache.Put(ctx, id, []byte("safe-storage-key"), 5*time.Minute); err != nil {
+	if _, err := keyCache.Put(ctx, id, []byte("safe-storage-key"), 5*time.Minute); err != nil {
 		t.Fatalf("Put a wrapped key while unlocked: %v", err)
 	}
 
@@ -220,8 +217,8 @@ func TestHandleAuthStatusLockedUnwrapRefusalReportsLocked(t *testing.T) {
 	if err != nil {
 		t.Fatalf("handleAuthStatus must swallow the locked-keybag refusal, got %v", err)
 	}
-	if marshalResult(t, got) != `{"authenticated":false,"degraded":false,"endpoint":"me@laptop:chrome:Default","keybag_locked":true}` {
-		t.Fatalf("auth_status = %s, want the structured locked reply", marshalResult(t, got))
+	if marshalResult(t, got) != `{"authenticated":false,"degraded":true,"endpoint":"me@laptop:chrome:Default","keybag_locked":true}` {
+		t.Fatalf("auth_status = %s, want the locked reply with the demoted cache degraded", marshalResult(t, got))
 	}
 }
 
@@ -257,15 +254,15 @@ esac
 
 // TestHandleAuthStatusBoundsWedgedProbeReportsLockedNote pins the fast path on the live
 // locked/screen-shared incident: the session probe wedges, but a status read must never
-// block the caller past its deadline. authStatusTimeout bounds the probe and a bounded-out
+// block the caller past its deadline. auth.StatusTimeout bounds the probe and a bounded-out
 // probe reports the host locked — the degraded+locked OK-with-note reply the doctor renders
 // healthy — rather than hanging into an i/o-timeout FAIL. Without the bound the handler
 // would block on the never-done background context and the watchdog would fire.
 func TestHandleAuthStatusBoundsWedgedProbeReportsLockedNote(t *testing.T) {
 	fakeMesh(t, "me@laptop")
-	restore := authStatusTimeout
-	authStatusTimeout = 20 * time.Millisecond
-	t.Cleanup(func() { authStatusTimeout = restore })
+	restore := auth.StatusTimeout
+	auth.StatusTimeout = 20 * time.Millisecond
+	t.Cleanup(func() { auth.StatusTimeout = restore })
 
 	// A probe that returns only when its context is cancelled — the wedged ioreg/netstat
 	// exec.CommandContext the bound kills and unblocks.
@@ -298,37 +295,36 @@ func TestHandleAuthStatusBoundsWedgedProbeReportsLockedNote(t *testing.T) {
 			t.Fatalf("auth_status = %s, want the degraded+locked note reply", marshalResult(t, r.got))
 		}
 		if elapsed := time.Since(start); elapsed > 2*time.Second {
-			t.Fatalf("handleAuthStatus took %v; authStatusTimeout must bound the probe near %v", elapsed, authStatusTimeout)
+			t.Fatalf("handleAuthStatus took %v; auth.StatusTimeout must bound the probe near %v", elapsed, auth.StatusTimeout)
 		}
 		if c.getCalls() != 0 {
 			t.Fatalf("cache Get called %d times after a probe timeout; the fallback must skip the cache read", c.getCalls())
 		}
 	case <-time.After(5 * time.Second):
-		t.Fatal("handleAuthStatus hung on a wedged probe; authStatusTimeout did not bound it")
+		t.Fatal("handleAuthStatus hung on a wedged probe; auth.StatusTimeout did not bound it")
 	}
 }
 
 // TestHandleAuthStatusBoundsWedgedUnwrapReportsLockedNote proves the cache read is bounded
 // too: the Enclave opened healthy and cached a key, then the screen locked and cache-unwrap
-// hangs (a helper round-trip with no deadline of its own). authStatusTimeout kills the
+// hangs (a helper round-trip with no deadline of its own). auth.StatusTimeout kills the
 // unwrap and the locked keybag is reported as the OK-with-note reply, not a FAIL.
 func TestHandleAuthStatusBoundsWedgedUnwrapReportsLockedNote(t *testing.T) {
 	fakeMesh(t, "me@laptop")
-	restore := authStatusTimeout
-	authStatusTimeout = 50 * time.Millisecond
-	t.Cleanup(func() { authStatusTimeout = restore })
+	restore := auth.StatusTimeout
+	auth.StatusTimeout = 50 * time.Millisecond
+	t.Cleanup(func() { auth.StatusTimeout = restore })
 
 	ctx := context.Background()
-	wrapper, err := cache.OpenWrapper(ctx, helper.Bridge{Binary: writeHangingUnwrapHelper(t)})
+	keyCache, err := cache.Open(ctx, helper.Bridge{Binary: writeHangingUnwrapHelper(t)})
 	if err != nil {
-		t.Fatalf("OpenWrapper: %v", err)
+		t.Fatalf("Open: %v", err)
 	}
-	keyCache := cache.NewKeyCache(wrapper)
 	st := stateWith("me@laptop", "")
 	d := New(&fakeConsent{}, keyCache, nil, staticProbe(SessionSnapshot{OnConsole: true, Locked: true}), &recordingRunner{}, fixedState{st: st}, fixedState{st: st})
 
 	id := endpointID("me@laptop", "chrome", "Default")
-	if err := keyCache.Put(ctx, id, []byte("safe-storage-key"), 5*time.Minute); err != nil {
+	if _, err := keyCache.Put(ctx, id, []byte("safe-storage-key"), 5*time.Minute); err != nil {
 		t.Fatalf("Put a wrapped key while unlocked: %v", err)
 	}
 
@@ -348,10 +344,10 @@ func TestHandleAuthStatusBoundsWedgedUnwrapReportsLockedNote(t *testing.T) {
 			t.Fatalf("auth_status = %s, want the locked note reply", marshalResult(t, got))
 		}
 		if elapsed := time.Since(start); elapsed > 2*time.Second {
-			t.Fatalf("handleAuthStatus took %v; authStatusTimeout must bound the unwrap", elapsed)
+			t.Fatalf("handleAuthStatus took %v; auth.StatusTimeout must bound the unwrap", elapsed)
 		}
 	case <-time.After(5 * time.Second):
-		t.Fatal("handleAuthStatus hung on a wedged cache-unwrap; authStatusTimeout did not bound it")
+		t.Fatal("handleAuthStatus hung on a wedged cache-unwrap; auth.StatusTimeout did not bound it")
 	}
 }
 
@@ -385,8 +381,8 @@ esac
 }
 
 // writeBlockingHealHelper writes a fake cookiesync-keyhelper whose first cache-newkey
-// (the OpenWrapper probe) exits 3 to degrade, and whose next cache-newkey (a KeyCache
-// heal) appends to tallyPath then parks until releasePath exists — a heal wedged in its
+// (the Open probe) exits 3 to degrade, and whose next cache-newkey (a KeyCache heal)
+// appends to tallyPath then parks until releasePath exists — a heal wedged in its
 // presence prompt, so a test can drive auth_status against a cache mid-heal.
 func writeBlockingHealHelper(t *testing.T) (binary, tallyPath, releasePath string) {
 	t.Helper()
@@ -419,23 +415,28 @@ esac
 
 // TestHandleAuthStatusReturnsWhileAHealIsMidFlight proves the A1 lock split at the daemon
 // boundary: with a Put's heal parked in cache-newkey (its presence prompt), a status read
-// still returns within authStatusTimeout because the heal no longer holds the wrapper lock
+// still returns within auth.StatusTimeout because the heal no longer holds the wrapper lock
 // the read's Degraded check takes.
 func TestHandleAuthStatusReturnsWhileAHealIsMidFlight(t *testing.T) {
 	fakeMesh(t, "me@laptop")
 	binary, tallyPath, releasePath := writeBlockingHealHelper(t)
-	wrapper, err := cache.OpenWrapper(context.Background(), helper.Bridge{Binary: binary})
-	if !errors.Is(err, cache.ErrSEPresenceUnavailable) {
-		t.Fatalf("OpenWrapper err = %v, want ErrSEPresenceUnavailable", err)
+	keyCache, err := cache.Open(context.Background(), helper.Bridge{Binary: binary})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
 	}
-	keyCache := cache.NewKeyCache(wrapper)
+	if !keyCache.Degraded() {
+		t.Fatalf("Open over a presence-refusing helper must degrade")
+	}
 	st := stateWith("me@laptop", "")
 	d := New(&fakeConsent{}, keyCache, nil, staticProbe(SessionSnapshot{}), &recordingRunner{}, fixedState{st: st}, fixedState{st: st})
-	d.probeKeybag = staticProbe(liveSession(currentUser(t)))
+	d.broker.KeybagProbe = staticProbe(liveSession(currentUser(t)))
 
 	id := endpointID("me@laptop", "chrome", "Default")
 	putDone := make(chan error, 1)
-	go func() { putDone <- keyCache.Put(context.Background(), id, []byte("k"), 5*time.Minute) }()
+	go func() {
+		_, err := keyCache.Put(context.Background(), id, []byte("k"), 5*time.Minute)
+		putDone <- err
+	}()
 	t.Cleanup(func() {
 		_ = os.WriteFile(releasePath, nil, 0o600)
 		<-putDone
@@ -463,8 +464,8 @@ func TestHandleAuthStatusReturnsWhileAHealIsMidFlight(t *testing.T) {
 	}()
 	select {
 	case <-done:
-		if elapsed := time.Since(start); elapsed > authStatusTimeout {
-			t.Fatalf("handleAuthStatus took %v with a heal mid-flight; the read must stay off the heal lock (bound %v)", elapsed, authStatusTimeout)
+		if elapsed := time.Since(start); elapsed > auth.StatusTimeout {
+			t.Fatalf("handleAuthStatus took %v with a heal mid-flight; the read must stay off the heal lock (bound %v)", elapsed, auth.StatusTimeout)
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("handleAuthStatus hung with a heal mid-flight")
@@ -491,7 +492,7 @@ func TestHandleAuthStatusUsesKeybagProbeNotTheFullProbe(t *testing.T) {
 		return snap, nil
 	}
 	d := New(&fakeConsent{}, newFakeCache(), nil, fullProbe, &recordingRunner{}, fixedState{st: st}, fixedState{st: st})
-	d.probeKeybag = keybagProbe
+	d.broker.KeybagProbe = keybagProbe
 
 	got, err := d.handleAuthStatus(context.Background(), map[string]any{"browser": "chrome"})
 	if err != nil {
@@ -517,7 +518,7 @@ func TestWhoamiReadsScreenShareFromTheFullProbe(t *testing.T) {
 	full.ScreenShared = true
 	d := New(&fakeConsent{}, newFakeCache(), nil, staticProbe(full), &recordingRunner{}, fixedState{st: st}, fixedState{st: st})
 	// A keybag probe with no screen-share signal; whoami must not read it.
-	d.probeKeybag = staticProbe(liveSession(me))
+	d.broker.KeybagProbe = staticProbe(liveSession(me))
 
 	got, err := d.handleWhoami(context.Background(), map[string]any{})
 	if err != nil {
@@ -529,20 +530,20 @@ func TestWhoamiReadsScreenShareFromTheFullProbe(t *testing.T) {
 }
 
 // TestHandleAuthStatusMasksBoundedCacheReadAfterUnlockedProbe proves the masking fix: an
-// unlocked keybag probe followed by a cache read that outruns authStatusTimeout reports
+// unlocked keybag probe followed by a cache read that outruns auth.StatusTimeout reports
 // degraded:true, authenticated:false, and keybag_locked:false — not a forced lock and not
 // a raw RPC error.
 func TestHandleAuthStatusMasksBoundedCacheReadAfterUnlockedProbe(t *testing.T) {
 	fakeMesh(t, "me@laptop")
-	restore := authStatusTimeout
-	authStatusTimeout = 30 * time.Millisecond
-	t.Cleanup(func() { authStatusTimeout = restore })
+	restore := auth.StatusTimeout
+	auth.StatusTimeout = 30 * time.Millisecond
+	t.Cleanup(func() { auth.StatusTimeout = restore })
 
 	st := stateWith("me@laptop", "")
 	c := &blockingGetCache{fakeCache: newFakeCache()}
 	c.degraded = true
 	d := New(&fakeConsent{}, c, nil, staticProbe(SessionSnapshot{}), &recordingRunner{}, fixedState{st: st}, fixedState{st: st})
-	d.probeKeybag = staticProbe(liveSession(currentUser(t)))
+	d.broker.KeybagProbe = staticProbe(liveSession(currentUser(t)))
 
 	done := make(chan any, 1)
 	start := time.Now()
@@ -559,7 +560,7 @@ func TestHandleAuthStatusMasksBoundedCacheReadAfterUnlockedProbe(t *testing.T) {
 			t.Fatalf("auth_status = %s, want %s", marshalResult(t, got), want)
 		}
 		if elapsed := time.Since(start); elapsed > 2*time.Second {
-			t.Fatalf("handleAuthStatus took %v; authStatusTimeout must bound the read", elapsed)
+			t.Fatalf("handleAuthStatus took %v; auth.StatusTimeout must bound the read", elapsed)
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("handleAuthStatus hung on a blocking cache read")

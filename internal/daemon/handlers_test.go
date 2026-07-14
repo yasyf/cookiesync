@@ -8,8 +8,8 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
-	"github.com/yasyf/cookiesync/internal/cache"
 	"github.com/yasyf/cookiesync/internal/cookie"
 	"github.com/yasyf/cookiesync/internal/state"
 )
@@ -30,6 +30,81 @@ func marshalResult(t *testing.T, v any) string {
 		t.Fatalf("marshal result: %v", err)
 	}
 	return string(data)
+}
+
+// TestRenderLocalKeyWarningClassifiesFailures pins the distinct operator guidance for
+// retryable, declined, and fatal local release outcomes.
+func TestRenderLocalKeyWarningClassifiesFailures(t *testing.T) {
+	endpoint := "me@laptop:chrome:Default"
+	tests := []struct {
+		name string
+		err  error
+		want string
+	}{
+		{
+			name: "unavailable",
+			err:  &AuthRequired{Msg: "no live approver"},
+			want: "skip cold me@laptop:chrome:Default: run cookiesync auth (no live approver)",
+		},
+		{
+			name: "denied",
+			err:  &cookie.ConsentError{Msg: "user declined"},
+			want: "skip cold me@laptop:chrome:Default: consent declined (user declined)",
+		},
+		{
+			name: "fatal",
+			err:  errors.New("unknown browser"),
+			want: "skip cold me@laptop:chrome:Default: unknown browser",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := renderLocalKeyWarning(endpoint, tc.err); got != tc.want {
+				t.Fatalf("renderLocalKeyWarning() = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+type countingStateLoader struct {
+	st    *state.State
+	loads int
+}
+
+func (s *countingStateLoader) Load(context.Context) (*state.State, error) {
+	s.loads++
+	return s.st, nil
+}
+
+// TestGetCookiesAllUsesOneStateSnapshot proves the endpoint list and local key sweep
+// consume the same state load instead of observing two independently loaded snapshots.
+func TestGetCookiesAllUsesOneStateSnapshot(t *testing.T) {
+	ctx := context.Background()
+	browser := chromeStoreUnderHome(t)
+	key := cookie.DeriveKey(cookie.SafeStorageKey("peanuts"))
+	seed := []cookie.Cookie{{HostKey: "x.com", Name: "sid", Value: "abc", Path: "/", LastUpdateUTC: 13_350_000_000_000_000, SameSite: 2, IsSecure: true, SourceScheme: 2, SourcePort: 443}}
+	if _, err := cookie.Apply(ctx, seed, browser, "Default", key); err != nil {
+		t.Fatalf("seed apply: %v", err)
+	}
+
+	self := "me@laptop"
+	fakeMesh(t, self)
+	loader := &countingStateLoader{st: stateWith(self, "", stateEndpoint(self, "chrome", "Default"))}
+	cache := newFakeCache()
+	d := New(&fakeConsent{key: key}, cache, nil, staticProbe(SessionSnapshot{}), &recordingRunner{}, loader, fixedState{st: loader.st})
+	_, _ = cache.Put(ctx, endpointID(self, "chrome", "Default"), []byte(key), 0)
+	d.grant("local", []cookie.BrowserName{"chrome"}, time.Hour)
+
+	got, err := d.handleGetCookies(ctx, map[string]any{"url": "https://x.com/"})
+	if err != nil {
+		t.Fatalf("handleGetCookies union: %v", err)
+	}
+	if loader.loads != 1 {
+		t.Fatalf("state loads = %d, want one shared snapshot", loader.loads)
+	}
+	if cookies := wireCookieNames(t, got); cookies["sid"].Value != "abc" {
+		t.Fatalf("union cookies = %+v, want sid=abc", cookies)
+	}
 }
 
 // TestHandleWhoamiWireShape proves whoami emits exactly the frozen
@@ -71,14 +146,25 @@ func TestHandleWhoamiWireShape(t *testing.T) {
 	}
 }
 
+// TestSessionSummaryNullsConsoleUserWhenHeadless proves the whoami summary maps an
+// absent console user to a JSON null (a nil any), not an empty string.
+func TestSessionSummaryNullsConsoleUserWhenHeadless(t *testing.T) {
+	got, err := sessionSummary(context.Background(), staticProbe(SessionSnapshot{OnConsole: false}))
+	if err != nil {
+		t.Fatalf("sessionSummary: %v", err)
+	}
+	if got["console_user"] != nil {
+		t.Fatalf("console_user = %v, want nil", got["console_user"])
+	}
+}
+
 // TestHandleAuthStatusWireShape proves auth_status reports cache warmth, degradation, and
 // keybag availability under the frozen {"endpoint", "authenticated", "degraded", "locked"}
 // shape (alphabetical keys): authenticated once a key is cached, degraded over a
 // memory-wrapped cache, and locked whenever the daemon user's keybag is unavailable — the
 // screen locked, no console session, or another user on console via fast user switching.
-// The incident rows: a warm key whose cache-unwrap refuses (ErrSEPresenceUnavailable)
-// while the keybag is unavailable reports authenticated:false with no error, across a
-// locked screen, fast user switching, and a session-absent console alike.
+// A presence-refused unwrap is a plain cache miss now (the cache demotes itself), so the
+// incident surface is the cold degraded rows.
 func TestHandleAuthStatusWireShape(t *testing.T) {
 	fakeMesh(t, "me@laptop")
 	st := stateWith("me@laptop", "")
@@ -92,7 +178,6 @@ func TestHandleAuthStatusWireShape(t *testing.T) {
 		name     string
 		warm     bool
 		degraded bool
-		getErr   error
 		snap     SessionSnapshot
 		want     string
 	}{
@@ -127,34 +212,24 @@ func TestHandleAuthStatusWireShape(t *testing.T) {
 			want:     `{"authenticated":false,"degraded":true,"endpoint":"me@laptop:chrome:Default","keybag_locked":true}`,
 		},
 		{
-			name:   "locked screen unwrap refused reports unauthenticated without error",
-			warm:   true,
-			getErr: cache.ErrSEPresenceUnavailable,
-			snap:   lockedScreen,
-			want:   `{"authenticated":false,"degraded":false,"endpoint":"me@laptop:chrome:Default","keybag_locked":true}`,
+			name:     "cold degraded fast user switching",
+			degraded: true,
+			snap:     otherUser,
+			want:     `{"authenticated":false,"degraded":true,"endpoint":"me@laptop:chrome:Default","keybag_locked":true}`,
 		},
 		{
-			name:   "fast user switching unwrap refused reports locked without error",
-			warm:   true,
-			getErr: cache.ErrSEPresenceUnavailable,
-			snap:   otherUser,
-			want:   `{"authenticated":false,"degraded":false,"endpoint":"me@laptop:chrome:Default","keybag_locked":true}`,
-		},
-		{
-			name:   "session-absent unwrap refused reports locked without error",
-			warm:   true,
-			getErr: cache.ErrSEPresenceUnavailable,
-			snap:   SessionSnapshot{},
-			want:   `{"authenticated":false,"degraded":false,"endpoint":"me@laptop:chrome:Default","keybag_locked":true}`,
+			name:     "cold degraded session-absent console",
+			degraded: true,
+			snap:     SessionSnapshot{},
+			want:     `{"authenticated":false,"degraded":true,"endpoint":"me@laptop:chrome:Default","keybag_locked":true}`,
 		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			c := newFakeCache()
 			c.degraded = tc.degraded
-			c.getErr = tc.getErr
 			if tc.warm {
-				_ = c.Put(context.Background(), id, []byte("k"), 0)
+				_, _ = c.Put(context.Background(), id, []byte("k"), 0)
 			}
 			d := New(&fakeConsent{}, c, nil, staticProbe(tc.snap), &recordingRunner{}, fixedState{st: st}, fixedState{st: st})
 			got, err := d.handleAuthStatus(context.Background(), map[string]any{"browser": "chrome"})
@@ -168,10 +243,9 @@ func TestHandleAuthStatusWireShape(t *testing.T) {
 	}
 }
 
-// TestHandleAuthStatusPropagatesGetErrors proves the swallow is narrow: only a presence
-// refusal while the keybag is unavailable is reported as unauthenticated. A presence
-// sentinel on an attended console (this user, unlocked — a genuinely broken key) and any
-// non-presence error while locked both propagate raw.
+// TestHandleAuthStatusPropagatesGetErrors proves the swallow is narrow: only a read
+// that outran authStatusTimeout is reported as unauthenticated; any real Get error
+// propagates raw, attended or locked alike.
 func TestHandleAuthStatusPropagatesGetErrors(t *testing.T) {
 	fakeMesh(t, "me@laptop")
 	st := stateWith("me@laptop", "")
@@ -184,8 +258,8 @@ func TestHandleAuthStatusPropagatesGetErrors(t *testing.T) {
 		snap   SessionSnapshot
 	}{
 		{
-			name:   "presence sentinel while attended propagates",
-			getErr: cache.ErrSEPresenceUnavailable,
+			name:   "plain error while attended propagates",
+			getErr: plain,
 			snap:   liveSession(me),
 		},
 		{
@@ -803,5 +877,26 @@ func TestPrimeAuthAllZeroLocalEndpointsFailsClosed(t *testing.T) {
 	var authErr *AuthRequired
 	if !errors.As(err, &authErr) {
 		t.Fatalf("all-mode prime with zero local endpoints = %v, want *AuthRequired", err)
+	}
+}
+
+// TestPrimeAuthAllStaleRescanFailsClosed proves the verification backstop: when every
+// release succeeds but a demote staleifies the cache before the final rescan, the
+// all-mode prime fails closed with AuthRequired — never an empty {"primed": true}.
+func TestPrimeAuthAllStaleRescanFailsClosed(t *testing.T) {
+	self := "me@laptop"
+	fakeMesh(t, self)
+	st := stateWith(self, "", stateEndpoint(self, "chrome", "Default"))
+	consent := &fakeConsent{key: cookie.DeriveKey(cookie.SafeStorageKey("peanuts"))}
+	cache := &staleRescanCache{fakeCache: newFakeCache()}
+	d := New(consent, cache, nil, staticProbe(liveSession(currentUser(t))), &recordingRunner{}, fixedState{st: st}, fixedState{st: st})
+
+	got, err := d.handlePrimeAuth(context.Background(), map[string]any{})
+	var authErr *AuthRequired
+	if !errors.As(err, &authErr) {
+		t.Fatalf("all-mode prime with a stale rescan = %v, %v, want *AuthRequired", got, err)
+	}
+	if cache.putCalls() == 0 {
+		t.Fatalf("the release must have cached keys before the rescan went stale")
 	}
 }

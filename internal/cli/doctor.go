@@ -30,8 +30,8 @@ type check struct {
 	detail string
 }
 
-// doctorEnv is the set of probes the doctor runs, each returning one check. It is the
-// seam tests inject a fake environment through so doctor runs without a signed helper,
+// doctorEnv is the set of probes the doctor runs. The TCC probe may be inapplicable; all
+// others return one check. Tests inject this seam so doctor runs without a signed helper,
 // a live helper, or a registered mesh. The zero value is not usable; build it with
 // realDoctorEnv.
 type doctorEnv struct {
@@ -39,6 +39,7 @@ type doctorEnv struct {
 	socket   func(ctx context.Context) check
 	keyCache func(ctx context.Context) check
 	mesh     func(ctx context.Context) check
+	tcc      func(ctx context.Context) (check, bool)
 	manifest func(ctx context.Context) check
 	state    func(ctx context.Context) check
 	tracked  func(ctx context.Context) check
@@ -46,15 +47,20 @@ type doctorEnv struct {
 
 // checks runs every probe in a fixed order so the report is deterministic.
 func (e doctorEnv) checks(ctx context.Context) []check {
-	return []check{
+	checks := []check{
 		e.helper(ctx),
 		e.socket(ctx),
 		e.keyCache(ctx),
 		e.mesh(ctx),
+	}
+	if tcc, ok := e.tcc(ctx); ok {
+		checks = append(checks, tcc)
+	}
+	return append(checks,
 		e.manifest(ctx),
 		e.state(ctx),
 		e.tracked(ctx),
-	}
+	)
 }
 
 func newDoctorCmd() *cobra.Command {
@@ -96,6 +102,9 @@ func realDoctorEnv() doctorEnv {
 		socket:   checkSocket,
 		keyCache: checkKeyCache,
 		mesh:     checkMesh,
+		tcc: func(ctx context.Context) (check, bool) {
+			return checkTCC(ctx, mesh.Resolve)
+		},
 		manifest: checkManifest,
 		state:    checkState,
 		tracked:  checkTracked,
@@ -152,10 +161,9 @@ type keyCacheStatus struct {
 	Locked   bool `json:"keybag_locked"`
 }
 
-// checkKeyCache confirms the resident daemon's key cache is Secure-Enclave wrapped, not
-// degraded to plain process memory because the keybag was locked when the daemon started.
-// The flags are cache-global, so the probe reads them off auth_status for the default
-// chrome endpoint — the endpoint itself is immaterial — and keyCacheCheck renders them.
+// checkKeyCache confirms the resident daemon's current key-cache wrapping state. The
+// flags are cache-global, so the probe reads them off auth_status for the default chrome
+// endpoint — the endpoint itself is immaterial — and keyCacheCheck renders them.
 func checkKeyCache(ctx context.Context) check {
 	probeCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
@@ -167,16 +175,15 @@ func checkKeyCache(ctx context.Context) check {
 }
 
 // keyCacheCheck renders the key-cache health line from the daemon's degradation and
-// keybag-availability flags. A locked keybag is a healthy state: an Enclave wrap that is
-// unavailable until it unlocks, or an in-memory degradation that re-primes Enclave-wrapped
-// on the first prime after it unlocks. Only a degradation while the keybag is available is
-// a genuine FAIL.
+// keybag-availability flags. The cache may demote and re-heal during the daemon's life. A
+// locked keybag makes either state expected; only an in-memory cache while the keybag is
+// available is a genuine FAIL.
 func keyCacheCheck(status keyCacheStatus) check {
 	switch {
 	case status.Degraded && status.Locked:
-		return check{label: "key cache", ok: true, detail: "in process memory (keybag locked at daemon start; re-primes Secure-Enclave wrapped on the first prime after it unlocks)"}
+		return check{label: "key cache", ok: true, detail: "in process memory (keybag locked; re-heals Secure-Enclave wrapped on the next authorization)"}
 	case status.Degraded:
-		return check{label: "key cache", detail: "degraded: Secure Enclave presence was unavailable at daemon start; run 'cookiesync auth' to re-prime"}
+		return check{label: "key cache", detail: "degraded after a Secure Enclave presence refusal; run 'cookiesync auth' to re-prime"}
 	case status.Locked:
 		return check{label: "key cache", ok: true, detail: "Secure-Enclave wrapped (keybag locked: screen locked or session away)"}
 	default:
@@ -193,6 +200,20 @@ func checkMesh(ctx context.Context) check {
 		return check{label: "mesh", detail: err.Error()}
 	}
 	return check{label: "mesh", ok: true, detail: fmt.Sprintf("self %s", self)}
+}
+
+// checkTCC emits an informational peer-access pointer when cross-host pulls apply. It
+// never fails because a TCC denial cannot be confirmed without Full Disk Access.
+func checkTCC(ctx context.Context, resolve func(context.Context) (string, []string, error)) (check, bool) {
+	_, peers, err := resolve(ctx)
+	if err != nil || len(peers) == 0 {
+		return check{}, false
+	}
+	return check{
+		label:  "peer TCC",
+		ok:     true,
+		detail: "cross-host pulls use ssh; if this host times out pulling from a peer, check Full Disk Access for the peer's ssh identity (sshd or tailscaled)",
+	}, true
 }
 
 // checkManifest confirms cookiesync's synckit manifest is registered AND validates

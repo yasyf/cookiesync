@@ -10,12 +10,11 @@ import (
 	"sync"
 	"time"
 
-	"github.com/yasyf/cookiesync/internal/cache"
+	"github.com/yasyf/cookiesync/internal/auth"
 	"github.com/yasyf/cookiesync/internal/cookie"
 	"github.com/yasyf/cookiesync/internal/engine"
 	"github.com/yasyf/cookiesync/internal/state"
 	"github.com/yasyf/synckit/hostregistry"
-	synckit "github.com/yasyf/synckit/rpc"
 )
 
 // unionSSHConcurrency bounds the concurrent ssh dials getCookiesAll's remote leg makes,
@@ -24,63 +23,21 @@ const unionSSHConcurrency = 4
 
 // unionReadTimeout bounds one peer's get_cookies leg in the browser-less union read; the
 // union is a background data-plane read — a wedged peer costs seconds, never the consent
-// window, because the peer's own release flight is detached (primeAuth runs it under
+// window, because the peer's own release flight is detached (the broker runs it under
 // context.WithoutCancel), so a Touch ID sheet pending there survives the killed ssh and
 // the next union pull rides the resulting grant. Mirrors engine's fetchTimeout. A var so
 // tests shrink it.
 var unionReadTimeout = 15 * time.Second
 
-// authStatusTimeout bounds the session probe and cache read behind a status query. A
-// client deadline does not cross the socket (the dispatcher runs the handler for minutes),
-// so a wedged probe or a locked-keybag helper round-trip would block the doctor's 2s read
-// into an i/o-timeout FAIL. On the bound the host is reported locked — data the doctor
-// renders OK-with-note, not an error. Under the doctor's 2s so the reply lands first; a var
-// so tests shrink it.
-var authStatusTimeout = 1500 * time.Millisecond
+// brokerKeys adapts the broker's grant-blind cached-key read to the engine's
+// KeyCache seam, so the extract/apply data plane reads keys without reaching
+// the release machinery.
+type brokerKeys struct {
+	broker *auth.Broker
+}
 
-// errAuthStatusTimeout is the cause the status read stamps on its own deadline, so a probe
-// or unwrap that outran authStatusTimeout is told apart from a parent cancel or an earlier
-// parent deadline via context.Cause — only the former reports the host locked.
-var errAuthStatusTimeout = errors.New("auth_status probe/read exceeded authStatusTimeout")
-
-// releaseMode selects whether a release derives the routed/local consent split or is
-// pinned to a local terminus. A local prime walks the full ladder — hard consent route,
-// local Touch ID, routed fallback — deriving the routed/local split once inside the
-// flight (routesConsent), so every console release shares one routing rule and a
-// mid-call presence flip cannot split one requestor's prompts across two flights. An
-// approver prime (an inbound request_consent) is the routed gate's terminus: it only
-// ever releases locally, so routedRelease is structurally unreachable and a 3+ mesh can
-// never loop an approval back out.
-type releaseMode string
-
-const (
-	releaseLocal    releaseMode = "local"
-	releaseApprover releaseMode = "approver"
-)
-
-// consentSurface identifies which presence gate a release flight actually used: none
-// (served from a warm cache inside a live grant), a local Touch ID evaluation, or a
-// routed peer approval. A caller that sequences multiple primes keys its loop off each
-// flight's actual surface — never a call-start routing snapshot, which a mid-call
-// presence flip could stale out into a second sheet or a surprise route.
-type consentSurface int
-
-const (
-	surfaceNone consentSurface = iota
-	surfaceLocal
-	surfaceRouted
-)
-
-// batchResult is one batchFlight flight's outcome: the per-browser outcome for every
-// browser the flight evaluated — read-only to waiters — the TTL its released keys
-// were cached under, and the consent surface the flight actually used. Carrying the
-// whole outcome, not just the successes, lets a waiter for a distinct endpoint of a
-// covered browser tell a covered-but-errored result (its key failed) from a genuinely
-// uncovered one (re-lead its own flight).
-type batchResult struct {
-	outcomes map[cookie.BrowserName]cookie.KeyOutcome
-	ttl      time.Duration
-	surface  consentSurface
+func (k brokerKeys) Get(ctx context.Context, endpointID string) ([]byte, bool, error) {
+	return k.broker.CachedKey(ctx, endpointID)
 }
 
 // handleSync converges the union of every tracked endpoint, suppressing the origin
@@ -162,10 +119,11 @@ func (d *Daemon) handleExtract(ctx context.Context, params map[string]any) (any,
 	if err != nil {
 		return nil, err
 	}
-	if _, _, err := d.primeAuth(ctx, peerRequestor(ctx, params), browser, profile, consentReason, releaseLocal); err != nil {
+	req := auth.Req{Requestor: peerRequestor(ctx, params), Browser: browser, Profile: profile, Reason: consentReason, Mode: auth.ModeLocal}
+	if _, _, err := d.broker.Key(ctx, req); err != nil {
 		return nil, err
 	}
-	extracted, err := engine.NewCachedKeySource(d.cache, self).Extract(ctx, browser, profile)
+	extracted, err := engine.NewCachedKeySource(brokerKeys{d.broker}, self).Extract(ctx, browser, profile)
 	if err != nil {
 		return nil, err
 	}
@@ -195,7 +153,7 @@ func (d *Daemon) handleApply(ctx context.Context, params map[string]any) (any, e
 	id := endpointID(self, browser, profile)
 	defer d.engine.ApplyLock(id).Unlock()
 	d.engine.Recorder().RecordApplied(id, cookie.LogicalDigest(cookies))
-	applied, err := engine.NewCachedKeySource(d.cache, self).Apply(ctx, browser, profile, cookies)
+	applied, err := engine.NewCachedKeySource(brokerKeys{d.broker}, self).Apply(ctx, browser, profile, cookies)
 	if err != nil {
 		return nil, err
 	}
@@ -208,11 +166,32 @@ func (d *Daemon) handleWhoami(ctx context.Context, _ map[string]any) (any, error
 	return sessionSummary(ctx, d.probe)
 }
 
-// handlePrimeAuth obtains the Safe Storage key and caches it under the endpoint TTL. With
-// a "browser" param it primes that one endpoint — behind one Touch ID tap when a session
-// is live, else by routing the gate to the active peer — and emits the frozen
-// {"primed": true, "endpoint": str}. With no "browser" it primes every registered local
-// browser via primeAuthAll, emitting {"primed": true, "endpoints": [...], "warnings": [...]}.
+// sessionSummary is this host's console session state shaped for the whoami RPC,
+// byte-for-byte the Python session_summary. console_user is null (a nil any) when no
+// GUI session is attached.
+func sessionSummary(ctx context.Context, probe Probe) (map[string]any, error) {
+	snapshot, err := probe(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var consoleUser any
+	if snapshot.ConsoleUser != "" {
+		consoleUser = snapshot.ConsoleUser
+	}
+	return map[string]any{
+		"on_console":    snapshot.OnConsole,
+		"locked":        snapshot.Locked,
+		"console_user":  consoleUser,
+		"screen_shared": snapshot.ScreenShared,
+	}, nil
+}
+
+// handlePrimeAuth obtains the Safe Storage key and caches it under the endpoint TTL.
+// With a "browser" param it primes that one endpoint via the broker — behind one Touch
+// ID tap when a session is live, else by routing the gate to the active peer — and
+// emits the frozen {"primed": true, "endpoint": str}. With no "browser" it primes every
+// registered local browser via LocalKeys(PrimeAll), emitting
+// {"primed": true, "endpoints": [...], "warnings": [...]}.
 func (d *Daemon) handlePrimeAuth(ctx context.Context, params map[string]any) (any, error) {
 	reason := optionalString(params, "reason", consentReason)
 	browser := optionalString(params, "browser", "")
@@ -220,7 +199,8 @@ func (d *Daemon) handlePrimeAuth(ctx context.Context, params map[string]any) (an
 		return d.primeAuthAll(ctx, requestorID(ctx, params), reason)
 	}
 	profile := optionalString(params, "profile", defaultProfile)
-	if _, _, err := d.primeAuth(ctx, requestorID(ctx, params), browser, profile, reason, releaseLocal); err != nil {
+	req := auth.Req{Requestor: requestorID(ctx, params), Browser: browser, Profile: profile, Reason: reason, Mode: auth.ModeLocal}
+	if _, _, err := d.broker.Key(ctx, req); err != nil {
 		return nil, err
 	}
 	self, err := meshSelf(ctx)
@@ -230,112 +210,23 @@ func (d *Daemon) handlePrimeAuth(ctx context.Context, params map[string]any) (an
 	return map[string]any{"primed": true, "endpoint": endpointID(self, browser, profile)}, nil
 }
 
-// primeAuthAll primes every registered local browser behind at most one Touch ID sheet,
-// looping the single-browser primeAuth over the distinct local browsers in sorted order.
-// A live session leads one batch flight whose releaseAllLocal covers every tracked local
-// browser, so any browser still cold after it was Missing or denied in that batch —
-// surfaced as a warning, never a second sheet. A cold session routes consent per browser
-// to a live peer (decision 1), caching each routed key under all of that browser's
-// tracked local endpoint ids, since every profile of a browser shares its Safe Storage
-// key. Zero tracked local browsers fails closed with AuthRequired — the CLI
-// auto-registers before calling, so this is the backstop; a loop that primes nothing
-// returns the first underlying error. Emits {"primed": true, "endpoints": [sorted ids],
-// "warnings": [...]}.
+// primeAuthAll renders the browser-less prime_auth reply from a PrimeAll broker
+// sweep: a warning per skipped or failed browser, the verified-warm endpoint ids
+// sorted, the frozen {"primed": true, "endpoints": [...], "warnings": [...]}.
 func (d *Daemon) primeAuthAll(ctx context.Context, requestor, reason string) (map[string]any, error) {
-	self, err := meshSelf(ctx)
+	outcomes, err := d.broker.LocalKeys(ctx, requestor, reason, auth.PrimeAll)
 	if err != nil {
 		return nil, err
 	}
-	st, err := d.state.Load(ctx)
-	if err != nil {
-		return nil, err
-	}
-	locals := make([]state.Endpoint, 0)
-	for _, ep := range st.Endpoints() {
-		if ep.Host == self {
-			locals = append(locals, ep)
+	var endpoints, warnings []string
+	for _, oc := range outcomes {
+		switch {
+		case oc.Skipped:
+			warnings = append(warnings, fmt.Sprintf("skip %s: not released by the one-tap batch (missing or denied)", oc.Browser))
+		case oc.Err != nil:
+			warnings = append(warnings, fmt.Sprintf("skip %s: %v", oc.Browser, oc.Err))
 		}
-	}
-	if len(locals) == 0 {
-		return nil, &AuthRequired{Msg: "no local browsers are tracked; run cookiesync browser add"}
-	}
-	sort.Slice(locals, func(i, j int) bool { return locals[i].ID() < locals[j].ID() })
-
-	// Distinct browsers in id-sorted order (each with its first tracked profile) plus
-	// every browser's full set of tracked local endpoint ids — all profiles of a browser
-	// share one key, so a routed prime bulk-caches the others and the final scan reports
-	// them all.
-	type browserPrime struct{ browser, profile string }
-	var order []browserPrime
-	idsByBrowser := map[string][]string{}
-	for _, ep := range locals {
-		if _, seen := idsByBrowser[ep.Browser]; !seen {
-			order = append(order, browserPrime{browser: ep.Browser, profile: ep.Profile})
-		}
-		idsByBrowser[ep.Browser] = append(idsByBrowser[ep.Browser], string(ep.ID()))
-	}
-
-	// Each per-browser prime derives the routed/local split inside its own unified
-	// flight, and the loop keys off each flight's ACTUAL consent surface — never a
-	// call-start snapshot a mid-call presence flip could stale out. A cold host routes
-	// every browser to a live peer (one routed tap each, the routed key bulk-cached
-	// under the browser's other tracked profiles); the first flight that evaluates
-	// consent locally covers the whole tracked batch behind one sheet, so every later
-	// browser rides that grant and anything still cold after it (Missing or denied) is
-	// a fail-closed skip — a flip never costs a second sheet or a surprise route.
-	var warnings []string
-	var firstErr error
-	prompted := false
-	for _, bp := range order {
-		id := endpointID(self, bp.browser, bp.profile)
-		_, warm, err := d.cache.Get(ctx, id)
-		if err != nil {
-			return nil, err
-		}
-		if warm && d.granted(requestor, cookie.BrowserName(bp.browser)) {
-			continue
-		}
-		if prompted {
-			warnings = append(warnings, fmt.Sprintf("skip %s: not released by the one-tap batch (missing or denied)", bp.browser))
-			continue
-		}
-		key, surface, err := d.primeAuth(ctx, requestor, bp.browser, bp.profile, reason, releaseLocal)
-		if surface == surfaceLocal {
-			prompted = true
-		}
-		if err != nil {
-			if firstErr == nil {
-				firstErr = err
-			}
-			warnings = append(warnings, fmt.Sprintf("skip %s: %v", bp.browser, err))
-			continue
-		}
-		if surface == surfaceRouted {
-			ttl := d.effectiveTTL(st.Settings.AuthTTL)
-			for _, other := range idsByBrowser[bp.browser] {
-				if other == id {
-					continue
-				}
-				if err := d.cache.Put(ctx, other, []byte(key), ttl); err != nil {
-					return nil, err
-				}
-			}
-		}
-	}
-
-	endpoints := make([]string, 0, len(locals))
-	for _, ep := range locals {
-		id := string(ep.ID())
-		_, warm, err := d.cache.Get(ctx, id)
-		if err != nil {
-			return nil, err
-		}
-		if warm {
-			endpoints = append(endpoints, id)
-		}
-	}
-	if len(endpoints) == 0 {
-		return nil, firstErr
+		endpoints = append(endpoints, oc.Warm...)
 	}
 	sort.Strings(endpoints)
 	reply := map[string]any{"primed": true, "endpoints": endpoints}
@@ -346,21 +237,10 @@ func (d *Daemon) primeAuthAll(ctx context.Context, requestor, reason string) (ma
 }
 
 // handleAuthStatus reports whether the endpoint's key is warm in the cache, whether the
-// cache is degraded to process memory (Secure Enclave presence unavailable at open, not
-// yet healed by a Put), and whether the daemon user's keybag is unavailable — the console
-// session locked, absent, or held by another user via fast user switching — the frozen
-// {"endpoint", "authenticated", "degraded", "keybag_locked"} shape. The keybag verdict
-// comes from probeKeybag, the ioreg-only console read: netstat's screen-share signal bears
-// on consent routing, not keybag availability, so it stays off this hot path. The probe and
-// cache read run under authStatusTimeout so a status read never blocks the caller. Only a
-// probe that itself outruns the bound (ioreg wedged) or fails forces keybag_locked true and
-// skips the cache, since a key is unservable while the keybag is unreadable. After a
-// successful probe keybag_locked is the probe's verdict, and a cache read that outruns the
-// bound — or, while locked, refuses the per-boot key (ErrSEPresenceUnavailable) — is
-// swallowed as authenticated:false rather than a raw RPC failure, so a mid-flight heal or a
-// wedged unwrap never fails the status query. Any other Get error, and any probe failure
-// that is not the bound, still propagates. context.Cause tells the bound apart from a parent
-// cancel so a caller that went away is never reported as locked.
+// cache is degraded to process memory, and whether the daemon user's keybag is
+// unavailable — the frozen {"endpoint", "authenticated", "degraded", "keybag_locked"}
+// shape, rendered from the broker's Status read (which bounds the probe and cache read
+// under auth.StatusTimeout so a status query never blocks the caller).
 func (d *Daemon) handleAuthStatus(ctx context.Context, params map[string]any) (any, error) {
 	browser, err := stringParam(params, "browser")
 	if err != nil {
@@ -372,31 +252,55 @@ func (d *Daemon) handleAuthStatus(ctx context.Context, params map[string]any) (a
 		return nil, err
 	}
 	id := endpointID(self, browser, profile)
-
-	statusCtx, cancel := context.WithTimeoutCause(ctx, authStatusTimeout, errAuthStatusTimeout)
-	defer cancel()
-
-	snap, err := d.probeKeybag(statusCtx)
-	if err != nil {
-		if !errors.Is(context.Cause(statusCtx), errAuthStatusTimeout) {
-			return nil, err
-		}
-		return map[string]any{"endpoint": id, "authenticated": false, "degraded": d.cache.Degraded(), "keybag_locked": true}, nil
-	}
-	locked, err := keybagLocked(snap)
+	status, err := d.broker.Status(ctx, id)
 	if err != nil {
 		return nil, err
 	}
+	return map[string]any{"endpoint": id, "authenticated": status.Authenticated, "degraded": status.Degraded, "keybag_locked": status.KeybagLocked}, nil
+}
 
-	_, ok, err := d.cache.Get(statusCtx, id)
+// handleRequestConsent shows the Touch ID prompt to the person at this machine for the
+// requesting endpoint and echoes the requester's nonce + endpoint VERBATIM to bind the
+// approval — no key crosses the wire. The approval runs the broker's approver-mode
+// release for the requested browser+profile on behalf of the requesting endpoint's
+// host, so the same tap warms this host's own cache and grants that host a consent
+// window. Returns {"status": "approved", "nonce", "endpoint"} on a live tap,
+// {"status": "denied"} when declined, or {"status": "unavailable"} when this host
+// cannot approve because it has no live session, a locked keybag, or a broken key
+// cache. Other release failures propagate to the RPC caller.
+func (d *Daemon) handleRequestConsent(ctx context.Context, params map[string]any) (any, error) {
+	browserID, err := stringParam(params, "browser")
 	if err != nil {
-		timedOut := errors.Is(context.Cause(statusCtx), errAuthStatusTimeout)
-		sePresence := locked && errors.Is(err, cache.ErrSEPresenceUnavailable)
-		if !timedOut && !sePresence {
-			return nil, err
-		}
+		return nil, err
 	}
-	return map[string]any{"endpoint": id, "authenticated": ok, "degraded": d.cache.Degraded(), "keybag_locked": locked}, nil
+	profile := optionalString(params, "profile", defaultProfile)
+	nonce, err := stringParam(params, "nonce")
+	if err != nil {
+		return nil, err
+	}
+	endpoint, err := stringParam(params, "endpoint")
+	if err != nil {
+		return nil, err
+	}
+	host, _, _ := strings.Cut(endpoint, ":")
+	req := auth.Req{
+		Requestor: "host:" + host,
+		Browser:   browserID,
+		Profile:   profile,
+		Reason:    fmt.Sprintf("sync them to %s", endpoint),
+		Mode:      auth.ModeApprover,
+	}
+	_, _, keyErr := d.broker.Key(ctx, req)
+	switch auth.Classify(keyErr) {
+	case auth.VerdictOK:
+		return map[string]any{"status": "approved", "nonce": nonce, "endpoint": endpoint}, nil
+	case auth.VerdictDenied:
+		return map[string]any{"status": "denied"}, nil
+	case auth.VerdictUnavailable:
+		return map[string]any{"status": "unavailable"}, nil
+	default:
+		return nil, keyErr
+	}
 }
 
 // handleGetCookies renders cookies for one or more urls, merged into one set. With a
@@ -418,16 +322,14 @@ func (d *Daemon) handleGetCookies(ctx context.Context, params map[string]any) (a
 }
 
 // getCookiesSingle renders one browser's cookies for every url, merged into one set,
-// behind the per-requestor consent gate: a warm cached key is served silently only
-// inside the requestor's live grant; otherwise the release runs through the one unified
-// routing rule (routesConsent) — a hard route or a cold local session routes the gate to
-// a live peer, else a live local session prompts one Touch ID sheet, failing closed with
-// AuthRequired only when routing finds no live approver. A local caller sends no origin;
-// a peer-driven read (origin set, so peerRequestor keys the grant "host:"+origin exactly
-// like extract) names the origin in the prompt and routes per this host's own consent
-// config when cold — often bouncing the sheet back to the calling Mac, which is by
-// design. New CLIs send "urls" (one or more hosts); older ones send a single "url" — both
-// are accepted, and every host is decrypted with the same released key (one prime covers
+// behind the per-requestor consent gate the broker owns: a warm cached key is served
+// silently only inside the requestor's live grant; otherwise the release runs through
+// the one unified routing rule, failing closed with AuthRequired only when routing
+// finds no live approver. A local caller sends no origin; a peer-driven read (origin
+// set, so peerRequestor keys the grant "host:"+origin exactly like extract) names the
+// origin in the prompt and routes per this host's own consent config when cold. New
+// CLIs send "urls" (one or more hosts); older ones send a single "url" — both are
+// accepted, and every host is decrypted with the same released key (one prime covers
 // them all) and unioned by logical identity. Emits the frozen {"cookies": [...]}.
 func (d *Daemon) getCookiesSingle(ctx context.Context, params map[string]any) (any, error) {
 	browser, err := stringParam(params, "browser")
@@ -443,7 +345,8 @@ func (d *Daemon) getCookiesSingle(ctx context.Context, params map[string]any) (a
 	if origin := optionalString(params, "origin", ""); origin != "" {
 		reason = fmt.Sprintf("send them to %s", origin)
 	}
-	key, _, err := d.primeAuth(ctx, peerRequestor(ctx, params), browser, profile, reason, releaseLocal)
+	req := auth.Req{Requestor: peerRequestor(ctx, params), Browser: browser, Profile: profile, Reason: reason, Mode: auth.ModeLocal}
+	key, _, err := d.broker.Key(ctx, req)
 	if err != nil {
 		return nil, err
 	}
@@ -466,18 +369,15 @@ func (d *Daemon) getCookiesSingle(ctx context.Context, params map[string]any) (a
 
 // getCookiesAll unions the cookies for every url across every registered endpoint —
 // local browsers and remote hosts — best-effort: an endpoint that fails is skipped with
-// a per-endpoint warning, and only a total shutout is an error. Zero endpoints at all is
-// the AuthRequired backstop (the CLI auto-registers locals first). The local leg runs
-// sequentially behind at most one release flight (decision 8): a warm+granted endpoint
-// serves from cache; else the first cold endpoint runs one unified release — a live local
-// session prompts one sheet and grants the whole local batch (later browsers ride it),
-// while a cold session routes consent to a live peer per this host's config — and
-// anything still cold after that one flight is a "skip cold" warning. The remote leg fans
-// out in parallel over a bounded ssh semaphore — never errgroup, whose first-error cancel
+// a per-endpoint warning, and only a total shutout is an error. Zero endpoints at all
+// is the AuthRequired backstop (the CLI auto-registers locals first). The local leg is
+// one LocalKeys(OneFlight) broker sweep — at most one release flight for the whole
+// call, everything still cold after it a "skip cold" warning. The remote leg fans out
+// in parallel over a bounded ssh semaphore — never errgroup, whose first-error cancel
 // would abort the best-effort union. Deliberate asymmetry: the all path keys grants by
-// the local requestor ladder — it is never peer-driven, since the recursion guard forbids
-// a peer re-fanning out — where only the single path is peer-driven and origin-keyed.
-// MergeRanked breaks last_update_utc ties for the local machine. Emits
+// the local requestor ladder — it is never peer-driven, since the recursion guard
+// forbids a peer re-fanning out — where only the single path is peer-driven and
+// origin-keyed. MergeRanked breaks last_update_utc ties for the local machine. Emits
 // {"cookies": [...], "warnings": [...]}.
 func (d *Daemon) getCookiesAll(ctx context.Context, requestor string, urls []string) (any, error) {
 	self, err := meshSelf(ctx)
@@ -488,64 +388,47 @@ func (d *Daemon) getCookiesAll(ctx context.Context, requestor string, urls []str
 	if err != nil {
 		return nil, err
 	}
-	var locals, remotes []state.Endpoint
+	var remotes []state.Endpoint
 	for _, ep := range st.Endpoints() {
-		if ep.Host == self {
-			locals = append(locals, ep)
-			continue
+		if ep.Host != self {
+			remotes = append(remotes, ep)
 		}
-		remotes = append(remotes, ep)
 	}
-	if len(locals)+len(remotes) == 0 {
-		return nil, &AuthRequired{Msg: "no browsers are tracked; run cookiesync browser add"}
+	outcomes, err := d.broker.LocalKeysWithState(ctx, requestor, consentReason, auth.OneFlight, st)
+	if err != nil {
+		return nil, err
+	}
+	if len(outcomes)+len(remotes) == 0 {
+		return nil, &auth.AuthRequired{Msg: "no browsers are tracked; run cookiesync browser add"}
 	}
 
 	var sets []cookie.RankedSet
 	var warnings []string
 
-	// LOCAL leg: sequential, at most one release flight for the whole call. The first
-	// cold endpoint runs one unified release (releaseLocal) — a live session prompts once
-	// and grants the whole batch (later browsers ride the grant), a cold session routes
-	// consent to a live peer — with the routed/local split decided inside the one flight
-	// rather than a per-call snapshot a mid-call presence flip could stale out. Anything
-	// still cold after that one flight is a "skip cold" warning.
-	prompted := false
-	for _, ep := range locals {
-		id := string(ep.ID())
-		name := cookie.BrowserName(ep.Browser)
-		cached, warm, err := d.cache.Get(ctx, id)
-		if err != nil {
-			return nil, err
-		}
-		var key cookie.AesKey
+	// LOCAL leg: render the broker sweep — a released or warm key extracts,
+	// everything else is a per-endpoint skip warning.
+	for _, oc := range outcomes {
 		switch {
-		case warm && d.granted(requestor, name):
-			key = cookie.AesKey(cached)
-		case !prompted:
-			released, _, err := d.primeAuth(ctx, requestor, ep.Browser, ep.Profile, consentReason, releaseLocal)
-			prompted = true
-			if err != nil {
-				warnings = append(warnings, fmt.Sprintf("skip cold %s: run cookiesync auth (%v)", id, err))
-				continue
-			}
-			key = released
-		default:
-			warnings = append(warnings, fmt.Sprintf("skip cold %s: run cookiesync auth", id))
+		case oc.Err != nil:
+			warnings = append(warnings, renderLocalKeyWarning(oc.Endpoint, oc.Err))
+			continue
+		case oc.Skipped:
+			warnings = append(warnings, fmt.Sprintf("skip cold %s: run cookiesync auth", oc.Endpoint))
 			continue
 		}
-		b, err := cookie.Lookup(name)
+		b, err := cookie.Lookup(cookie.BrowserName(oc.Browser))
 		if err != nil {
-			warnings = append(warnings, fmt.Sprintf("skip %s: %v", id, err))
+			warnings = append(warnings, fmt.Sprintf("skip %s: %v", oc.Endpoint, err))
 			continue
 		}
 		urlSets := make([][]cookie.Cookie, 0, len(urls))
 		for _, url := range urls {
-			// fallback=false: only the released key, never the cross-browser sweep — same
-			// as the single path.
-			extracted, err := cookie.Extract(ctx, url, b, key, ep.Profile, false, false)
+			// fallback=false: only the released key, never the cross-browser
+			// sweep — same as the single path.
+			extracted, err := cookie.Extract(ctx, url, b, oc.Key, oc.Profile, false, false)
 			if err != nil {
 				urlSets = nil
-				warnings = append(warnings, fmt.Sprintf("skip %s: %v", id, err))
+				warnings = append(warnings, fmt.Sprintf("skip %s: %v", oc.Endpoint, err))
 				break
 			}
 			urlSets = append(urlSets, extracted.Cookies)
@@ -569,11 +452,12 @@ func (d *Daemon) getCookiesAll(ctx context.Context, requestor string, urls []str
 			cookies, err := d.remoteGetCookies(ctx, ep.Host, ep.Browser, ep.Profile, urls)
 			mu.Lock()
 			defer mu.Unlock()
-			if errors.Is(err, context.DeadlineExceeded) {
-				warnings = append(warnings, fmt.Sprintf("skip %s: no reply from %s within %s (consent may be pending there or the host is slow); approve on %s or run cookiesync auth on it", ep.ID(), ep.Host, unionReadTimeout, ep.Host))
-				return
-			}
 			if err != nil {
+				var peerErr *PeerReadError
+				if errors.As(err, &peerErr) {
+					warnings = append(warnings, renderPeerReadWarning(string(ep.ID()), peerErr))
+					return
+				}
 				warnings = append(warnings, fmt.Sprintf("skip %s: %v", ep.ID(), err))
 				return
 			}
@@ -592,12 +476,13 @@ func (d *Daemon) getCookiesAll(ctx context.Context, requestor string, urls []str
 	return reply, nil
 }
 
-// handleGetWebStorage renders the web storage (localStorage + sessionStorage) for one or
-// more urls' origins. It is LOCAL-only — no ssh remote fan-out — and consent-gated exactly
-// like get_cookies. With a "browser" param it scopes to that one endpoint via
-// getWebStorageSingle (so a browser-scoped cookies pull pairs with the SAME browser's web
-// storage — never mixing one browser's cookie identity with another's localStorage token).
-// With no "browser" it unions every registered local browser via getWebStorageAll.
+// handleGetWebStorage renders the web storage (localStorage + sessionStorage) for one
+// or more urls' origins. It is LOCAL-only — no ssh remote fan-out — and consent-gated
+// exactly like get_cookies. With a "browser" param it scopes to that one endpoint via
+// getWebStorageSingle (so a browser-scoped cookies pull pairs with the SAME browser's
+// web storage — never mixing one browser's cookie identity with another's localStorage
+// token). With no "browser" it unions every registered local browser via
+// getWebStorageAll.
 func (d *Daemon) handleGetWebStorage(ctx context.Context, params map[string]any) (any, error) {
 	if optionalString(params, "browser", "") == "" {
 		return d.getWebStorageAll(ctx, params)
@@ -605,11 +490,11 @@ func (d *Daemon) handleGetWebStorage(ctx context.Context, params map[string]any)
 	return d.getWebStorageSingle(ctx, params)
 }
 
-// getWebStorageSingle renders one browser's web storage for every url, consent-gated by the
-// same primeAuth path getCookiesSingle uses, then DISCARDING the released key — web storage
-// is stored unencrypted, so only the consent side-effect (the tap and the requestor grant)
-// is needed. It fails closed with AuthRequired when the prime does, never serving storage
-// without consent. Emits the frozen {"origins": [...]}.
+// getWebStorageSingle renders one browser's web storage for every url, consent-gated by
+// the same broker release getCookiesSingle uses, then DISCARDING the released key — web
+// storage is stored unencrypted, so only the consent side-effect (the tap and the
+// requestor grant) is needed. It fails closed with AuthRequired when the release does,
+// never serving storage without consent. Emits the frozen {"origins": [...]}.
 func (d *Daemon) getWebStorageSingle(ctx context.Context, params map[string]any) (any, error) {
 	browser, err := stringParam(params, "browser")
 	if err != nil {
@@ -620,7 +505,8 @@ func (d *Daemon) getWebStorageSingle(ctx context.Context, params map[string]any)
 	if err != nil {
 		return nil, err
 	}
-	if _, _, err := d.primeAuth(ctx, requestorID(ctx, params), browser, profile, consentReason, releaseLocal); err != nil {
+	req := auth.Req{Requestor: requestorID(ctx, params), Browser: browser, Profile: profile, Reason: consentReason, Mode: auth.ModeLocal}
+	if _, _, err := d.broker.Key(ctx, req); err != nil {
 		return nil, err
 	}
 	b, err := cookie.Lookup(cookie.BrowserName(browser))
@@ -635,71 +521,45 @@ func (d *Daemon) getWebStorageSingle(ctx context.Context, params map[string]any)
 }
 
 // getWebStorageAll unions the web storage for every url across every registered LOCAL
-// browser, best-effort. It mirrors getCookiesAll's local leg: the first cold endpoint runs
-// one release flight (a live session prompts one Touch ID sheet granting the whole local
-// batch, a cold session routes consent to a live peer) whose released key is DISCARDED, a
-// warm+granted endpoint serves silently, and anything still cold is a skip warning. A
-// requestor already granted by an earlier get_cookies call rides that grant with no extra
-// tap. Origins are folded in endpoint-id order, so an (origin, name) collision resolves
-// deterministically to the lowest endpoint id. Emits {"origins": [...], "warnings": [...]}.
+// browser, best-effort. Its consent gate is the same LocalKeys(OneFlight) sweep as
+// getCookiesAll's local leg, with every released key DISCARDED — a warm+granted
+// endpoint serves silently, anything still cold is a skip warning, and a requestor
+// already granted by an earlier get_cookies call rides that grant with no extra tap.
+// Origins are folded in endpoint-id order, so an (origin, name) collision resolves
+// deterministically to the lowest endpoint id. Emits {"origins": [...], "warnings":
+// [...]}.
 func (d *Daemon) getWebStorageAll(ctx context.Context, params map[string]any) (any, error) {
 	urls, err := urlsParam(params)
 	if err != nil {
 		return nil, err
 	}
-	requestor := requestorID(ctx, params)
-	self, err := meshSelf(ctx)
+	outcomes, err := d.broker.LocalKeys(ctx, requestorID(ctx, params), consentReason, auth.OneFlight)
 	if err != nil {
 		return nil, err
 	}
-	st, err := d.state.Load(ctx)
-	if err != nil {
-		return nil, err
+	if len(outcomes) == 0 {
+		return nil, &auth.AuthRequired{Msg: "no local browsers are tracked; run cookiesync browser add"}
 	}
-	var locals []state.Endpoint
-	for _, ep := range st.Endpoints() {
-		if ep.Host == self {
-			locals = append(locals, ep)
-		}
-	}
-	if len(locals) == 0 {
-		return nil, &AuthRequired{Msg: "no local browsers are tracked; run cookiesync browser add"}
-	}
-	sort.Slice(locals, func(i, j int) bool { return locals[i].ID() < locals[j].ID() })
 
 	acc := map[string]*originAcc{}
 	var warnings []string
-	prompted := false
-	for _, ep := range locals {
-		id := string(ep.ID())
-		name := cookie.BrowserName(ep.Browser)
-		_, warm, err := d.cache.Get(ctx, id)
-		if err != nil {
-			return nil, err
-		}
+	for _, oc := range outcomes {
 		switch {
-		case warm && d.granted(requestor, name):
-		case !prompted:
-			// The released key is discarded: web storage is unencrypted, so only the
-			// consent side-effect (the tap and the requestor grant) is taken.
-			_, _, err := d.primeAuth(ctx, requestor, ep.Browser, ep.Profile, consentReason, releaseLocal)
-			prompted = true
-			if err != nil {
-				warnings = append(warnings, fmt.Sprintf("skip cold %s: run cookiesync auth (%v)", id, err))
-				continue
-			}
-		default:
-			warnings = append(warnings, fmt.Sprintf("skip cold %s: run cookiesync auth", id))
+		case oc.Err != nil:
+			warnings = append(warnings, renderLocalKeyWarning(oc.Endpoint, oc.Err))
+			continue
+		case oc.Skipped:
+			warnings = append(warnings, fmt.Sprintf("skip cold %s: run cookiesync auth", oc.Endpoint))
 			continue
 		}
-		b, err := cookie.Lookup(name)
+		b, err := cookie.Lookup(cookie.BrowserName(oc.Browser))
 		if err != nil {
-			warnings = append(warnings, fmt.Sprintf("skip %s: %v", id, err))
+			warnings = append(warnings, fmt.Sprintf("skip %s: %v", oc.Endpoint, err))
 			continue
 		}
-		origins, err := cookie.ExtractWebStorage(ctx, urls, b, ep.Profile)
+		origins, err := cookie.ExtractWebStorage(ctx, urls, b, oc.Profile)
 		if err != nil {
-			warnings = append(warnings, fmt.Sprintf("skip %s: %v", id, err))
+			warnings = append(warnings, fmt.Sprintf("skip %s: %v", oc.Endpoint, err))
 			continue
 		}
 		mergeOrigins(acc, origins)
@@ -712,14 +572,14 @@ func (d *Daemon) getWebStorageAll(ctx context.Context, params map[string]any) (a
 }
 
 // remoteGetCookies drives a peer's single-browser get_cookies over ssh and parses the
-// wire cookies it streams back, mirroring routedRelease's runner precedent. --browser is
-// always sent so the peer daemon takes the single path (the recursion guard), and origin
-// is this host's mesh self so the peer's grant keys "host:"+self like extract — the
-// first union pull prompts the peer once, then its grant window keeps the rest silent.
-// The call gets a short data-plane bound (unionReadTimeout): a peer stuck behind a pending
-// consent is killed in seconds rather than held for the whole consent window, because that
-// peer's release flight is detached and survives the killed ssh — the approval it earns
-// there makes the next union pull silent.
+// wire cookies it streams back. --browser is always sent so the peer daemon takes the
+// single path (the recursion guard), and origin is this host's mesh self so the peer's
+// grant keys "host:"+self like extract — the first union pull prompts the peer once,
+// then its grant window keeps the rest silent. The call gets a short data-plane bound
+// (unionReadTimeout): a peer stuck behind a pending consent is killed in seconds rather
+// than held for the whole consent window, because that peer's release flight is
+// detached and survives the killed ssh — the approval it earns there makes the next
+// union pull silent.
 func (d *Daemon) remoteGetCookies(ctx context.Context, host, browser, profile string, urls []string) ([]cookie.Cookie, error) {
 	self, err := meshSelf(ctx)
 	if err != nil {
@@ -743,281 +603,19 @@ func (d *Daemon) remoteGetCookies(ctx context.Context, host, browser, profile st
 	defer cancel()
 	out, err := d.runner.Run(rctx, host, cmd, nil)
 	if err != nil {
-		// exec.CommandContext reports the deadline kill as a bare exit error that loses the
-		// context cause; restore it so the caller can branch on the wedged-peer case.
-		if rctx.Err() != nil {
-			return nil, fmt.Errorf("rpc get_cookies on %s: %w (underlying: %w)", host, rctx.Err(), err)
-		}
-		return nil, err
+		return nil, newPeerReadError(host, errors.Is(rctx.Err(), context.DeadlineExceeded), err)
 	}
 	var payload struct {
 		Cookies []cookie.WireCookie `json:"cookies"`
 	}
 	if err := json.Unmarshal([]byte(out), &payload); err != nil {
-		return nil, fmt.Errorf("parse rpc get_cookies from %s: %w", host, err)
+		return nil, &PeerReadError{Host: host, Err: fmt.Errorf("parse rpc get_cookies: %w", err)}
 	}
 	cookies := make([]cookie.Cookie, len(payload.Cookies))
 	for i, w := range payload.Cookies {
 		cookies[i] = cookie.FromWire(w)
 	}
 	return cookies, nil
-}
-
-// primeAuth obtains the Safe Storage key for requestor via the presence gate
-// (releaseKey) and caches it under the endpoint's TTL. Authorization is per requestor,
-// never global cache warmth: a warm key is returned silently only while requestor
-// holds a live grant for the browser; anything else releases anew — one consent
-// evaluation, human or routed — which grants requestor every browser it covered and
-// refreshes the cache. Concurrent calls from one requestor — same endpoint or
-// distinct — collapse into one batchFlight flight per mode, whose released keys every
-// waiter shares. The flight runs detached from every caller's ctx, bounded only by
-// the dispatch timeout, so a caller that disconnects mid-consent neither poisons the
-// flight for the survivors nor stays parked behind it: it returns its own ctx.Err()
-// immediately while the flight (and the prompt) runs on. A flight that did not cover
-// this browser (a foreign leader's batch) is retried with this browser leading. On a
-// verified routed approval this host releases its own key non-interactively — the key
-// never leaves this box. A cold remote mesh fails closed with AuthRequired. The
-// returned consentSurface is the gate the covering flight actually used — reported
-// even alongside an error once a flight ran, so a caller sequencing primes can tell a
-// fired-and-denied local sheet from a failed route and never stacks a second sheet.
-// Mirrors the Python prime_auth.
-func (d *Daemon) primeAuth(ctx context.Context, requestor, browser, profile, reason string, mode releaseMode) (cookie.AesKey, consentSurface, error) {
-	self, err := meshSelf(ctx)
-	if err != nil {
-		return nil, surfaceNone, err
-	}
-	id := endpointID(self, browser, profile)
-	cached, warm, err := d.cache.Get(ctx, id)
-	if err != nil {
-		return nil, surfaceNone, err
-	}
-	if warm && d.granted(requestor, cookie.BrowserName(browser)) {
-		return cookie.AesKey(cached), surfaceNone, nil
-	}
-	for {
-		ch := d.batchFlight.DoChan("local-batch:"+string(mode)+":"+requestor, func() (any, error) {
-			fctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), synckit.DispatchTimeout)
-			defer cancel()
-			return d.releaseAndCacheKey(fctx, requestor, self, id, browser, profile, reason, mode)
-		})
-		select {
-		case res := <-ch:
-			if res.Err != nil {
-				surface := surfaceNone
-				if batch, ok := res.Val.(*batchResult); ok && batch != nil {
-					surface = batch.surface
-				}
-				return nil, surface, res.Err
-			}
-			batch := res.Val.(*batchResult)
-			oc, ok := batch.outcomes[cookie.BrowserName(browser)]
-			if !ok {
-				continue
-			}
-			if oc.Err != nil {
-				return nil, batch.surface, oc.Err
-			}
-			if oc.Missing {
-				return nil, batch.surface, &cookie.ConsentError{Msg: fmt.Sprintf("could not read %q from the Keychain (denied or missing)", oc.Browser.KeychainService)}
-			}
-			_, warm, err := d.cache.Get(ctx, id)
-			if err != nil {
-				return nil, batch.surface, err
-			}
-			if !warm {
-				if err := d.cache.Put(ctx, id, []byte(oc.Key), batch.ttl); err != nil {
-					return nil, batch.surface, err
-				}
-			}
-			return oc.Key, batch.surface, nil
-		case <-ctx.Done():
-			return nil, surfaceNone, ctx.Err()
-		}
-	}
-}
-
-// releaseAndCacheKey is one batchFlight flight: it re-probes the cache — a straggler
-// whose fresh flight starts just after another flight primed the endpoint is served
-// the warm key instead of re-prompting, but only inside requestor's live grant — then
-// releases keys behind the presence gate that applies and caches them under the
-// effective TTL.
-func (d *Daemon) releaseAndCacheKey(ctx context.Context, requestor, self, id, browser, profile, reason string, mode releaseMode) (*batchResult, error) {
-	st, err := d.state.Load(ctx)
-	if err != nil {
-		return nil, err
-	}
-	if d.granted(requestor, cookie.BrowserName(browser)) {
-		cached, ok, err := d.cache.Get(ctx, id)
-		if err != nil {
-			return nil, err
-		}
-		if ok {
-			name := cookie.BrowserName(browser)
-			return &batchResult{
-				outcomes: map[cookie.BrowserName]cookie.KeyOutcome{name: {Key: cookie.AesKey(cached)}},
-				ttl:      d.effectiveTTL(st.Settings.AuthTTL),
-			}, nil
-		}
-	}
-	return d.releaseKey(ctx, st, requestor, self, id, browser, profile, reason, mode)
-}
-
-// releaseKey obtains Safe Storage keys behind the presence gate that applies, deriving
-// the routed/local split once inside the flight. In releaseLocal mode a hard consent
-// route (ConsentRouteHard) to a live ConsentRouteTo peer wins outright — this host routes
-// the gate even when it looks locally attended — and a cold local session routes the gate
-// to the active peer; a routed approval releases just the requested browser's key. This
-// one rule serves every console release — prime, get_cookies, and extract alike — so a
-// cold browser-less cookies read routes exactly like auth, and a peer-driven get_cookies
-// routes per this host's own config (often back to the calling Mac). Otherwise — and
-// always in releaseApprover mode, where this host is the routed gate's terminus and must
-// never route onward — the whole local batch releases behind one Touch ID evaluation in
-// releaseAllLocal. The prompt gate is never held across routedRelease: an inbound
-// request_consent must stay promptable while this host's own outbound route is in flight,
-// or the same-host routed-consent cycle deadlocks.
-func (d *Daemon) releaseKey(ctx context.Context, st *state.State, requestor, self, id, browser, profile, reason string, mode releaseMode) (*batchResult, error) {
-	if mode == releaseLocal {
-		routed, err := d.routesConsent(ctx, st)
-		if err != nil {
-			return nil, err
-		}
-		if routed {
-			return d.routedBatch(ctx, st, requestor, id, browser, profile)
-		}
-	}
-	return d.releaseAllLocal(ctx, st, requestor, self, id, browser, reason)
-}
-
-// routesConsent reports whether a releaseLocal prime routes the user-presence gate to a
-// peer instead of prompting Touch ID locally: a hard consent route (ConsentRouteHard) to
-// a live ConsentRouteTo peer wins outright — this host routes even when it looks locally
-// attended — and a cold local session routes to the active peer. It is derived once
-// inside each release flight (releaseKey), never snapshotted at call start, so the
-// routed/local split a caller observes is always the one its flight actually used.
-func (d *Daemon) routesConsent(ctx context.Context, st *state.State) (bool, error) {
-	if st.ConsentRouteHard && st.ConsentRouteTo != "" {
-		live, err := d.peerIsLive(ctx, st.ConsentRouteTo)
-		if err != nil {
-			return false, err
-		}
-		if live {
-			return true, nil
-		}
-	}
-	live, err := HasActiveSession(ctx, d.probe)
-	if err != nil {
-		return false, err
-	}
-	return !live, nil
-}
-
-// routedBatch releases the requested browser's key through the routed-consent
-// handshake, caches it under the requested endpoint, and grants requestor that one
-// browser — a routed approval gates one browser, never the local batch.
-func (d *Daemon) routedBatch(ctx context.Context, st *state.State, requestor, id, browser, profile string) (*batchResult, error) {
-	b, err := cookie.Lookup(cookie.BrowserName(browser))
-	if err != nil {
-		return nil, err
-	}
-	key, err := d.routedRelease(ctx, b, browser, profile)
-	if err != nil {
-		return nil, err
-	}
-	ttl := d.effectiveTTL(st.Settings.AuthTTL)
-	if err := d.cache.Put(ctx, id, []byte(key), ttl); err != nil {
-		return nil, err
-	}
-	name := cookie.BrowserName(browser)
-	d.grant(requestor, []cookie.BrowserName{name}, ttl)
-	return &batchResult{
-		outcomes: map[cookie.BrowserName]cookie.KeyOutcome{name: {Browser: b, Key: key}},
-		ttl:      ttl,
-		surface:  surfaceRouted,
-	}, nil
-}
-
-// releaseAllLocal is the single choke point where Touch ID taps happen: one consent
-// evaluation covering every tracked local browser plus the requested one, under
-// promptGate so a local flight and an approver flight never stack two sheets. The
-// prompt reason names the requestor best-effort, and the evaluation grants requestor
-// every browser it released under the same effective TTL its keys are cached for.
-// Every ok browser's key is cached under all of its tracked local endpoint ids —
-// every profile of a browser shares its Safe Storage key — with the requested
-// endpoint id put LAST: a mid-batch heal (the healingWrapper swap runs EvictAll)
-// drops earlier Puts, so the requested id is verified after the batch and re-Put if a
-// heal raced past it. The whole batch's per-browser outcome is returned — a browser
-// that failed (Missing or Err) is carried in the outcomes, not cached, so a waiter for
-// a distinct browser is served while the leader's browser is denied. Only a
-// whole-batch failure (ObtainKeys errored — a denied sheet, a locked keybag, a helper
-// that cannot run) fails the flight; a single browser's failure is surfaced to that
-// browser's requestor by primeAuth. Every error at or past the consent evaluation
-// still carries a surfaceLocal batchResult, so a caller knows a sheet already fired
-// and never stacks a second one.
-func (d *Daemon) releaseAllLocal(ctx context.Context, st *state.State, requestor, self, id, browser, reason string) (*batchResult, error) {
-	requested := cookie.BrowserName(browser)
-	names := []cookie.BrowserName{requested}
-	seen := map[cookie.BrowserName]bool{requested: true}
-	bulkIDs := map[cookie.BrowserName][]string{}
-	for _, ep := range st.Endpoints() {
-		if ep.Host != self {
-			continue
-		}
-		name := cookie.BrowserName(ep.Browser)
-		if !seen[name] {
-			seen[name] = true
-			names = append(names, name)
-		}
-		if epID := string(ep.ID()); epID != id {
-			bulkIDs[name] = append(bulkIDs[name], epID)
-		}
-	}
-	browsers := make([]cookie.Browser, len(names))
-	for i, name := range names {
-		b, err := cookie.Lookup(name)
-		if err != nil {
-			return nil, err
-		}
-		browsers[i] = b
-	}
-	pid, hasPID := synckit.PeerPID(ctx)
-	reason = requestorReason(ctx, requestor, reason, pid, hasPID)
-	d.promptGate.Lock()
-	obtained, err := d.consent.ObtainKeys(ctx, browsers, reason)
-	d.promptGate.Unlock()
-	if err != nil {
-		return &batchResult{surface: surfaceLocal}, err
-	}
-	ttl := d.effectiveTTL(st.Settings.AuthTTL)
-	outcomes := make(map[cookie.BrowserName]cookie.KeyOutcome, len(obtained))
-	released := make([]cookie.BrowserName, 0, len(obtained))
-	for i, outcome := range obtained {
-		outcomes[names[i]] = outcome
-		if outcome.Missing || outcome.Err != nil {
-			continue
-		}
-		released = append(released, names[i])
-		for _, epID := range bulkIDs[names[i]] {
-			if err := d.cache.Put(ctx, epID, []byte(outcome.Key), ttl); err != nil {
-				return &batchResult{surface: surfaceLocal}, err
-			}
-		}
-	}
-	d.grant(requestor, released, ttl)
-	if oc := outcomes[requested]; !oc.Missing && oc.Err == nil {
-		if err := d.cache.Put(ctx, id, []byte(oc.Key), ttl); err != nil {
-			return &batchResult{surface: surfaceLocal}, err
-		}
-		_, warm, err := d.cache.Get(ctx, id)
-		if err != nil {
-			return &batchResult{surface: surfaceLocal}, err
-		}
-		if !warm {
-			if err := d.cache.Put(ctx, id, []byte(oc.Key), ttl); err != nil {
-				return &batchResult{surface: surfaceLocal}, err
-			}
-		}
-	}
-	return &batchResult{outcomes: outcomes, ttl: ttl, surface: surfaceLocal}, nil
 }
 
 // cookiesPayload is the frozen {"cookies": [...]} envelope a cookie set crosses the

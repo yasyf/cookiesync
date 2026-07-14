@@ -1,29 +1,15 @@
 package engine
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
-	"os"
-	"os/exec"
-	"strings"
-	"syscall"
 	"time"
 
 	"github.com/yasyf/cookiesync/internal/cookie"
 	"github.com/yasyf/synckit/hostregistry"
 	"github.com/yasyf/synckit/rpc"
 )
-
-// SSH option set mirrors synckit's host transport: BatchMode plus connect/keepalive
-// timeouts so a wedged peer fails fast instead of hanging a converge.
-var sshOpts = []string{
-	"-o", "BatchMode=yes",
-	"-o", "ConnectTimeout=5",
-	"-o", "ServerAliveInterval=5",
-	"-o", "ServerAliveCountMax=3",
-}
 
 // Per-call deadlines for the two remote rpc calls, vars so tests shrink them.
 var (
@@ -36,10 +22,6 @@ var (
 	applyTimeout = 60 * time.Second
 )
 
-// brewShellenv sources Homebrew's environment first, since a non-interactive ssh on
-// macOS lacks brew — and thus a brew-installed cookiesync — on PATH.
-const brewShellenv = `eval "$(/opt/homebrew/bin/brew shellenv)" && `
-
 // SSHRunner runs a remote command over ssh, optionally piping stdin, and returns its
 // stdout. It is the boundary the ssh-backed peer source crosses; tests inject a fake
 // so the backend's payload shape is exercised without a real ssh. Defined here, where
@@ -50,43 +32,15 @@ type SSHRunner interface {
 	Run(ctx context.Context, target, remoteCmd string, stdin []byte) (string, error)
 }
 
-// execSSHRunner is the production SSHRunner: it shells ssh with the standard option
-// set and the brew-shellenv wrap.
-type execSSHRunner struct{}
+type hostRegistrySSHRunner struct{}
 
-// NewExecSSHRunner returns the default SSHRunner that shells out to ssh.
+// NewExecSSHRunner returns the production SSHRunner backed by hostregistry.ExecSSH.
 func NewExecSSHRunner() SSHRunner {
-	return execSSHRunner{}
+	return hostRegistrySSHRunner{}
 }
 
-func (execSSHRunner) Run(ctx context.Context, target, remoteCmd string, stdin []byte) (string, error) {
-	args := append(append([]string{}, sshOpts...), target, brewShellenv+remoteCmd)
-	cmd := exec.CommandContext(ctx, "ssh", args...) //nolint:gosec // G204: this sync tool's job is to run ssh; target/remoteCmd come from trusted local state (registered hosts), not untrusted input.
-	// On deadline, SIGKILL the whole process group (Setpgid + negative-pid kill) so
-	// an ssh helper that inherited our stdout pipe dies too; otherwise cmd.Wait
-	// blocks past the deadline waiting for pipe EOF. WaitDelay force-closes the
-	// pipes as a backstop if the group-kill misses a holder.
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	cmd.Cancel = func() error {
-		err := syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
-		// ESRCH means the group already exited: report os.ErrProcessDone like
-		// Process.Kill would, so a completion/cancellation race is not an error.
-		if err == syscall.ESRCH {
-			return os.ErrProcessDone
-		}
-		return err
-	}
-	cmd.WaitDelay = 5 * time.Second
-	if stdin != nil {
-		cmd.Stdin = bytes.NewReader(stdin)
-	}
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
-		return "", fmt.Errorf("ssh %s: %w: %s", target, err, strings.TrimSpace(stderr.String()))
-	}
-	return stdout.String(), nil
+func (hostRegistrySSHRunner) Run(ctx context.Context, target, remoteCmd string, stdin []byte) (string, error) {
+	return hostregistry.ExecSSH(ctx, target, remoteCmd, stdin)
 }
 
 // SSHBackend is a peer host's cookie store, reached by driving its daemon over ssh.

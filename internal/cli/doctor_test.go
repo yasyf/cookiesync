@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"strings"
 	"testing"
@@ -25,9 +26,64 @@ func passing() doctorEnv {
 		socket:   ok("helper socket"),
 		keyCache: ok("key cache"),
 		mesh:     ok("mesh"),
+		tcc:      func(context.Context) (check, bool) { return check{}, false },
 		manifest: ok("manifest"),
 		state:    ok("state"),
 		tracked:  ok("browsers"),
+	}
+}
+
+// TestDoctorTCCNoteFollowsPeerPresence proves the informational TCC pointer is omitted
+// without peers or on mesh errors and is always an OK line when peers exist.
+func TestDoctorTCCNoteFollowsPeerPresence(t *testing.T) {
+	tests := []struct {
+		name     string
+		peers    []string
+		meshErr  error
+		wantNote bool
+	}{
+		{name: "no peers"},
+		{name: "mesh error", meshErr: errors.New("mesh unavailable")},
+		{name: "peer present", peers: []string{"you@desktop"}, wantNote: true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			resolve := func(context.Context) (string, []string, error) {
+				return "you@laptop", tc.peers, tc.meshErr
+			}
+			result, emitted := checkTCC(context.Background(), resolve)
+			if emitted && !result.ok {
+				t.Fatal("checkTCC emitted a failing check")
+			}
+			if emitted != tc.wantNote {
+				t.Fatalf("checkTCC emitted = %v, want %v", emitted, tc.wantNote)
+			}
+
+			env := passing()
+			env.tcc = func(ctx context.Context) (check, bool) {
+				return checkTCC(ctx, resolve)
+			}
+			wantChecks := 7
+			if tc.wantNote {
+				wantChecks = 8
+			}
+			if got := len(env.checks(context.Background())); got != wantChecks {
+				t.Fatalf("doctor check count = %d, want %d", got, wantChecks)
+			}
+			var out bytes.Buffer
+			cmd := &cobra.Command{}
+			cmd.SetOut(&out)
+			if err := runDoctor(cmd, env); err != nil {
+				t.Fatalf("runDoctor = %v, want nil", err)
+			}
+			const line = "OK   peer TCC: cross-host pulls use ssh; if this host times out pulling from a peer, check Full Disk Access for the peer's ssh identity (sshd or tailscaled)"
+			if got := strings.Contains(out.String(), line); got != tc.wantNote {
+				t.Fatalf("doctor TCC line present = %v, want %v:\n%s", got, tc.wantNote, out.String())
+			}
+			if strings.Contains(out.String(), "FAIL peer TCC") {
+				t.Fatalf("doctor emitted a failing TCC line:\n%s", out.String())
+			}
+		})
 	}
 }
 
@@ -112,13 +168,13 @@ func TestKeyCacheCheckRendersEveryDaemonState(t *testing.T) {
 			name:       "degraded keybag-locked",
 			status:     keyCacheStatus{Degraded: true, Locked: true},
 			wantOK:     true,
-			wantDetail: "in process memory (keybag locked at daemon start; re-primes Secure-Enclave wrapped on the first prime after it unlocks)",
+			wantDetail: "in process memory (keybag locked; re-heals Secure-Enclave wrapped on the next authorization)",
 		},
 		{
 			name:       "degraded unlocked",
 			status:     keyCacheStatus{Degraded: true, Locked: false},
 			wantOK:     false,
-			wantDetail: "degraded: Secure Enclave presence was unavailable at daemon start; run 'cookiesync auth' to re-prime",
+			wantDetail: "degraded after a Secure Enclave presence refusal; run 'cookiesync auth' to re-prime",
 		},
 	}
 	for _, tc := range tests {

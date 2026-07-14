@@ -9,7 +9,7 @@ require (
 	github.com/charmbracelet/x/exp/teatest v0.0.0-20260615092313-b57e5e6d29bb
 	github.com/spf13/cobra v1.10.2
 	github.com/syndtr/goleveldb v1.0.0
-	github.com/yasyf/synckit v0.11.0
+	github.com/yasyf/synckit v0.12.0
 	golang.org/x/crypto v0.48.0
 	golang.org/x/sync v0.20.0
 	golang.org/x/term v0.40.0
