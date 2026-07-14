@@ -601,6 +601,81 @@ func TestGetCookiesUnionZeroContributorsErrors(t *testing.T) {
 	}
 }
 
+// TestUnionTotalShutoutErrorCarriesWarnings proves a total shutout keeps every
+// accumulated skip warning in the error: a timed-out peer leads with the
+// consent-pending summary, a hard peer error keeps the auth hint.
+func TestUnionTotalShutoutErrorCarriesWarnings(t *testing.T) {
+	restore := unionReadTimeout
+	unionReadTimeout = 25 * time.Millisecond
+	t.Cleanup(func() { unionReadTimeout = restore })
+
+	peer := "wedged@desktop"
+	tests := []struct {
+		name       string
+		runner     func() engine.SSHRunner
+		wantPrefix string
+		absent     string
+	}{
+		{
+			name:       "peer timeout leads with consent-pending",
+			runner:     func() engine.SSHRunner { return &wedgedTargetRunner{inner: &recordingRunner{}, wedged: peer} },
+			wantPrefix: "no endpoint contributed cookies; consent may be pending on " + peer + " — approve it there and retry",
+			absent:     "run cookiesync auth",
+		},
+		{
+			name:       "peer hard error keeps the auth hint",
+			runner:     func() engine.SSHRunner { return &recordingRunner{err: errors.New("ssh down")} },
+			wantPrefix: "no endpoint contributed cookies; run cookiesync auth",
+			absent:     "consent may be pending",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			browser := chromeStoreUnderHome(t)
+			garbage := browser.CookiesDB("Ghost")
+			if err := os.MkdirAll(filepath.Dir(garbage), 0o750); err != nil {
+				t.Fatalf("mkdir ghost profile: %v", err)
+			}
+			if err := os.WriteFile(garbage, []byte("not a sqlite database"), 0o600); err != nil {
+				t.Fatalf("write ghost store: %v", err)
+			}
+
+			self := "me@laptop"
+			fakeMesh(t, self, peer)
+			st := stateWith(self, "",
+				stateEndpoint(self, "chrome", "Ghost"),
+				stateEndpoint(peer, "chrome", "Default"),
+			)
+			key := cookie.DeriveKey(cookie.SafeStorageKey("peanuts"))
+			cache := newFakeCache()
+			d := New(&fakeConsent{key: key}, cache, nil, staticProbe(SessionSnapshot{}), tc.runner(), fixedState{st: st}, fixedState{st: st})
+			_, _ = cache.Put(ctx, endpointID(self, "chrome", "Ghost"), []byte(key), 0)
+			d.grant("local", []cookie.BrowserName{"chrome"}, time.Hour)
+
+			_, err := d.handleGetCookies(ctx, map[string]any{"url": "https://x.com/"})
+			if err == nil {
+				t.Fatalf("total shutout must error")
+			}
+			msg := err.Error()
+			if !strings.HasPrefix(msg, tc.wantPrefix+"\n") {
+				t.Fatalf("shutout error = %q, want it to lead with %q", msg, tc.wantPrefix)
+			}
+			if strings.Contains(msg, tc.absent) {
+				t.Fatalf("shutout error = %q, want it free of %q", msg, tc.absent)
+			}
+			for _, skip := range []string{
+				"\n  skip " + endpointID(self, "chrome", "Ghost"),
+				"\n  skip " + endpointID(peer, "chrome", "Default"),
+			} {
+				if !strings.Contains(msg, skip) {
+					t.Fatalf("shutout error = %q, want the indented skip warning %q", msg, skip)
+				}
+			}
+		})
+	}
+}
+
 // TestGetCookiesSinglePeerDrivenGrantKeysOrigin proves the frozen single path is
 // peer-driven: a get_cookies with an explicit browser and an origin resolves the grant
 // via peerRequestor ("host:"+origin), so a warm cache is served silently to the peer's

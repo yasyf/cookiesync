@@ -520,3 +520,26 @@ func TestRoutedBatchBulkCachesSiblingProfiles(t *testing.T) {
 		t.Fatalf("cache puts = %v, want the requested endpoint %s put last", puts, requested)
 	}
 }
+
+// TestKeyApproverProbeErrorClassifiesUnavailable proves an approver-mode probe
+// failure classifies Unavailable — the flake fails over instead of killing the
+// requesting host's routed release.
+func TestKeyApproverProbeErrorClassifiesUnavailable(t *testing.T) {
+	probeErr := errors.New("ioreg: signal: killed")
+	probe := func(context.Context) (presence.SessionSnapshot, error) {
+		return presence.SessionSnapshot{}, probeErr
+	}
+	consent := &fakeConsent{key: cookie.DeriveKey(cookie.SafeStorageKey("peanuts"))}
+	b := newTestBroker(consent, newFakeCache(), probe, &recordingRunner{}, stateWith("me@laptop", ""))
+
+	_, _, err := b.Key(context.Background(), Req{Requestor: "host:them", Browser: "chrome", Profile: "Default", Reason: testConsentReason, Mode: ModeApprover})
+	if !errors.Is(err, probeErr) {
+		t.Fatalf("Key over a failed probe = %v, want it to wrap %v", err, probeErr)
+	}
+	if got := Classify(err); got != VerdictUnavailable {
+		t.Fatalf("Classify(probe error) = %v, want VerdictUnavailable", got)
+	}
+	if len(consent.promptedReasons) != 0 {
+		t.Fatalf("a failed probe must not prompt, got %v", consent.promptedReasons)
+	}
+}

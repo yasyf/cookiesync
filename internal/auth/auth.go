@@ -139,19 +139,20 @@ type AuthRequired struct { //nolint:revive // the established name of this error
 
 func (e *AuthRequired) Error() string { return e.Msg }
 
-// approverCacheError marks an approver's initial cache-read failure as retryable by another mesh host.
-type approverCacheError struct {
+// approverUnavailableError marks an approver-side failure — a flaky presence
+// probe or a broken initial cache read — as retryable by another mesh host.
+type approverUnavailableError struct {
 	err error
 }
 
-func (e *approverCacheError) Error() string { return e.err.Error() }
-func (e *approverCacheError) Unwrap() error { return e.err }
+func (e *approverUnavailableError) Error() string { return e.err.Error() }
+func (e *approverUnavailableError) Unwrap() error { return e.err }
 
 // Classify maps a release error to the verdict a renderer branches on: nil is
-// OK, a locked keybag, a fail-closed AuthRequired, or an approver's broken cache
-// is Unavailable, a declined prompt is Denied, and anything else is Fatal. The
-// keybag check runs first — a ConsentError wrapping ErrKeybagLocked is
-// retryable, never a denial.
+// OK, a locked keybag, a fail-closed AuthRequired, or an approver's failed
+// probe or broken cache is Unavailable, a declined prompt is Denied, and
+// anything else is Fatal. The keybag check runs first — a ConsentError wrapping
+// ErrKeybagLocked is retryable, never a denial.
 func Classify(err error) Verdict {
 	if err == nil {
 		return VerdictOK
@@ -163,8 +164,8 @@ func Classify(err error) Verdict {
 	if errors.As(err, &authErr) {
 		return VerdictUnavailable
 	}
-	var cacheErr *approverCacheError
-	if errors.As(err, &cacheErr) {
+	var unavailErr *approverUnavailableError
+	if errors.As(err, &unavailErr) {
 		return VerdictUnavailable
 	}
 	var declined *cookie.ConsentError

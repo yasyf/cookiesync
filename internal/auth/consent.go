@@ -48,11 +48,12 @@ func newNonce() (string, error) {
 // routedRelease routes the user-presence gate across the approver candidates —
 // a set consent_route_to first, then every mesh peer — and releases this host's
 // own key non-interactively after the first bound approval. A peer that is not
-// live, timed out, failed at the ssh transport (exit-255), or answered an
+// live, whose whoami leg failed at ssh (probeRoutesAround), whose consent leg
+// timed out or failed at the ssh transport (exit-255), or that answered an
 // explicit unavailable is routed around: the next candidate is tried. Any other
 // failure — a whoami or consent reply that does not parse, an unexpected status,
-// a remote command's real exit — propagates fatally rather than masquerading as
-// peer-offline. A denial is terminal — a human said no, and no other peer
+// a consent leg's real remote exit — propagates fatally rather than masquerading
+// as peer-offline. A denial is terminal — a human said no, and no other peer
 // is ever asked — and an approval that fails to echo the exact nonce and
 // endpoint this host sent fails closed with AuthRequired: a mismatch is a
 // security failure, never a retry. Each attempt binds its own fresh nonce. Only
@@ -81,7 +82,7 @@ func (b *Broker) routedRelease(ctx context.Context, browser cookie.Browser, brow
 	var lastErr error
 	for _, peer := range candidates {
 		live, err := b.peerIsLive(ctx, peer)
-		if err != nil && !routesAround(err) {
+		if err != nil && !probeRoutesAround(err) {
 			return nil, err
 		}
 		if err != nil || !live {
@@ -171,10 +172,10 @@ func (b *Broker) peerIsLive(ctx context.Context, peer string) (bool, error) {
 	return summary.OnConsole && !summary.Locked && !summary.ScreenShared, nil
 }
 
-// routesAround reports whether a probe or consent-leg failure is a genuine
-// transport failure the routed-consent failover may route around: a timed-out
-// leg, or an *hostregistry.SSHError caused by ssh's own exit-255 connection
-// failure. Anything else is a protocol failure the caller propagates.
+// routesAround reports whether a consent-leg failure is a genuine transport
+// failure the routed-consent failover may route around: a timed-out leg, or an
+// *hostregistry.SSHError caused by ssh's own exit-255 connection failure.
+// Anything else is a protocol failure the caller propagates.
 func routesAround(err error) bool {
 	if errors.Is(err, context.DeadlineExceeded) {
 		return true
@@ -185,4 +186,16 @@ func routesAround(err error) bool {
 	}
 	var exitErr *exec.ExitError
 	return errors.As(sshErr.Err, &exitErr) && exitErr.ExitCode() == sshConnFailureExit
+}
+
+// probeRoutesAround reports whether a whoami liveness-probe failure routes to
+// the next candidate: a timed-out probe, or ANY *hostregistry.SSHError — a peer
+// that cannot answer liveness is not a live approver, whatever the exit code.
+// A whoami reply that fails to parse stays fatal.
+func probeRoutesAround(err error) bool {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var sshErr *hostregistry.SSHError
+	return errors.As(err, &sshErr)
 }

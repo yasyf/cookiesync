@@ -291,6 +291,70 @@ func TestRoutedReleaseFailsOverUnreachableApprover(t *testing.T) {
 	}
 }
 
+// whoamiErrMesh wraps an approverMesh, failing the whoami leg for one target
+// with a fixed error; every other call delegates to the embedded mesh.
+type whoamiErrMesh struct {
+	*approverMesh
+	target string
+	err    error
+}
+
+func (r *whoamiErrMesh) Run(ctx context.Context, target, cmd string, stdin []byte) (string, error) {
+	if target == r.target && strings.Contains(cmd, "whoami") {
+		r.mu.Lock()
+		r.calls = append(r.calls, runnerCall{target: target, cmd: cmd})
+		r.mu.Unlock()
+		return "", r.err
+	}
+	return r.approverMesh.Run(ctx, target, cmd, stdin)
+}
+
+// TestRoutedReleaseFailsOverWhoamiErrorApprover proves a whoami leg that fails
+// with an SSHError — even a non-255 remote exit, the shape an approver-side
+// hard RPC error produces — routes to the next candidate: a peer that cannot
+// answer liveness is not a live approver.
+func TestRoutedReleaseFailsOverWhoamiErrorApprover(t *testing.T) {
+	self := "me@laptop"
+	broken := "broken@box"
+	healthy := "healthy@box"
+	nonce := "probe-err-nonce"
+	endpoint := endpointID(self, "chrome", "Default")
+
+	fakeMesh(t, self, broken, healthy)
+	consent := &fakeConsent{key: cookie.DeriveKey(cookie.SafeStorageKey("peanuts"))}
+	exit1 := exec.Command("/bin/sh", "-c", "exit 1").Run()
+	var exitErr *exec.ExitError
+	if !errors.As(exit1, &exitErr) {
+		t.Fatalf("fabricate exit-1: %v", exit1)
+	}
+	runner := &whoamiErrMesh{
+		approverMesh: &approverMesh{
+			whoami:  map[string]string{healthy: liveWhoami},
+			consent: map[string]string{healthy: approvedReply(t, nonce, endpoint)},
+		},
+		target: broken,
+		err:    &hostregistry.SSHError{Addr: broken, Stderr: "whoami failed remotely", Err: exit1},
+	}
+	st := stateWith(self, "", stateEndpoint(broken, "chrome", "Default"), stateEndpoint(healthy, "chrome", "Default"))
+
+	key, err := routedChrome(t, st, consent, runner, nonce)
+	if err != nil {
+		t.Fatalf("routedRelease across a whoami-erroring approver: %v", err)
+	}
+	if string(key) != string(consent.key) {
+		t.Fatalf("routedRelease returned the wrong key")
+	}
+	if probed := runner.probedTargets(); len(probed) != 2 || probed[0] != broken || probed[1] != healthy {
+		t.Fatalf("whoami probes = %v, want [%s %s]", probed, broken, healthy)
+	}
+	if asked := runner.consentTargets(); len(asked) != 1 || asked[0] != healthy {
+		t.Fatalf("request_consent dials = %v, want only %s (the broken whoami is routed around)", asked, healthy)
+	}
+	if consent.unpromptedCalled != 1 {
+		t.Fatalf("unprompted releases = %d, want 1", consent.unpromptedCalled)
+	}
+}
+
 // TestRoutedReleaseAdvancesPastWedgedProbe proves a peerIsLive probe timeout
 // routes around the wedged candidate: the next live approver is probed, asked,
 // and its approval releases the key.

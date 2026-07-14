@@ -113,7 +113,7 @@ func (b *Broker) Key(ctx context.Context, req Req) (cookie.AesKey, Surface, erro
 	if req.Mode == ModeApprover {
 		snap, err := b.probe(ctx)
 		if err != nil {
-			return nil, SurfaceNone, err
+			return nil, SurfaceNone, &approverUnavailableError{err: err}
 		}
 		live, err := presence.Attended(snap)
 		if err != nil {
@@ -131,7 +131,7 @@ func (b *Broker) Key(ctx context.Context, req Req) (cookie.AesKey, Surface, erro
 	cached, warm, err := b.cache.Get(ctx, id)
 	if err != nil {
 		if req.Mode == ModeApprover {
-			return nil, SurfaceNone, &approverCacheError{err: err}
+			return nil, SurfaceNone, &approverUnavailableError{err: err}
 		}
 		return nil, SurfaceNone, err
 	}

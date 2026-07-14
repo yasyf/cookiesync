@@ -97,6 +97,32 @@ func TestHandleRequestConsentKeybagLockedIsUnavailable(t *testing.T) {
 	}
 }
 
+// TestHandleRequestConsentProbeErrorReturnsUnavailable proves a flaky approver-side
+// presence probe — the 2s-bounded ioreg exec failing outright — answers
+// {"status":"unavailable"} so the requesting host tries the next approver, never a
+// raw RPC error that kills its routed release. The consent gate is never reached.
+func TestHandleRequestConsentProbeErrorReturnsUnavailable(t *testing.T) {
+	fakeMesh(t, "me@laptop")
+	consent := &fakeConsent{key: cookie.DeriveKey(cookie.SafeStorageKey("peanuts"))}
+	probe := func(context.Context) (SessionSnapshot, error) {
+		return SessionSnapshot{}, errors.New("ioreg: signal: killed")
+	}
+	d := New(consent, newFakeCache(), nil, probe, &recordingRunner{}, fixedState{}, fixedState{})
+
+	got, err := d.handleRequestConsent(context.Background(), map[string]any{
+		"browser": "chrome", "nonce": "n", "endpoint": "them@host:chrome:Default",
+	})
+	if err != nil {
+		t.Fatalf("handleRequestConsent over a failed probe must not error, got %v", err)
+	}
+	if marshalResult(t, got) != `{"status":"unavailable"}` {
+		t.Fatalf("probe error = %s, want unavailable", marshalResult(t, got))
+	}
+	if len(consent.promptedReasons) != 0 || len(consent.batchCalls) != 0 {
+		t.Fatalf("a failed probe must never reach the consent gate, got prompts %v and batches %v", consent.promptedReasons, consent.batchCalls)
+	}
+}
+
 // TestApproverBrokenCacheReturnsUnavailableNotError is the mesh-failover fix: an
 // approver whose key cache is broken — a Get that fails outright, the demoted-cache
 // shape a live incident produced — answers {"status":"unavailable"} so the requesting

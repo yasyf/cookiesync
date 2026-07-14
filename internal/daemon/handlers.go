@@ -442,6 +442,7 @@ func (d *Daemon) getCookiesAll(ctx context.Context, requestor string, urls []str
 	// REMOTE leg: parallel over a bounded semaphore, best-effort.
 	var mu sync.Mutex
 	var wg sync.WaitGroup
+	var pending []string
 	sem := make(chan struct{}, unionSSHConcurrency)
 	for _, ep := range remotes {
 		wg.Add(1)
@@ -456,6 +457,9 @@ func (d *Daemon) getCookiesAll(ctx context.Context, requestor string, urls []str
 				var peerErr *PeerReadError
 				if errors.As(err, &peerErr) {
 					warnings = append(warnings, renderPeerReadWarning(string(ep.ID()), peerErr))
+					if peerErr.TimedOut {
+						pending = append(pending, peerErr.Host)
+					}
 					return
 				}
 				warnings = append(warnings, fmt.Sprintf("skip %s: %v", ep.ID(), err))
@@ -467,7 +471,7 @@ func (d *Daemon) getCookiesAll(ctx context.Context, requestor string, urls []str
 	wg.Wait()
 
 	if len(sets) == 0 {
-		return nil, errors.New("no endpoint contributed cookies; run cookiesync auth")
+		return nil, noContributionError(warnings, pending)
 	}
 	reply := cookiesPayload(cookie.MergeRanked(sets...))
 	if len(warnings) > 0 {

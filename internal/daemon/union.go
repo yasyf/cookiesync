@@ -3,6 +3,7 @@ package daemon
 import (
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 
 	"github.com/yasyf/cookiesync/internal/auth"
@@ -46,6 +47,18 @@ func renderPeerReadWarning(endpoint string, err *PeerReadError) string {
 	default:
 		return fmt.Sprintf("skip %s: %v; is the daemon running on %s?", endpoint, err.Err, err.Host)
 	}
+}
+
+// noContributionError renders a total union shutout: a summary line — naming
+// the peers whose reads timed out (consent may be pending there), else the
+// plain auth hint — followed by every accumulated skip warning.
+func noContributionError(warnings, pending []string) error {
+	summary := "no endpoint contributed cookies; run cookiesync auth"
+	if len(pending) > 0 {
+		hosts := slices.Compact(slices.Sorted(slices.Values(pending)))
+		summary = fmt.Sprintf("no endpoint contributed cookies; consent may be pending on %s — approve it there and retry", strings.Join(hosts, ", "))
+	}
+	return fmt.Errorf("%s\n  %s", summary, strings.Join(warnings, "\n  "))
 }
 
 func renderLocalKeyWarning(endpoint string, err error) string {
