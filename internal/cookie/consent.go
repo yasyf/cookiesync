@@ -95,6 +95,9 @@ type Consent interface {
 	// ObtainKeyUnprompted releases the key non-interactively via a bare Keychain
 	// read, for the owning host only after a routed approval has already gated it.
 	ObtainKeyUnprompted(ctx context.Context, browser Browser) (AesKey, error)
+	// ObtainKeyBiometric releases the key behind a strict biometric-only tap, with
+	// no passcode or non-interactive fallback — the gate the live CDP bridge uses.
+	ObtainKeyBiometric(ctx context.Context, browser Browser, reason string) (AesKey, error)
 }
 
 // TouchIDConsent is a Secure-Enclave-bound key vault: one biometric tap unlocks
@@ -142,6 +145,29 @@ func (c TouchIDConsent) ObtainKey(ctx context.Context, browser Browser, reason s
 		return nil, &ConsentError{Msg: fmt.Sprintf("could not read %q from the Keychain (denied or missing)", browser.KeychainService)}
 	}
 	return outcome.Key, nil
+}
+
+// ObtainKeyBiometric releases browser's Safe Storage key behind a strict
+// biometric-only tap via the helper's vault-retrieve-biometric op — no passcode
+// and no bare Keychain fallback, so an unavailable biometry or locked keybag
+// fails closed rather than degrading. It is the gate the live CDP bridge uses.
+func (c TouchIDConsent) ObtainKeyBiometric(ctx context.Context, browser Browser, reason string) (AesKey, error) {
+	res, err := c.Helper.CDPUnlock(ctx, vaultName(browser), ComposeReason(browser.Display, reason))
+	if err != nil {
+		return nil, err
+	}
+	switch res.Code {
+	case 0:
+		return DeriveKey(SafeStorageKey(res.Stdout)), nil
+	case 1:
+		return nil, &ConsentError{Msg: "Touch ID (biometric) was cancelled or denied"}
+	case helper.CodePresenceUnavailable:
+		return nil, &ConsentError{Msg: "biometric authentication unavailable (no enrolled biometry, locked out, or screen locked)", Err: ErrKeybagLocked}
+	case 2:
+		return nil, &ConsentError{Msg: "bridge vault missing — re-enroll"}
+	default:
+		return nil, fmt.Errorf("vault-retrieve-biometric exited %d: %s", res.Code, bytes.TrimSpace(res.Stderr))
+	}
 }
 
 // ObtainKeys releases every browser's Safe Storage key behind a single Touch ID

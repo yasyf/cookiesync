@@ -59,6 +59,7 @@ func newRoot(version string) *cobra.Command {
 		newBrowserCmd(),
 		newAuthCmd(),
 		newCookiesCmd(),
+		newBridgeCmd(),
 		newRouteConsentCmd(),
 		newSelfCmd(),
 		newRequestorCmd(),

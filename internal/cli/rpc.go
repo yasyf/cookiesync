@@ -24,6 +24,8 @@ func newRPCCmd() *cobra.Command {
 		newRPCReconcileCmd(),
 		newRPCWhoamiCmd(),
 		newRPCRequestConsentCmd(),
+		newRPCBridgeOpenCmd(),
+		newRPCBridgeCloseCmd(),
 	)
 	return cmd
 }
@@ -230,5 +232,44 @@ func newRPCRequestConsentCmd() *cobra.Command {
 	_ = cmd.MarkFlagRequired("browser")
 	_ = cmd.MarkFlagRequired("nonce")
 	_ = cmd.MarkFlagRequired("endpoint")
+	return cmd
+}
+
+func newRPCBridgeOpenCmd() *cobra.Command {
+	var browser, profile, host string
+	var headless bool
+	cmd := &cobra.Command{
+		Use:   "bridge_open",
+		Short: "Ask the daemon to open a cookie-seeded CDP bridge and return its ws endpoint.",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			return rpcPassthrough(cmd, "bridge_open", map[string]any{
+				"host":    host,
+				"browser": browser,
+				"profile": profile,
+				"headed":  !headless,
+			})
+		},
+	}
+	cmd.Flags().StringVar(&browser, "browser", "", "The browser to seed the bridge from.")
+	cmd.Flags().StringVar(&profile, "profile", "Default", "The profile to seed the bridge from.")
+	cmd.Flags().StringVar(&host, "host", "", "The host that owns the browser (empty = local).")
+	cmd.Flags().BoolVar(&headless, "headless", false, "Run Chrome headless.")
+	_ = cmd.MarkFlagRequired("browser")
+	return cmd
+}
+
+func newRPCBridgeCloseCmd() *cobra.Command {
+	var capability string
+	cmd := &cobra.Command{
+		Use:   "bridge_close",
+		Short: "Ask the daemon to tear down a bridge session by its capability.",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			return rpcPassthrough(cmd, "bridge_close", map[string]any{"capability": capability})
+		},
+	}
+	cmd.Flags().StringVar(&capability, "capability", "", "The bridge capability to close.")
+	_ = cmd.MarkFlagRequired("capability")
 	return cmd
 }

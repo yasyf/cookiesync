@@ -169,6 +169,15 @@ func (b Bridge) CacheDropkey(ctx context.Context, label string) (Result, error) 
 	return b.run(ctx, nil, nil, "cache-dropkey", label)
 }
 
+// CDPUnlock runs vault-retrieve-biometric: the strict biometrics-only vault read
+// for the live CDP bridge, with no passcode fallback. reason is set as
+// COOKIESYNC_TOUCHID_REASON. stdout is the raw Safe Storage password, identical
+// to VaultRetrieve. Exit 0 is success, 1 cancelled/denied, 2 vault missing, and
+// CodePresenceUnavailable is biometrics unavailable or a locked keybag.
+func (b Bridge) CDPUnlock(ctx context.Context, vault, reason string) (Result, error) {
+	return b.run(ctx, nil, []string{reasonEnvVar + "=" + reason}, "vault-retrieve-biometric", vault)
+}
+
 // run executes one helper subcommand, feeding stdin (when non-nil) and appending
 // extraEnv to the inherited environment. It returns the helper's exit code,
 // stdout, and stderr; a non-zero exit is reported in Result.Code, not as an

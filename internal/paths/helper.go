@@ -22,11 +22,6 @@ func (e *HelperError) Error() string {
 	return fmt.Sprintf("cookiesync key helper not found at %s; run 'cookiesync install' to fetch the signed helper", e.Path)
 }
 
-// helperEnvOverride points the resolver at a specific cookiesync-keyhelper.app
-// bundle, for development or a non-Homebrew install; it takes precedence over the
-// Caskroom lookup.
-const helperEnvOverride = "COOKIESYNC_HELPER"
-
 // helperCask is the Homebrew cask that stages the signed helper bundle.
 const helperCask = "cookiesync-keyhelper"
 
@@ -58,13 +53,9 @@ func SetHelperBinaryForTest(path string) (restore func()) {
 // HelperAppPath returns the cookiesync-keyhelper.app bundle. The cask stages it
 // (stage_only) so the whole bundle lives intact in the Homebrew Caskroom — never
 // /Applications — keeping its bundle-relative provisioning profile alongside the
-// binary so the Secure Enclave keychain-access-group stays authorized.
-// $COOKIESYNC_HELPER overrides for development. A *HelperError reports a bundle
-// that is not staged.
+// binary so the Secure Enclave keychain-access-group stays authorized. A
+// *HelperError reports a bundle that is not staged.
 func HelperAppPath() (string, error) {
-	if env := os.Getenv(helperEnvOverride); env != "" {
-		return env, nil
-	}
 	for _, prefix := range brewPrefixes() {
 		matches, _ := filepath.Glob(filepath.Join(prefix, "Caskroom", helperCask, "*", helperApp))
 		for _, app := range matches {

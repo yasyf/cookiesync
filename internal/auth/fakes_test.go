@@ -66,9 +66,16 @@ type fakeConsent struct {
 	obtainErr  error
 	missingFor cookie.BrowserName
 
+	// biometricKey and biometricErr script ObtainKeyBiometric independently of
+	// the passcode-capable paths, so a bridge test proves it took the strict
+	// biometric seam and not ObtainKey/ObtainKeys.
+	biometricKey cookie.AesKey
+	biometricErr error
+
 	mu               sync.Mutex
 	promptedReasons  []string
 	batchCalls       []consentBatchCall
+	biometricReasons []string
 	unpromptedCalled int
 }
 
@@ -114,6 +121,31 @@ func (c *fakeConsent) ObtainKeyUnprompted(_ context.Context, _ cookie.Browser) (
 	c.unpromptedCalled++
 	c.mu.Unlock()
 	return c.key, nil
+}
+
+func (c *fakeConsent) ObtainKeyBiometric(_ context.Context, _ cookie.Browser, reason string) (cookie.AesKey, error) {
+	c.mu.Lock()
+	c.biometricReasons = append(c.biometricReasons, reason)
+	c.mu.Unlock()
+	if c.biometricErr != nil {
+		return nil, c.biometricErr
+	}
+	return c.biometricKey, nil
+}
+
+// biometricCount reports how many times ObtainKeyBiometric was invoked.
+func (c *fakeConsent) biometricCount() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return len(c.biometricReasons)
+}
+
+// promptCount reports how many times ObtainKey or ObtainKeys was invoked — the
+// passcode-capable paths a bridge release must never reach.
+func (c *fakeConsent) promptCount() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return len(c.promptedReasons)
 }
 
 // fakeCache is an in-memory key cache double storing raw keys without wrapping.

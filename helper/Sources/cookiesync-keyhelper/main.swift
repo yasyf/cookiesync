@@ -17,6 +17,11 @@
 //   Consent vault (biometry-or-passcode-bound Safe Storage password):
 //     vault-enroll   <vault-service> <safe-storage-service>
 //     vault-retrieve <vault-service>
+//     vault-retrieve-biometric <vault-service>
+//                    like vault-retrieve, but gated on Touch ID biometrics only —
+//                    no device-passcode fallback and no non-interactive path. Fails
+//                    closed (exit 3) when biometrics are unavailable, not enrolled,
+//                    or locked out; never returns the key without a live biometric.
 //     vault-batch-retrieve <vault-service> <safe-storage-service> [<vault-service> <safe-storage-service> ...]
 //                    one auth sheet for the whole batch, then one stdout line per
 //                    item: <index>\t<ok|missing|error>\t<payload>, where payload is
@@ -42,7 +47,9 @@
 //       non-interactive, key generation misconfigured)
 //   3 = presence unavailable: the data-protection keybag refused the operation with
 //       errSecInteractionNotAllowed (-25308) — screen locked / no user present;
-//       retry after unlock. Aborts a vault-batch-retrieve mid-batch.
+//       retry after unlock. Aborts a vault-batch-retrieve mid-batch. Also returned by
+//       vault-retrieve-biometric when biometrics are unavailable, not enrolled, or
+//       locked out, so the caller fails closed instead of falling back to a passcode.
 
 import Foundation
 import LocalAuthentication
@@ -175,6 +182,47 @@ func evaluateVaultPolicy(_ context: LAContext) -> Int32? {
     return 1
 }
 
+// evaluateStrictBiometricPolicy runs the single deviceOwnerAuthenticationWithBiometrics
+// sheet behind the biometrics-only vault read, with COOKIESYNC_TOUCHID_REASON as the
+// prompt text. localizedFallbackTitle is cleared so no passcode-fallback button is
+// offered. Returns nil when biometrics approved, otherwise the exit code (3 =
+// biometrics unavailable / cannot evaluate policy / not enrolled / locked out — fail
+// closed, never a silent success; 1 = denied/cancelled).
+func evaluateStrictBiometricPolicy(_ context: LAContext) -> Int32? {
+    context.localizedFallbackTitle = ""
+    var policyError: NSError?
+    guard context.canEvaluatePolicy(.deviceOwnerAuthenticationWithBiometrics, error: &policyError) else {
+        fail("biometrics unavailable: \(policyError?.localizedDescription ?? "no enrolled biometry")")
+        return 3
+    }
+    let reason = ProcessInfo.processInfo.environment["COOKIESYNC_TOUCHID_REASON"]
+        ?? "unlock your cookie vault"
+
+    let semaphore = DispatchSemaphore(value: 0)
+    var approved = false
+    var evalError: Error?
+    context.evaluatePolicy(.deviceOwnerAuthenticationWithBiometrics, localizedReason: reason) { ok, error in
+        approved = ok
+        evalError = error
+        semaphore.signal()
+    }
+    semaphore.wait()
+
+    if approved {
+        return nil
+    }
+    if let laError = evalError as? LAError {
+        switch laError.code {
+        case .biometryNotAvailable, .biometryNotEnrolled, .biometryLockout,
+             .notInteractive, .invalidContext, .passcodeNotSet:
+            return 3
+        default:
+            return 1
+        }
+    }
+    return 1
+}
+
 func vaultRetrieve(vaultService: String) -> Int32 {
     let context = LAContext()
     if let code = evaluateVaultPolicy(context) {
@@ -189,6 +237,53 @@ func vaultRetrieve(vaultService: String) -> Int32 {
         kSecMatchLimit as String: kSecMatchLimitOne,
         kSecUseDataProtectionKeychain as String: true,
         kSecUseAuthenticationContext as String: context,
+    ]
+    var item: CFTypeRef?
+    let status = SecItemCopyMatching(query as CFDictionary, &item)
+    switch status {
+    case errSecSuccess:
+        guard let data = item as? Data else {
+            fail("vault item returned no data")
+            return 1
+        }
+        FileHandle.standardOutput.write(data)
+        return 0
+    case errSecItemNotFound, errSecAuthFailed:
+        // The biometry-bound item is gone or invalidated (the fingerprint set
+        // changed, which voids a .biometryCurrentSet ACL). Signal re-enroll.
+        fail("vault item '\(vaultService)' missing or invalidated: re-enroll")
+        return 2
+    case errSecUserCanceled:
+        fail("retrieve cancelled by user")
+        return 1
+    default:
+        fail("SecItemCopyMatching failed: \(SecCopyErrorMessageString(status, nil) as String? ?? "\(status)")")
+        return 1
+    }
+}
+
+// vaultRetrieveBiometric mirrors vaultRetrieve — same Secure-Enclave vault read and
+// key-bytes stdout — but gates it on deviceOwnerAuthenticationWithBiometrics only, so
+// there is no device-passcode fallback and no non-interactive path. The key read runs
+// only after evaluateStrictBiometricPolicy returns nil (a live biometric approval);
+// any other outcome returns its exit code without touching the keychain.
+func vaultRetrieveBiometric(vaultService: String) -> Int32 {
+    let context = LAContext()
+    if let code = evaluateStrictBiometricPolicy(context) {
+        return code
+    }
+
+    let query: [String: Any] = [
+        kSecClass as String: kSecClassGenericPassword,
+        kSecAttrService as String: vaultService,
+        kSecAttrAccessGroup as String: KEYCHAIN_ACCESS_GROUP,
+        kSecReturnData as String: true,
+        kSecMatchLimit as String: kSecMatchLimitOne,
+        kSecUseDataProtectionKeychain as String: true,
+        kSecUseAuthenticationContext as String: context,
+        // Fail closed: the pre-authenticated context satisfies the ACL, so no UI is
+        // needed — refuse (never show) a second, passcode-capable Keychain prompt.
+        kSecUseAuthenticationUI as String: kSecUseAuthenticationUIFail,
     ]
     var item: CFTypeRef?
     let status = SecItemCopyMatching(query as CFDictionary, &item)
@@ -475,6 +570,7 @@ guard arguments.count >= 3 else {
     fail("usage: cookiesync-keyhelper <subcommand> <arg> [arg]")
     fail("  vault-enroll <vault-service> <safe-storage-service>")
     fail("  vault-retrieve <vault-service>")
+    fail("  vault-retrieve-biometric <vault-service>")
     fail("  vault-batch-retrieve <vault-service> <safe-storage-service> [<vault-service> <safe-storage-service> ...]")
     fail("  vault-status <vault-service>")
     fail("  cache-newkey|cache-wrap|cache-unwrap|cache-dropkey <label>")
@@ -490,6 +586,8 @@ case "vault-enroll":
     exit(vaultEnroll(vaultService: arguments[2], safeStorageService: arguments[3]))
 case "vault-retrieve":
     exit(vaultRetrieve(vaultService: arguments[2]))
+case "vault-retrieve-biometric":
+    exit(vaultRetrieveBiometric(vaultService: arguments[2]))
 case "vault-batch-retrieve":
     let rest = Array(arguments.dropFirst(2))
     guard rest.count % 2 == 0 else {

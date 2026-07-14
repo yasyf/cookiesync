@@ -30,9 +30,11 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/yasyf/cookiesync/internal/auth"
+	"github.com/yasyf/cookiesync/internal/bridge"
 	"github.com/yasyf/cookiesync/internal/cache"
 	"github.com/yasyf/cookiesync/internal/cookie"
 	"github.com/yasyf/cookiesync/internal/engine"
@@ -79,6 +81,18 @@ type Daemon struct {
 	runner   engine.SSHRunner
 	state    StateLoader
 	registry RegistryLoader
+
+	// seedSource and hostBinary are the two bridge test seams: the profile read
+	// and the Chrome resolver, defaulted in New and overridden in tests.
+	seedSource func(context.Context, cookie.Browser, string, cookie.AesKey) (cookie.StorageState, int, error)
+	hostBinary func() (string, error)
+
+	bridgeMu       sync.Mutex
+	bridges        map[string]*bridgeSession
+	bridgeShutdown bool
+	bridgeLock     *os.File
+	bridgeStop     chan struct{}
+	bridgeStopOnce sync.Once
 }
 
 // Build wires the production daemon: Touch ID consent, the per-boot
@@ -91,6 +105,21 @@ func Build(ctx context.Context) (*Daemon, func(context.Context) error, error) {
 	if err != nil {
 		return nil, nil, err
 	}
+	// Own the bridge lock before the destructive sweep so a second daemon can't
+	// reap a live sibling's bridges; a crashed owner's flock is auto-released.
+	owned, err := d.acquireBridgeOwnership()
+	if err != nil {
+		_ = keyCache.Close(ctx)
+		return nil, nil, err
+	}
+	// Reap any bridge a crashed daemon left running, then arm the expiry reaper.
+	if owned {
+		if err := d.sweepOrphanBridges(ctx); err != nil {
+			_ = keyCache.Close(ctx)
+			return nil, nil, err
+		}
+	}
+	d.startBridgeReaper()
 	return d, keyCache.Close, nil
 }
 
@@ -127,12 +156,16 @@ func build(ctx context.Context) (*Daemon, *cache.KeyCache, error) {
 // fields directly.
 func New(consent cookie.Consent, c Cache, eng *engine.Engine, probe Probe, runner engine.SSHRunner, st StateLoader, reg RegistryLoader) *Daemon {
 	return &Daemon{
-		broker:   auth.NewBroker(consent, c, probe, runner, st),
-		engine:   eng,
-		probe:    probe,
-		runner:   runner,
-		state:    st,
-		registry: reg,
+		broker:     auth.NewBroker(consent, c, probe, runner, st),
+		engine:     eng,
+		probe:      probe,
+		runner:     runner,
+		state:      st,
+		registry:   reg,
+		bridges:    map[string]*bridgeSession{},
+		bridgeStop: make(chan struct{}),
+		seedSource: cookie.SeedState,
+		hostBinary: bridge.ResolveHostBinary,
 	}
 }
 
@@ -164,6 +197,11 @@ func (d *Daemon) Dispatcher() *synckit.Dispatcher {
 	dispatcher.Register("get_web_storage", d.handleGetWebStorage)
 	dispatcher.Register("auth_status", d.handleAuthStatus)
 	dispatcher.Register("request_consent", d.handleRequestConsent)
+	// Bridge methods stay concurrent (plain Register): a mid-flight routed
+	// consent must keep answering while a bridge open is in progress.
+	dispatcher.Register("bridge_open", d.handleBridgeOpen)
+	dispatcher.Register("bridge_status", d.handleBridgeStatus)
+	dispatcher.Register("bridge_close", d.handleBridgeClose)
 	return dispatcher
 }
 
@@ -180,6 +218,7 @@ func Serve(ctx context.Context) error {
 	defer func() {
 		shutdownCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
 		defer cancel()
+		d.closeAllBridges(shutdownCtx)
 		if err := closer(shutdownCtx); err != nil {
 			fmt.Fprintf(os.Stderr, "cookiesync: drop Enclave key on shutdown: %v\n", err)
 		}

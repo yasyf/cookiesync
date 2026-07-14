@@ -84,6 +84,7 @@ type fakeConsent struct {
 	promptedReasons  []string
 	batchCalls       []consentBatchCall
 	unpromptedCalled int
+	biometricCalls   atomic.Int32
 }
 
 // consentBatchCall is one recorded fakeConsent.ObtainKeys invocation.
@@ -130,6 +131,14 @@ func (c *fakeConsent) ObtainKeyUnprompted(_ context.Context, _ cookie.Browser) (
 	return c.key, nil
 }
 
+func (c *fakeConsent) ObtainKeyBiometric(_ context.Context, _ cookie.Browser, _ string) (cookie.AesKey, error) {
+	c.biometricCalls.Add(1)
+	if c.obtainErr != nil {
+		return nil, c.obtainErr
+	}
+	return c.key, nil
+}
+
 // gateConsent blocks every ObtainKey until release closes, counting entries — the
 // consent double a concurrency test holds mid-prompt to prove concurrent cold primes
 // join one flight instead of prompting again. Like the real Touch ID gate, it honors
@@ -166,6 +175,10 @@ func (c *gateConsent) ObtainKeys(ctx context.Context, browsers []cookie.Browser,
 
 func (c *gateConsent) ObtainKeyUnprompted(_ context.Context, _ cookie.Browser) (cookie.AesKey, error) {
 	panic("gateConsent: unexpected unprompted release")
+}
+
+func (c *gateConsent) ObtainKeyBiometric(_ context.Context, _ cookie.Browser, _ string) (cookie.AesKey, error) {
+	panic("gateConsent: unexpected biometric release")
 }
 
 // partialGateConsent gates the batch like gateConsent — each ObtainKeys parks
@@ -214,6 +227,10 @@ func (c *partialGateConsent) ObtainKeyUnprompted(_ context.Context, _ cookie.Bro
 	panic("partialGateConsent: unexpected unprompted release")
 }
 
+func (c *partialGateConsent) ObtainKeyBiometric(_ context.Context, _ cookie.Browser, _ string) (cookie.AesKey, error) {
+	panic("partialGateConsent: unexpected biometric release")
+}
+
 // countingConsent tracks the peak number of concurrent ObtainKey prompts, holding
 // each for hold so an unserialized overlap is observable — the double that proves
 // promptGate admits one consent sheet at a time.
@@ -253,6 +270,10 @@ func (c *countingConsent) ObtainKeys(ctx context.Context, browsers []cookie.Brow
 
 func (c *countingConsent) ObtainKeyUnprompted(_ context.Context, _ cookie.Browser) (cookie.AesKey, error) {
 	panic("countingConsent: unexpected unprompted release")
+}
+
+func (c *countingConsent) ObtainKeyBiometric(_ context.Context, _ cookie.Browser, _ string) (cookie.AesKey, error) {
+	panic("countingConsent: unexpected biometric release")
 }
 
 // fakeCache is an in-memory key cache double: it stores raw keys without wrapping, so
