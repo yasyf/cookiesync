@@ -4,19 +4,30 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.14.0] - 2026-07-15
 
 ### Added
-- `cookiesync bridge open --host <peer>` opens a live CDP bridge on another Mac in the mesh
-  and forwards it back over ssh. The peer runs its own consent tap (strict biometric, or
-  routed to a third host per the peer's own config) and seeds the bridge with its own
-  cookies locally — the Safe Storage key is read and used entirely on the peer and never
-  crosses the wire. The origin spawns a detached `ssh -N -L` loopback forward, proves it up
-  against the peer's token-gated `/json/version` before publishing the ws endpoint, and
-  supervises it with a keepalive so the peer reaps the bridge the moment the origin goes
-  away; the peer's ≤10-minute lease is the crash-durable ceiling if a hard power-off outruns
-  the keepalive. `bridge ls` and `bridge stop` manage a cross-host bridge by the same
-  host:browser:profile target as a local one.
+- `cookiesync bridge open [browser[:profile]]` launches a throwaway Chrome seeded with your
+  real cookies and web storage behind one Touch ID tap, and exposes a live, token-gated CDP
+  endpoint on loopback for agent-browser or any CDP client to drive. The bridge speaks CDP to
+  Chrome over `--remote-debugging-pipe` — never an unauthenticated debugging port — and relays
+  a single client's traffic byte-for-byte over a token-gated WebSocket; the browser is torn
+  down when that client disconnects or the short bridge grant lapses. Cookies are seeded into
+  an off-the-record context, so the decrypted state never lands on same-UID-readable disk.
+  `bridge ls` and `bridge stop` manage running sessions.
+- agent-browser can drive the bridge two ways: `ab --bridge <site>` opens one and connects the
+  session to it, and a native `--provider cookiesync` plugin slots the bridge in wherever
+  `--provider browserbase` sits.
+- `cookiesync bridge open --host <peer>` opens the bridge on another Mac in the mesh and
+  forwards it back over ssh. The peer runs its own consent tap (strict biometric, or routed to
+  a third host per the peer's own config) and seeds the bridge with its own cookies locally —
+  the Safe Storage key is read and used entirely on the peer and never crosses the wire. The
+  origin spawns a detached `ssh -N -L` loopback forward, proves it up against the peer's
+  token-gated `/json/version` before publishing the ws endpoint, and supervises it with a
+  keepalive so the peer reaps the bridge the moment the origin goes away; the peer's ≤10-minute
+  lease is the crash-durable ceiling if a hard power-off outruns the keepalive. `bridge ls` and
+  `bridge stop` manage a cross-host bridge by the same host:browser:profile target as a local
+  one.
 
 ## [0.11.1] - 2026-07-13
 
