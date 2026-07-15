@@ -823,6 +823,9 @@ func TestWriteAllImmediateSoftBusyIsPrompt(t *testing.T) {
 }
 
 func TestReadCleansUpTempDir(t *testing.T) {
+	// Isolate os.TempDir() so a concurrent package's cookiesync-* temp dir (this
+	// suite runs under `go test -race ./...`) can't be miscounted as a leak.
+	t.Setenv("TMPDIR", t.TempDir())
 	browser := makeBrowser(t, t.TempDir(), "Default")
 	initDB(t, browser.CookiesDB("Default"), v24SQL)
 	before := tempDirCount(t)
