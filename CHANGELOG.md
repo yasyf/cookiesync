@@ -19,8 +19,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   **Upgrade note:** the first upgrade onto this build prompts once per service, because
   each one's identity moves from a path to the bundle — that is the last approval
-  you'll be asked for, and it also clears the access that macOS had marked denied under
-  the old path.
+  you'll be asked for, and it sheds any denials macOS had recorded against the old
+  path.
 
 ## [0.15.0] - 2026-07-16
 
