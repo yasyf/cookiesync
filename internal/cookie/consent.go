@@ -180,9 +180,10 @@ func (c TouchIDConsent) ObtainKeyBiometric(ctx context.Context, browser Browser,
 // (or passcode) sheet via vault-batch-retrieve, which enrolls a missing vault
 // item in-helper under the same authentication — no probe, no second tap. A
 // denied sheet or a locked keybag fails the whole batch with a ConsentError; a
-// host with no biometry and no passcode degrades to bare per-browser Keychain
-// reads. Every helper prompt on this path carries the composed reason, so the
-// helper never shows its generic default.
+// host with no biometry and no passcode (exit 2) degrades to bare per-browser
+// Keychain reads, but a rejected caller or usage error (exit 4) is a hard
+// failure that never degrades. Every helper prompt on this path carries the
+// composed reason, so the helper never shows its generic default.
 func (c TouchIDConsent) ObtainKeys(ctx context.Context, browsers []Browser, reason string) ([]KeyOutcome, error) {
 	items := make([]helper.VaultItem, len(browsers))
 	for i, b := range browsers {
@@ -201,6 +202,8 @@ func (c TouchIDConsent) ObtainKeys(ctx context.Context, browsers []Browser, reas
 		return bareOutcomes(ctx, browsers), nil
 	case helper.CodePresenceUnavailable:
 		return nil, &ConsentError{Msg: "the keychain keybag is locked (screen locked or no user present); retry after unlock", Err: ErrKeybagLocked}
+	case helper.CodeCallerRejected:
+		return nil, fmt.Errorf("vault-batch-retrieve rejected the caller or the invocation was malformed (exit %d); refusing to degrade to an unattended Keychain read: %s", res.Code, bytes.TrimSpace(res.Stderr))
 	default:
 		return nil, fmt.Errorf("vault-batch-retrieve exited %d: %s", res.Code, bytes.TrimSpace(res.Stderr))
 	}

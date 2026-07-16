@@ -486,6 +486,31 @@ func TestSecurityFallbackFailureRaises(t *testing.T) {
 	}
 }
 
+func TestCallerRejectedIsHardErrorNoBareRead(t *testing.T) {
+	// Exit 4 (rejected caller / usage error) must fail hard, never degrade to the
+	// bare read exit 2 uses. securityBin would succeed if called, so the error proves it.
+	script, logPath, _ := writeFakeHelper(t, fakeHelperSpec{
+		batchCode:   authkit.CodeCallerRejected,
+		batchStderr: "authkit: caller not pinned\n",
+	})
+	securityBin = writeFakeSecurity(t, 0, testPassword+"\n")
+	t.Cleanup(func() { securityBin = "/usr/bin/security" })
+	c := TouchIDConsent{Helper: helper.Bridge{Binary: script}}
+
+	outcomes, err := c.ObtainKeys(context.Background(), []Browser{chrome(t), arc(t)}, "post a tweet")
+	if outcomes != nil {
+		t.Fatalf("outcomes = %+v, want nil on an exit-4 hard failure (no bare read)", outcomes)
+	}
+	if err == nil {
+		t.Fatalf("exit 4 must surface an error, got nil")
+	}
+	lines := readLog(t, logPath)
+	if got := verbCount(lines, "vault-batch-retrieve"); got != 1 {
+		t.Fatalf("vault-batch-retrieve count = %d, want 1", got)
+	}
+	assertNoBlankPrompts(t, lines)
+}
+
 func TestObtainKeyUnpromptedDoesBareSecurityReadNoTouchID(t *testing.T) {
 	script, logPath, _ := writeFakeHelper(t, fakeHelperSpec{
 		batchCode: 0,

@@ -11,7 +11,8 @@
 // helper's raw exit code, stdout, and stderr so callers branch on the
 // documented 0 (success) / 1 (failed/denied/cancelled) / 2
 // (unavailable/not-found) / CodePresenceUnavailable (keybag locked, retry after
-// unlock) contract and log the helper's stderr diagnostics.
+// unlock) / CodeCallerRejected (non-pinned caller or usage error — a hard
+// failure, never degrade) contract and log the helper's stderr diagnostics.
 package helper
 
 import (
@@ -29,6 +30,13 @@ import (
 // screen is locked or no user is present. It is authkit's screen-locked code,
 // kept under cookiesync's name so callers can degrade instead of failing.
 const CodePresenceUnavailable = authkit.CodeScreenLocked
+
+// CodeCallerRejected is the helper exit code for a non-pinned caller, a
+// malformed invocation, or any misconfiguration — a hard failure cookiesync
+// must never degrade to an unattended Keychain read on, distinct from the
+// no-biometry exit 2 it may. It is authkit's caller-rejected code, kept under
+// cookiesync's name alongside CodePresenceUnavailable.
+const CodeCallerRejected = authkit.CodeCallerRejected
 
 // BatchStatus is the status column of one vault-batch-retrieve stdout line.
 type BatchStatus string
@@ -96,8 +104,9 @@ func (b Bridge) VaultStatus(ctx context.Context, vault string) (Result, error) {
 // AUTHKIT_REASON so the prompt text is always cookiesync's composed sentence.
 // Exit 0 means the sheet was approved and the per-item outcomes are the stdout
 // lines ParseBatchLines decodes; 1 is cancelled/denied, 2 is no
-// biometry/passcode, and CodePresenceUnavailable is a locked keybag, which
-// aborts the whole batch.
+// biometry/passcode, CodePresenceUnavailable is a locked keybag which aborts
+// the whole batch, and CodeCallerRejected is a rejected caller or usage error
+// that fails hard.
 func (b Bridge) VaultBatchRetrieve(ctx context.Context, items []VaultItem, reason string) (Result, error) {
 	args := make([]string, 0, 1+2*len(items))
 	args = append(args, "vault-batch-retrieve")
