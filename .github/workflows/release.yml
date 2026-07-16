@@ -20,3 +20,117 @@ jobs:
   release:
     uses: yasyf/homebrew-tap/.github/workflows/release-go.yml@v1
     secrets: inherit
+
+  # Wrap the cookiesync CLI in a signed, notarized, stapled CookieSync.app and ship it
+  # as the cookiesync cask (a bundle-inner `binary` symlink). tccd keys a bare Mach-O's
+  # grant by resolved path (client_type=1), so each versioned-Cellar upgrade re-prompts;
+  # a bundle is keyed by CFBundleIdentifier (client_type=0) and the grant survives. The
+  # wrap-daemon-bundle action does the codesign + notarize + staple; this job builds the
+  # universal binary, zips + attaches the .app, and renders + publishes the hand-managed
+  # cask (goreleaser's homebrew_casks can only serve a bare-binary archive — see
+  # .goreleaser.yaml). cookiesync's TCC classes (AppBundles + Automation) are not
+  # entitlement-backed, so no entitlements or provisioning profile are needed.
+  #
+  # Depends on release so the v* release already exists before the attach step:
+  # goreleaser owns release creation, and this job only ADDS the .app asset and pushes
+  # the cask.
+  app-build:
+    needs: [release]
+    runs-on: macos-15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Import Developer ID certificate
+        uses: yasyf/homebrew-tap/.github/actions/import-developer-id@v1
+        with:
+          p12: ${{ secrets.MACOS_SIGN_P12 }}
+          p12-password: ${{ secrets.MACOS_SIGN_PASSWORD }}
+          notary-key: ${{ secrets.MACOS_NOTARY_KEY }}
+          notary-key-id: ${{ secrets.MACOS_NOTARY_KEY_ID }}
+          notary-issuer-id: ${{ secrets.MACOS_NOTARY_ISSUER_ID }}
+
+      - name: Build the universal cookiesync binary (pure Go, arm64 + amd64 via lipo)
+        id: build
+        run: |
+          set -euo pipefail
+          # goreleaser strips the leading v for {{ .Version }}; match it so the stamped
+          # version, the bundle version, and the cask __VERSION__ all agree.
+          VERSION="${GITHUB_REF_NAME#v}"
+          mkdir -p dist
+          # Mirror .goreleaser.yaml's build: pure Go (modernc.org/sqlite), same ldflags.
+          LDFLAGS="-s -w -X main.version=${VERSION}"
+          CGO_ENABLED=0 GOARCH=arm64 go build -ldflags "$LDFLAGS" -o dist/cookiesync-arm64 .
+          CGO_ENABLED=0 GOARCH=amd64 go build -ldflags "$LDFLAGS" -o dist/cookiesync-amd64 .
+          lipo -create -output dist/cookiesync dist/cookiesync-arm64 dist/cookiesync-amd64
+          # Prove both slices and the version stamp reached the binary (lipo -archs
+          # order is not guaranteed, so assert each arch independently).
+          archs="$(lipo -archs dist/cookiesync)"
+          echo "$archs" | grep -qw arm64
+          echo "$archs" | grep -qw x86_64
+          dist/cookiesync --version | grep -q "$VERSION"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "binary=$PWD/dist/cookiesync" >> "$GITHUB_OUTPUT"
+
+      - name: Wrap the CLI in CookieSync.app (durable TCC bundle identity)
+        id: wrap
+        uses: yasyf/homebrew-tap/.github/actions/wrap-daemon-bundle@v1
+        with:
+          binary: ${{ steps.build.outputs.binary }}
+          bundle-id: com.github.yasyf.cookiesync
+          bundle-name: CookieSync
+          executable-name: cookiesync
+          version: ${{ steps.build.outputs.version }}
+
+      - name: Zip, checksum, and attach CookieSync.app
+        id: pkg
+        env:
+          BUNDLE: ${{ steps.wrap.outputs.bundle-path }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          # github.ref_name supplies the vX.Y.Z, so the asset stays
+          # CookieSync-v#{version}-darwin.zip — the cask url depends on it. ditto -c -k
+          # preserves the bundle metadata a plain zip drops; zip the STAPLED bundle.
+          zip="dist/CookieSync-${GITHUB_REF_NAME}-darwin.zip"
+          ditto -c -k --keepParent "$BUNDLE" "$zip"
+          sha="$(shasum -a 256 "$zip" | awk '{print $1}')"
+          shasum -a 256 "$zip" > "$zip.sha256"
+          echo "zip=$zip" >> "$GITHUB_OUTPUT"
+          echo "sha256=$sha" >> "$GITHUB_OUTPUT"
+
+      - name: Attach the .app zip to the release
+        uses: softprops/action-gh-release@v3
+        with:
+          files: |
+            ${{ steps.pkg.outputs.zip }}
+            ${{ steps.pkg.outputs.zip }}.sha256
+          # goreleaser already generated the notes when it created the release; this job
+          # only adds the .app asset, so it must not regenerate the body.
+          generate_release_notes: false
+          prerelease: ${{ contains(github.ref_name, '-') }}
+
+      # Only real, non-prerelease v* tags publish the cask: a `-`-bearing tag
+      # (e.g. v1.0.0-rc1) ships a prerelease asset that must not become the tap's latest.
+      - name: Render the cask
+        if: ${{ !contains(github.ref_name, '-') }}
+        uses: yasyf/homebrew-tap/.github/actions/render-formula@v1
+        with:
+          template: .github/cask/cookiesync.rb.tmpl
+          output: Casks/cookiesync.rb
+          substitutions: |
+            __SHA_APP__=${{ steps.pkg.outputs.sha256 }}
+
+      - name: Publish the cask to the tap
+        if: ${{ !contains(github.ref_name, '-') }}
+        uses: yasyf/homebrew-tap/.github/actions/publish@v1
+        with:
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          dir: tap-staging
+          message: "cookiesync ${{ github.ref_name }}"

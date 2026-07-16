@@ -56,41 +56,14 @@ changelog:
       - "^test:"
       - "^chore:"
 
-homebrew_casks:
-  - repository:
-      owner: yasyf
-      name: homebrew-tap
-      token: "{{ .Env.HOMEBREW_TAP_TOKEN }}"
-    homepage: https://github.com/yasyf/cookiesync
-    description: Sync your browser cookies across your Macs.
-    # The signed Secure-Enclave helper ships as the authkit cask (published from
-    # the authkit repo). Installing cookiesync pulls it so the Touch ID-gated vault
-    # and the per-boot Enclave key cache are available before the first sync.
-    dependencies:
-      - cask: authkit
-    # Strip the quarantine attribute so the (notarized, or unsigned) binary runs on
-    # first launch.
-    #
-    # brew upgrade swaps the binary on disk but never touches launchd, so the
-    # resident helper (com.github.yasyf.synckit.helper.cookiesync) keeps serving
-    # the old dispatcher until reboot. Kick it after every (re)install so upgrades
-    # self-deploy. must_succeed keeps first install a no-op — the agent only
-    # exists after `cookiesync install` + `synckitd install`.
-    hooks:
-      post:
-        install: |
-          if OS.mac?
-            system_command "/usr/bin/xattr",
-                           args: ["-dr", "com.apple.quarantine", "#{staged_path}/cookiesync"]
-          end
-          system_command "/bin/launchctl",
-                         args:         ["kickstart", "-k", "gui/#{Process.uid}/com.github.yasyf.synckit.helper.cookiesync"],
-                         must_succeed: false,
-                         print_stderr: false
-    caveats: |
-      Wire up the watch daemon and reconcile tick, then track your first browser:
-
-        cookiesync install
+# No homebrew_casks block: the cookiesync cask ships a signed, notarized, stapled
+# CookieSync.app (assembled by release.yml's app-build job via the shared
+# wrap-daemon-bundle tap action) and symlinks the CLI to the bundle-inner binary, so
+# every exec earns a DURABLE, CFBundleIdentifier-keyed TCC grant instead of the
+# path-keyed one a bare Cellar binary re-prompts for on every upgrade. goreleaser can
+# only serve a cask over its own archive artifacts (a bare Mach-O), so the cask is a
+# hand-managed template (.github/cask/cookiesync.rb.tmpl) rendered + published from
+# release.yml via the shared wrap-daemon-bundle → render-formula → publish tap pipeline.
 
 release:
   # The shared release workflow retries `goreleaser release` on transient
