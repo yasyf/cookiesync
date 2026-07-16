@@ -84,7 +84,7 @@ type Daemon struct {
 
 	// seedSource and hostBinary are the local-bridge test seams: the profile read
 	// and the Chrome resolver, defaulted in New and overridden in tests.
-	seedSource func(context.Context, cookie.Browser, string, cookie.AesKey) (cookie.StorageState, int, error)
+	seedSource func(context.Context, cookie.Browser, string, cookie.AesKey) (cookie.StorageState, cookie.SeedCounts, error)
 	hostBinary func() (string, error)
 
 	// openTunnel and openKeepalive are the cross-host bridge seams: the ssh -L

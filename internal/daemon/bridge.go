@@ -259,7 +259,7 @@ func (d *Daemon) openBridge(ctx context.Context, requestor, endpoint, browser, p
 		return nil, err
 	}
 
-	storage, skipped, err := d.seedSource(ctx, browserObj, profile, key)
+	storage, counts, err := d.seedSource(ctx, browserObj, profile, key)
 	if err != nil {
 		return nil, fmt.Errorf("seed source %s/%s: %w", browser, profile, err)
 	}
@@ -312,8 +312,12 @@ func (d *Daemon) openBridge(ctx context.Context, requestor, endpoint, browser, p
 		return nil, err
 	}
 	// Seeding is bounded on the RPC ctx, not the session's long-lived context.
-	if err := d.seedBridge(ctx, proc, storage); err != nil {
+	seeded, err := d.seedBridge(ctx, proc, storage)
+	if err != nil {
 		return nil, err
+	}
+	for _, rc := range seeded.Rejected {
+		fmt.Fprintf(os.Stderr, "cookiesync: chrome rejected cookie %s @ %s: %s\n", rc.Name, rc.Domain, rc.Reason)
 	}
 
 	token, err := mintSecret()
@@ -366,24 +370,53 @@ func (d *Daemon) openBridge(ctx context.Context, requestor, endpoint, browser, p
 	go d.watchBridge(sessionCtx, capability, server, sess.expiry)
 
 	result := sess.OpenResult()
-	result["skipped"] = skipped
+	result["seed"] = buildSeedReport(counts, seeded)
 	return result, nil
 }
 
+// seedReport is the observability payload bridge_open returns: what the seed
+// attempted, seeded, and dropped, with a per-cause breakdown that reconciles as
+// Attempted == Seeded + Undecryptable + Expired + CDPRejected (Skipped is their
+// sum). Rejected carries the cookies Chrome explicitly refused.
+type seedReport struct {
+	Attempted     int                     `json:"attempted"`
+	Seeded        int                     `json:"seeded"`
+	Skipped       int                     `json:"skipped"`
+	Undecryptable int                     `json:"undecryptable"`
+	Expired       int                     `json:"expired"`
+	CDPRejected   int                     `json:"cdp_rejected"`
+	Rejected      []bridge.RejectedCookie `json:"rejected,omitempty"`
+}
+
+// buildSeedReport folds the cookie-layer decrypt/expiry counts and the CDP-layer
+// seed report into the single reconciling payload the client renders.
+func buildSeedReport(counts cookie.SeedCounts, report bridge.SeedReport) seedReport {
+	return seedReport{
+		Attempted:     counts.Attempted,
+		Seeded:        report.CookiesSeeded,
+		Skipped:       counts.Undecryptable + counts.Expired + report.CDPRejected,
+		Undecryptable: counts.Undecryptable,
+		Expired:       counts.Expired,
+		CDPRejected:   report.CDPRejected,
+		Rejected:      report.Rejected,
+	}
+}
+
 // seedBridge dials the browser pipe and injects the storage state, bounded by a
-// derived timeout.
-func (d *Daemon) seedBridge(ctx context.Context, proc *bridge.Proc, storage cookie.StorageState) error {
+// derived timeout, returning the CDP seed report.
+func (d *Daemon) seedBridge(ctx context.Context, proc *bridge.Proc, storage cookie.StorageState) (bridge.SeedReport, error) {
 	seedCtx, cancel := context.WithTimeout(ctx, bridgeSeedTimeout)
 	defer cancel()
 	conn, err := proc.Dial(seedCtx)
 	if err != nil {
-		return fmt.Errorf("dial bridge: %w", err)
+		return bridge.SeedReport{}, fmt.Errorf("dial bridge: %w", err)
 	}
 	defer func() { _ = conn.Close() }()
-	if _, err := bridge.Seed(seedCtx, conn, storage); err != nil {
-		return fmt.Errorf("seed bridge: %w", err)
+	report, err := bridge.Seed(seedCtx, conn, storage)
+	if err != nil {
+		return bridge.SeedReport{}, fmt.Errorf("seed bridge: %w", err)
 	}
-	return nil
+	return report, nil
 }
 
 // watchBridge tears the session down on the first of a client disconnect, the

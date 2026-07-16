@@ -16,12 +16,28 @@ import (
 // Windows epoch (1601) and the Unix epoch (1970).
 const windowsEpochOffset = 11_644_473_600
 
-// SeedReport summarizes what was injected and what was dropped.
-// SessionStorageOrigins counts origins seeded on the OTR page; that
-// sessionStorage is tab-scoped and survives only while the external client keeps
-// driving the seeded tab (a fresh tab starts empty).
+// RejectedCookie identifies a cookie Chrome refused during seeding and the CDP
+// error it reported.
+type RejectedCookie struct {
+	Name   string `json:"name"`
+	Domain string `json:"domain"`
+	Reason string `json:"reason"`
+}
+
+// SeedReport summarizes what the CDP seed injected and dropped. CookiesSeeded is
+// what Chrome accepted (a live readback); CDPRejected is the count that failed to
+// land (sent minus accepted); Rejected is the subset Chrome explicitly errored on
+// during the per-cookie retry, so len(Rejected) may be below CDPRejected when
+// Chrome drops a cookie without reporting an error. SessionStorageOrigins counts
+// origins seeded on the OTR page; that sessionStorage is tab-scoped and survives
+// only while the external client keeps driving the seeded tab (a fresh tab starts
+// empty).
 type SeedReport struct {
-	Cookies, LocalStorageOrigins, SessionStorageOrigins, SkippedCookies int
+	CookiesSeeded         int
+	CDPRejected           int
+	Rejected              []RejectedCookie
+	LocalStorageOrigins   int
+	SessionStorageOrigins int
 }
 
 // Seed provisions an off-the-record CDP browser context, seeds it, and leaves a
@@ -58,12 +74,16 @@ func Seed(ctx context.Context, c *Conn, state cookie.StorageState) (SeedReport, 
 	report.LocalStorageOrigins = local
 	report.SessionStorageOrigins = session
 
-	accepted, skipped, err := seedCookies(ctx, c, browserContextID, state.Cookies)
+	accepted, rejected, err := seedCookies(ctx, c, browserContextID, state.Cookies)
 	if err != nil {
 		return report, err
 	}
-	report.Cookies = accepted
-	report.SkippedCookies = skipped
+	report.CookiesSeeded = accepted
+	report.Rejected = rejected
+	report.CDPRejected = len(state.Cookies) - accepted
+	if report.CDPRejected < 0 {
+		report.CDPRejected = 0
+	}
 
 	if err := closeOtherPages(ctx, c, pageID); err != nil {
 		return report, err
@@ -312,11 +332,11 @@ func attachTarget(ctx context.Context, c *Conn, targetID string) (string, error)
 
 // seedCookies sets every cookie into the OTR context in one Storage.setCookies
 // batch, isolating the good ones per-cookie if the batch is rejected (typically
-// an unsupported partitionKey shape), then reads back to count what Chrome
-// actually accepted.
-func seedCookies(ctx context.Context, c *Conn, browserContextID string, cookies []cookie.Cookie) (accepted, skipped int, err error) {
+// an unsupported partitionKey shape) and recording which cookies Chrome errored
+// on, then reads back to count what Chrome actually accepted.
+func seedCookies(ctx context.Context, c *Conn, browserContextID string, cookies []cookie.Cookie) (accepted int, rejected []RejectedCookie, err error) {
 	if len(cookies) == 0 {
-		return 0, 0, nil
+		return 0, nil, nil
 	}
 	params := make([]cdpCookieParam, len(cookies))
 	for i, ck := range cookies {
@@ -324,20 +344,18 @@ func seedCookies(ctx context.Context, c *Conn, browserContextID string, cookies 
 	}
 
 	if _, err := c.Call(ctx, "", "Storage.setCookies", map[string]any{"cookies": params, "browserContextId": browserContextID}); err != nil {
-		for _, p := range params {
-			_, _ = c.Call(ctx, "", "Storage.setCookies", map[string]any{"cookies": []cdpCookieParam{p}, "browserContextId": browserContextID})
+		for i, p := range params {
+			if _, rerr := c.Call(ctx, "", "Storage.setCookies", map[string]any{"cookies": []cdpCookieParam{p}, "browserContextId": browserContextID}); rerr != nil {
+				rejected = append(rejected, RejectedCookie{Name: p.Name, Domain: string(cookies[i].HostKey), Reason: rerr.Error()})
+			}
 		}
 	}
 
 	got, err := getCookieCount(ctx, c, browserContextID)
 	if err != nil {
-		return 0, 0, err
+		return 0, nil, err
 	}
-	skipped = len(params) - got
-	if skipped < 0 {
-		skipped = 0
-	}
-	return got, skipped, nil
+	return got, rejected, nil
 }
 
 func getCookieCount(ctx context.Context, c *Conn, browserContextID string) (int, error) {

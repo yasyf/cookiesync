@@ -51,7 +51,7 @@ func proxyBridgeSessionFor(d *Daemon, capability string) (*proxyBridgeSession, b
 // cannedBridgeOpenReply is the peer's bridge_open reply the recordingRunner
 // serves: the ws url advertises the origin's forwarded loopback and embeds the
 // peer token, and capB is the peer-side capability the origin manages it by.
-const cannedBridgeOpenReply = `{"url":"ws://127.0.0.1:5555/tok-b/devtools/browser/uuid-b","endpoint":"you@desktop:chrome:Default","browser":"chrome","profile":"Default","capability":"cap-b-secret","expires_in":600,"proxy_port":6000,"skipped":3}`
+const cannedBridgeOpenReply = `{"url":"ws://127.0.0.1:5555/tok-b/devtools/browser/uuid-b","endpoint":"you@desktop:chrome:Default","browser":"chrome","profile":"Default","capability":"cap-b-secret","expires_in":600,"proxy_port":6000,"seed":{"attempted":5,"seeded":2,"skipped":3,"undecryptable":1,"expired":1,"cdp_rejected":1}}`
 
 // newProxyDaemon builds a daemon wired for a cross-host open: a mesh with the peer
 // present, a runner serving the canned bridge_open reply, and the tunnel/keepalive
@@ -112,8 +112,8 @@ func TestRemoteBridgeOpenDispatch(t *testing.T) {
 	if pp, _ := open["proxy_port"].(int); pp == 0 {
 		t.Fatalf("proxy_port = %v, want the forwarded loopback port", open["proxy_port"])
 	}
-	if sk, _ := open["skipped"].(int); sk != 3 {
-		t.Fatalf("skipped = %v, want the peer's 3 forwarded through", open["skipped"])
+	if sd, _ := open["seed"].(seedReport); sd.Skipped != 3 || sd.Attempted != 5 || sd.Seeded != 2 {
+		t.Fatalf("seed = %+v, want the peer's breakdown forwarded through", open["seed"])
 	}
 
 	// The forward got the peer's token, proxy port, and advertised ws url.

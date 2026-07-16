@@ -41,7 +41,7 @@ func TestSeedState(t *testing.T) {
 		"map-9-session-beta":                         utf16LEBytes("four"),
 	})
 
-	state, skipped, err := SeedState(context.Background(), browser, profile, key)
+	state, counts, err := SeedState(context.Background(), browser, profile, key)
 	if err != nil {
 		t.Fatalf("SeedState: %v", err)
 	}
@@ -97,8 +97,9 @@ func TestSeedState(t *testing.T) {
 			},
 		},
 	}
-	if skipped != 1 {
-		t.Fatalf("skipped = %d, want 1", skipped)
+	wantCounts := SeedCounts{Attempted: 5, Undecryptable: 1, Expired: 1}
+	if counts != wantCounts {
+		t.Fatalf("counts = %#v, want %#v", counts, wantCounts)
 	}
 	if !reflect.DeepEqual(state, want) {
 		t.Fatalf("SeedState = %#v, want %#v", state, want)

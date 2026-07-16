@@ -72,11 +72,14 @@ func TestBridgeSeedAndServe(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Seed: %v (chrome stderr: %q)", err, proc.stderr.String())
 	}
-	if report.Cookies != 2 {
-		t.Errorf("report.Cookies = %d, want 2", report.Cookies)
+	if report.CookiesSeeded != 2 {
+		t.Errorf("report.CookiesSeeded = %d, want 2", report.CookiesSeeded)
 	}
-	if report.SkippedCookies != 0 {
-		t.Errorf("report.SkippedCookies = %d, want 0", report.SkippedCookies)
+	if report.CDPRejected != 0 {
+		t.Errorf("report.CDPRejected = %d, want 0", report.CDPRejected)
+	}
+	if len(report.Rejected) != 0 {
+		t.Errorf("report.Rejected = %v, want none", report.Rejected)
 	}
 	if report.LocalStorageOrigins != 1 {
 		t.Errorf("report.LocalStorageOrigins = %d, want 1", report.LocalStorageOrigins)
@@ -215,8 +218,8 @@ func TestBridgeSeedCookieOnlySolePage(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Seed: %v (chrome stderr: %q)", err, proc.stderr.String())
 	}
-	if report.Cookies != 2 {
-		t.Errorf("report.Cookies = %d, want 2", report.Cookies)
+	if report.CookiesSeeded != 2 {
+		t.Errorf("report.CookiesSeeded = %d, want 2", report.CookiesSeeded)
 	}
 	if report.LocalStorageOrigins != 0 || report.SessionStorageOrigins != 0 {
 		t.Errorf("web-storage origins = %d local / %d session, want 0/0 (cookie-only)", report.LocalStorageOrigins, report.SessionStorageOrigins)

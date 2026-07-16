@@ -64,9 +64,9 @@ func TestBridgeOpenReattachClose(t *testing.T) {
 		}},
 	}
 	var seedCalls atomic.Int32
-	d.seedSource = func(_ context.Context, _ cookie.Browser, _ string, _ cookie.AesKey) (cookie.StorageState, int, error) {
+	d.seedSource = func(_ context.Context, _ cookie.Browser, _ string, _ cookie.AesKey) (cookie.StorageState, cookie.SeedCounts, error) {
 		seedCalls.Add(1)
-		return fixture, 0, nil
+		return fixture, cookie.SeedCounts{Attempted: len(fixture.Cookies)}, nil
 	}
 
 	ctx := context.Background()
@@ -220,12 +220,12 @@ func TestBridgeFreshOpensDoNotShareSecrets(t *testing.T) {
 	t.Cleanup(func() { d.closeAllBridges(context.Background()) })
 
 	var seedCalls atomic.Int32
-	d.seedSource = func(_ context.Context, _ cookie.Browser, _ string, _ cookie.AesKey) (cookie.StorageState, int, error) {
+	d.seedSource = func(_ context.Context, _ cookie.Browser, _ string, _ cookie.AesKey) (cookie.StorageState, cookie.SeedCounts, error) {
 		seedCalls.Add(1)
 		return cookie.StorageState{Cookies: []cookie.Cookie{{
 			HostKey: "example.com", Name: "bridge_probe", Value: "ok", Path: "/",
 			IsSecure: true, SameSite: 2, SourceScheme: 2, SourcePort: 443,
-		}}}, 0, nil
+		}}}, cookie.SeedCounts{Attempted: 1}, nil
 	}
 
 	const n = 2

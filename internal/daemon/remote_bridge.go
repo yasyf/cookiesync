@@ -52,14 +52,14 @@ type bridgeKeepalive interface {
 // the ws url (its token embedded, never on argv), the peer's loopback proxy port
 // the forward targets, and the peer-side capability the origin closes it by.
 type remoteBridgeReply struct {
-	URL        string  `json:"url"`
-	Endpoint   string  `json:"endpoint"`
-	Browser    string  `json:"browser"`
-	Profile    string  `json:"profile"`
-	Capability string  `json:"capability"`
-	ExpiresIn  float64 `json:"expires_in"`
-	ProxyPort  int     `json:"proxy_port"`
-	Skipped    int     `json:"skipped"`
+	URL        string     `json:"url"`
+	Endpoint   string     `json:"endpoint"`
+	Browser    string     `json:"browser"`
+	Profile    string     `json:"profile"`
+	Capability string     `json:"capability"`
+	ExpiresIn  float64    `json:"expires_in"`
+	ProxyPort  int        `json:"proxy_port"`
+	Seed       seedReport `json:"seed"`
 }
 
 // proxyBridgeSession is a live cross-host bridge the origin fronts: the peer owns
@@ -301,7 +301,7 @@ func (d *Daemon) tryRemoteBridgeOpen(ctx context.Context, self, host, browser, p
 	go d.watchProxyBridge(sessionCtx, sess)
 
 	out := sess.OpenResult()
-	out["skipped"] = reply.Skipped
+	out["seed"] = reply.Seed
 	return out, false, nil
 }
 

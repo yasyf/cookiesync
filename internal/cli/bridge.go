@@ -25,12 +25,32 @@ const bridgeDefaultProfile = "Default"
 
 // bridgeOpenResult is the frozen bridge_open reply.
 type bridgeOpenResult struct {
-	URL        string  `json:"url"`
-	Endpoint   string  `json:"endpoint"`
-	Browser    string  `json:"browser"`
-	Profile    string  `json:"profile"`
-	Capability string  `json:"capability"`
-	ExpiresIn  float64 `json:"expires_in"`
+	URL        string     `json:"url"`
+	Endpoint   string     `json:"endpoint"`
+	Browser    string     `json:"browser"`
+	Profile    string     `json:"profile"`
+	Capability string     `json:"capability"`
+	ExpiresIn  float64    `json:"expires_in"`
+	Seed       seedReport `json:"seed"`
+}
+
+// seedReport mirrors the daemon's per-cause seed breakdown: Attempted ==
+// Seeded + Undecryptable + Expired + CDPRejected, and Skipped is their sum.
+type seedReport struct {
+	Attempted     int              `json:"attempted"`
+	Seeded        int              `json:"seeded"`
+	Skipped       int              `json:"skipped"`
+	Undecryptable int              `json:"undecryptable"`
+	Expired       int              `json:"expired"`
+	CDPRejected   int              `json:"cdp_rejected"`
+	Rejected      []rejectedCookie `json:"rejected,omitempty"`
+}
+
+// rejectedCookie is a cookie Chrome refused during seeding and the reason.
+type rejectedCookie struct {
+	Name   string `json:"name"`
+	Domain string `json:"domain"`
+	Reason string `json:"reason"`
 }
 
 // bridgeOpenJSON is the `bridge open --json` shape: the endpoint fields a consumer
@@ -258,7 +278,13 @@ func bridgeCapKey(host, browser, profile string) string {
 }
 
 func printBridgeReady(cmd *cobra.Command, r bridgeOpenResult) {
+	s := r.Seed
 	cmd.Printf("bridge ready · %s/%s   (expires in %s)\n", r.Browser, r.Profile, formatTTL(r.ExpiresIn))
+	cmd.Printf("  seeded %d/%d cookies · skipped=%d (undecryptable=%d, expired=%d, cdp-rejected=%d)\n",
+		s.Seeded, s.Attempted, s.Skipped, s.Undecryptable, s.Expired, s.CDPRejected)
+	for _, rc := range s.Rejected {
+		cmd.Printf("    rejected %s @ %s: %s\n", rc.Name, rc.Domain, rc.Reason)
+	}
 	cmd.Printf("  agent-browser connect '%s'\n", r.URL)
 	cmd.Printf("  # or:  export AGENT_BROWSER_CDP='%s'\n", r.URL)
 	cmd.Printf("  # raw Playwright:  chromium.connectOverCDP('%s')\n", r.URL)
