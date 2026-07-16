@@ -4,6 +4,24 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.16.0]
+
+### Changed
+- The `cookiesync` CLI now ships inside a signed, notarized, stapled `CookieSync.app`,
+  and the Homebrew cask symlinks the command to the bundle-inner binary. macOS keys a
+  bare binary's Automation and app-bundle (kTCCServiceSystemPolicyAppBundles) approvals
+  to its versioned Cellar path, so every `brew upgrade` used to land at a new path and
+  re-prompt for access; a bundle is keyed by its identifier
+  (`com.github.yasyf.cookiesync`) instead, so the grant survives upgrades. Because tccd
+  attributes a nested binary to its enclosing bundle, both the interactive CLI and the
+  synckit-driven resident helper LaunchAgent
+  (`com.github.yasyf.synckit.helper.cookiesync`) now inherit that durable identity.
+
+  **Upgrade note:** the first upgrade onto this build prompts once per service, because
+  each one's identity moves from a path to the bundle — that is the last approval
+  you'll be asked for, and it also clears the access that macOS had marked denied under
+  the old path.
+
 ## [0.15.0] - 2026-07-16
 
 ### Changed
