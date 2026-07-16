@@ -300,7 +300,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `synckitd install` now owns the agents. The host mesh is read from the shared
   `~/.config/synckit`.
 
-[Unreleased]: https://github.com/yasyf/cookiesync/compare/v0.15.0...HEAD
+[0.16.0]: https://github.com/yasyf/cookiesync/compare/v0.15.0...HEAD
 [0.15.0]: https://github.com/yasyf/cookiesync/releases/tag/v0.15.0
 [0.14.2]: https://github.com/yasyf/cookiesync/releases/tag/v0.14.2
 [0.14.1]: https://github.com/yasyf/cookiesync/releases/tag/v0.14.1
