@@ -54,6 +54,8 @@ CREATE UNIQUE INDEX cookies_unique_index ON cookies(
 );
 `
 
+const liveExpiresUTC cookie.ChromeMicros = 15_746_918_400_000_000
+
 // chromeStoreUnderHome points HOME at a temp dir and creates an empty Chrome v24
 // cookie store for the Default profile there, so cookie.Lookup("chrome") resolves to
 // it. It returns the chrome Browser the handlers will resolve.
@@ -873,8 +875,8 @@ func TestExtractApplyRoundTripWireContract(t *testing.T) {
 
 	// Apply two cookies via the frozen wire array.
 	in := []cookie.WireCookie{
-		cookie.ToWire(cookie.Cookie{HostKey: "x.com", Name: "sid", Value: "abc", Path: "/", LastUpdateUTC: 13_350_000_000_000_000, SameSite: 2, SourceScheme: 2, SourcePort: 443}),
-		cookie.ToWire(cookie.Cookie{HostKey: "y.com", Name: "tok", Value: "xyz", Path: "/", LastUpdateUTC: 13_350_000_000_000_001, SameSite: 1, SourceScheme: 2, SourcePort: 443}),
+		cookie.ToWire(cookie.Cookie{HostKey: "x.com", Name: "sid", Value: "abc", Path: "/", ExpiresUTC: liveExpiresUTC, LastUpdateUTC: 13_350_000_000_000_000, SameSite: 2, SourceScheme: 2, SourcePort: 443}),
+		cookie.ToWire(cookie.Cookie{HostKey: "y.com", Name: "tok", Value: "xyz", Path: "/", ExpiresUTC: liveExpiresUTC, LastUpdateUTC: 13_350_000_000_000_001, SameSite: 1, SourceScheme: 2, SourcePort: 443}),
 	}
 	applyRes, err := d.handleApply(ctx, map[string]any{"browser": "chrome", "cookies": wireArrayToAny(t, in)})
 	if err != nil {
@@ -895,6 +897,89 @@ func TestExtractApplyRoundTripWireContract(t *testing.T) {
 	}
 }
 
+func TestApplySyncableCookiesOnly(t *testing.T) {
+	live := cookie.Cookie{HostKey: "live.example", Name: "sid", Value: "live", Path: "/", ExpiresUTC: liveExpiresUTC, LastUpdateUTC: 200, CreationUTC: 100, SameSite: 2, SourceScheme: 2, SourcePort: 443}
+	seeded := cookie.Cookie{HostKey: "stale.example", Name: "sid", Value: "current", Path: "/", ExpiresUTC: liveExpiresUTC, LastUpdateUTC: 300, CreationUTC: 100, SameSite: 2, SourceScheme: 2, SourcePort: 443}
+	tests := []struct {
+		name        string
+		seed        []cookie.Cookie
+		payload     []cookie.Cookie
+		wantApplied int
+		want        cookie.Cookie
+	}{
+		{
+			name: "filters expired and session cookies",
+			payload: []cookie.Cookie{
+				live,
+				{HostKey: "expired.example", Name: "sid", Value: "expired", Path: "/", ExpiresUTC: 1, LastUpdateUTC: 201, CreationUTC: 100, SameSite: 2, SourceScheme: 2, SourcePort: 443},
+				{HostKey: "session.example", Name: "sid", Value: "session", Path: "/", LastUpdateUTC: 202, CreationUTC: 100, SameSite: 2, SourceScheme: 2, SourcePort: 443},
+			},
+			wantApplied: 1,
+			want:        live,
+		},
+		{
+			name: "rejects stale overwrite",
+			seed: []cookie.Cookie{seeded},
+			payload: []cookie.Cookie{
+				{HostKey: seeded.HostKey, Name: seeded.Name, Value: "stale", Path: seeded.Path, ExpiresUTC: seeded.ExpiresUTC, LastUpdateUTC: seeded.LastUpdateUTC - 1, CreationUTC: seeded.CreationUTC, SameSite: seeded.SameSite, SourceScheme: seeded.SourceScheme, SourcePort: seeded.SourcePort},
+			},
+			wantApplied: 0,
+			want:        seeded,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			browser := chromeStoreUnderHome(t)
+			key := cookie.DeriveKey(cookie.SafeStorageKey("peanuts"))
+			cache := newFakeCache()
+			_, _ = cache.Put(ctx, endpointID("me@laptop", "chrome", "Default"), []byte(key), 0)
+			fakeMesh(t, "me@laptop")
+			st := stateWith("me@laptop", "")
+			d := New(&fakeConsent{}, cache, newRealEngine(t, cache), staticProbe(SessionSnapshot{}), &recordingRunner{}, fixedState{st: st}, fixedState{st: st})
+
+			if len(tt.seed) > 0 {
+				applied, err := cookie.Write(ctx, browser, "Default", tt.seed, key)
+				if err != nil {
+					t.Fatalf("seed: %v", err)
+				}
+				if applied != len(tt.seed) {
+					t.Fatalf("seed applied = %d, want %d", applied, len(tt.seed))
+				}
+			}
+
+			wire := make([]cookie.WireCookie, len(tt.payload))
+			for i := range tt.payload {
+				wire[i] = cookie.ToWire(tt.payload[i])
+			}
+			res, err := d.handleApply(ctx, map[string]any{"browser": "chrome", "cookies": wireArrayToAny(t, wire)})
+			if err != nil {
+				t.Fatalf("handleApply: %v", err)
+			}
+			wantResult := fmt.Sprintf(`{"applied":%d}`, tt.wantApplied)
+			if got := marshalResult(t, res); got != wantResult {
+				t.Fatalf("apply = %s, want %s", got, wantResult)
+			}
+
+			rows, err := cookie.Read(ctx, browser, "Default")
+			if err != nil {
+				t.Fatalf("read store: %v", err)
+			}
+			if len(rows) != 1 {
+				t.Fatalf("stored rows = %d, want 1", len(rows))
+			}
+			got, ok := cookie.DecryptRow(rows[0], key)
+			if !ok {
+				t.Fatal("decrypt stored row")
+			}
+			if got != tt.want {
+				t.Fatalf("stored cookie = %+v, want %+v", got, tt.want)
+			}
+		})
+	}
+}
+
 // TestApplySerializesPerEndpoint proves concurrent applies to the SAME endpoint queue
 // behind its apply lock — the anti-echo digest record and store write never
 // interleave, so the recorded digest always matches the store's final content.
@@ -910,7 +995,7 @@ func TestApplySerializesPerEndpoint(t *testing.T) {
 	d := New(&fakeConsent{}, cache, engine.New(nil, cache, nil, recorder), staticProbe(SessionSnapshot{}), &recordingRunner{}, fixedState{st: st}, fixedState{st: st})
 
 	payload := wireArrayToAny(t, []cookie.WireCookie{
-		cookie.ToWire(cookie.Cookie{HostKey: "x.com", Name: "sid", Value: "abc", Path: "/", LastUpdateUTC: 13_350_000_000_000_000, SameSite: 2, SourceScheme: 2, SourcePort: 443}),
+		cookie.ToWire(cookie.Cookie{HostKey: "x.com", Name: "sid", Value: "abc", Path: "/", ExpiresUTC: liveExpiresUTC, LastUpdateUTC: 13_350_000_000_000_000, SameSite: 2, SourceScheme: 2, SourcePort: 443}),
 	})
 	const n = 4
 	type outcome struct {
@@ -924,15 +1009,23 @@ func TestApplySerializesPerEndpoint(t *testing.T) {
 			done <- outcome{res: res, err: err}
 		}()
 	}
+	counts := make(map[string]int)
 	for range n {
 		out := <-done
 		if out.err != nil {
 			t.Errorf("apply: %v", out.err)
 			continue
 		}
-		if got := marshalResult(t, out.res); got != `{"applied":1}` {
-			t.Errorf("apply = %s, want {\"applied\":1}", got)
-		}
+		counts[marshalResult(t, out.res)]++
+	}
+	if got := counts[`{"applied":1}`]; got != 1 {
+		t.Errorf("applied=1 responses = %d, want 1", got)
+	}
+	if got := counts[`{"applied":0}`]; got != n-1 {
+		t.Errorf("applied=0 responses = %d, want %d", got, n-1)
+	}
+	if len(counts) != 2 {
+		t.Errorf("apply response counts = %v, want one applied=1 and %d applied=0", counts, n-1)
 	}
 	if got := recorder.peak.Load(); got != 1 {
 		t.Errorf("peak concurrent same-endpoint applies = %d, want 1 (apply must serialize per endpoint)", got)
@@ -958,7 +1051,7 @@ func TestApplyDistinctEndpointsOverlap(t *testing.T) {
 	d := New(&fakeConsent{}, cache, engine.New(nil, cache, nil, recorder), staticProbe(SessionSnapshot{}), &recordingRunner{}, fixedState{st: st}, fixedState{st: st})
 
 	payload := wireArrayToAny(t, []cookie.WireCookie{
-		cookie.ToWire(cookie.Cookie{HostKey: "x.com", Name: "sid", Value: "abc", Path: "/", LastUpdateUTC: 13_350_000_000_000_000, SameSite: 2, SourceScheme: 2, SourcePort: 443}),
+		cookie.ToWire(cookie.Cookie{HostKey: "x.com", Name: "sid", Value: "abc", Path: "/", ExpiresUTC: liveExpiresUTC, LastUpdateUTC: 13_350_000_000_000_000, SameSite: 2, SourceScheme: 2, SourcePort: 443}),
 	})
 	done := make(chan error, 2)
 	for _, profile := range []string{"Default", "Work"} {
@@ -1010,7 +1103,7 @@ func newConvergeFixture(t *testing.T) *convergeFixture {
 		registry: newRegistry(localEP, peerEP),
 	}
 	runner := &recordingRunner{byMethod: map[string]string{
-		"rpc extract": peerExtractReply(t, cookie.Cookie{HostKey: "x.com", Name: "sid", Value: "peer", Path: "/", LastUpdateUTC: 13_350_000_000_000_000, SameSite: 2, SourceScheme: 2, SourcePort: 443}),
+		"rpc extract": peerExtractReply(t, cookie.Cookie{HostKey: "x.com", Name: "sid", Value: "peer", Path: "/", ExpiresUTC: liveExpiresUTC, LastUpdateUTC: 13_350_000_000_000_000, SameSite: 2, SourceScheme: 2, SourcePort: 443}),
 		"rpc apply":   `{"applied":1}`,
 	}}
 	arrived := make(chan string, 4)
@@ -1054,7 +1147,7 @@ func TestConvergeLocalWriteSerializesWithApply(t *testing.T) {
 	syncDone := fx.holdConvergeMidLocalWrite(ctx, t)
 
 	payload := wireArrayToAny(t, []cookie.WireCookie{
-		cookie.ToWire(cookie.Cookie{HostKey: "y.com", Name: "tok", Value: "xyz", Path: "/", LastUpdateUTC: 13_350_000_000_000_001, SameSite: 1, SourceScheme: 2, SourcePort: 443}),
+		cookie.ToWire(cookie.Cookie{HostKey: "y.com", Name: "tok", Value: "xyz", Path: "/", ExpiresUTC: liveExpiresUTC, LastUpdateUTC: 13_350_000_000_000_001, SameSite: 1, SourceScheme: 2, SourcePort: 443}),
 	})
 	applyDone := make(chan error, 1)
 	go func() {
@@ -1091,7 +1184,7 @@ func TestConvergeLocalWriteOverlapsDistinctApply(t *testing.T) {
 	syncDone := fx.holdConvergeMidLocalWrite(ctx, t)
 
 	payload := wireArrayToAny(t, []cookie.WireCookie{
-		cookie.ToWire(cookie.Cookie{HostKey: "y.com", Name: "tok", Value: "xyz", Path: "/", LastUpdateUTC: 13_350_000_000_000_001, SameSite: 1, SourceScheme: 2, SourcePort: 443}),
+		cookie.ToWire(cookie.Cookie{HostKey: "y.com", Name: "tok", Value: "xyz", Path: "/", ExpiresUTC: liveExpiresUTC, LastUpdateUTC: 13_350_000_000_000_001, SameSite: 1, SourceScheme: 2, SourcePort: 443}),
 	})
 	applyDone := make(chan error, 1)
 	go func() {

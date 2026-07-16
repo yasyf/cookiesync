@@ -4,16 +4,21 @@ import (
 	"context"
 	"log/slog"
 	"sync"
+	"time"
 
 	"github.com/yasyf/cookiesync/internal/cookie"
 	"github.com/yasyf/cookiesync/internal/state"
 )
 
+const windowsEpochOffsetSeconds = 11_644_473_600
+
 // Mass-drop quarantine thresholds: a local source whose extracted rowcount falls to
 // QuarantineCollapseFraction of its last-known-good baseline (itself at least
 // QuarantineMinBaseline rows) is excluded from merge inputs — a razed store's freshly
-// regenerated cookies must not win per-key over good peer values — until it recovers
-// to QuarantineRecoverFraction, which the union write-back itself achieves.
+// regenerated cookies must not win the merge over good peer values — until it recovers
+// to QuarantineRecoverFraction, which the union write-back itself achieves. Restoration
+// is best-effort under monotone writes: missing keys re-insert; a key the razed browser
+// regenerated with a fresher last_update_utc keeps its fresh value.
 const (
 	// QuarantineMinBaseline is the smallest baseline the quarantine acts on; below it
 	// a collapse is indistinguishable from an ordinarily small store.
@@ -141,8 +146,9 @@ type ConvergeDeps struct {
 	LockFor func(endpointID string) *sync.Mutex
 }
 
-// Converge merges the union of endpoint's cookies and every peer's across this host
-// and its peers, then idempotently applies the merged set to every gathered endpoint.
+// Converge merges the union of endpoint's persistent, unexpired cookies and every
+// peer's across this host and its peers, then idempotently applies the merged set to
+// every gathered endpoint. Store writes are monotone on last_update_utc.
 //
 // It gathers endpoint's cookies through the local source (a cold key cache returns
 // ErrNeedsAuth rather than prompting), and each peer's through SourceFor(peer.host) —
@@ -191,7 +197,9 @@ func Converge(
 		if err != nil {
 			return nil, err
 		}
-		sources[i].cookies = extracted.Cookies
+		now := time.Now()
+		sources[i].cookies = cookie.FilterSyncable(extracted.Cookies, float64(now.UnixNano())/1e9)
+		warnFutureUpdates(ctx, sources[i].endpoint, extracted.Cookies, now)
 	}
 
 	if err := quarantineMassDrops(ctx, sources, deps); err != nil {
@@ -217,6 +225,24 @@ func Converge(
 		}
 	}
 	return merged, nil
+}
+
+func warnFutureUpdates(ctx context.Context, endpoint state.Endpoint, cookies []cookie.Cookie, now time.Time) {
+	var count int
+	var maxDelta time.Duration
+	nowChrome := cookie.ChromeMicros((now.Unix()+windowsEpochOffsetSeconds)*1_000_000 + int64(now.Nanosecond())/1_000)
+	for _, c := range cookies {
+		delta := c.LastUpdateUTC - nowChrome
+		if delta <= cookie.ChromeMicros((2*time.Minute)/time.Microsecond) {
+			continue
+		}
+		count++
+		maxDelta = max(maxDelta, time.Duration(delta)*time.Microsecond)
+	}
+	if count > 0 {
+		slog.WarnContext(ctx, "converge: source has future last_update_utc",
+			"endpoint", endpoint.ID(), "rows", count, "max_delta", maxDelta)
+	}
 }
 
 // quarantineMassDrops updates the durable rowcount ledger from this pass's local

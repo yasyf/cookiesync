@@ -146,6 +146,7 @@ func (d *Daemon) handleApply(ctx context.Context, params map[string]any) (any, e
 	if err != nil {
 		return nil, err
 	}
+	cookies = cookie.FilterSyncable(cookies, float64(time.Now().UnixNano())/1e9)
 	self, err := meshSelf(ctx)
 	if err != nil {
 		return nil, err

@@ -4,17 +4,16 @@
 // convergent-reconcile orchestration.
 //
 // A converge gathers the decrypted cookies of an endpoint and every tracked peer
-// endpoint through one Source seam, merges them with the pure union newest-wins rule
-// (cookie.Merge), and writes the merged set back to any endpoint whose rows differ —
-// preserving each winner's last_update_utc and recording the applied anti-echo digest
-// before the write, so the induced filesystem event is recognized as the daemon's own
-// echo. Cookie last_update_utc is absolute Chrome time and host-independent, so the
-// raw newest-wins comparison converges across NTP-synced machines with no clock-skew
-// correction.
+// endpoint through one Source seam, keeps only persistent, unexpired cookies, merges
+// them with the pure union newest-wins rule (cookie.Merge), and writes the merged set
+// back to any endpoint whose rows differ. Store writes are monotone on
+// last_update_utc. Cookie last_update_utc is absolute Chrome time and host-independent,
+// so the raw newest-wins comparison converges across NTP-synced machines with no
+// clock-skew correction.
 //
-// Every collaborator — the key cache, the cookie sources, the anti-echo recorder, the
-// clock — is injected, so the whole pass runs in unit tests against fakes without ssh,
-// a real cookie store, or any macOS API.
+// Every external collaborator — the key cache, the cookie sources, and the anti-echo
+// recorder — is injected, so the whole pass runs in unit tests against fakes without
+// ssh, a real cookie store, or any macOS API.
 package engine
 
 import (

@@ -339,22 +339,26 @@ func upsertSQL(columns, conflict []string) (string, error) {
 			updates = append(updates, fmt.Sprintf("%s = excluded.%s", c, c))
 		}
 	}
-	return fmt.Sprintf(
+	query := fmt.Sprintf(
 		"INSERT INTO cookies (%s) VALUES (%s) ON CONFLICT(%s) DO UPDATE SET %s",
 		strings.Join(columns, ", "),
 		strings.Join(placeholders, ", "),
 		strings.Join(conflict, ", "),
 		strings.Join(updates, ", "),
-	), nil
+	)
+	if _, ok := conflictSet["last_update_utc"]; ok {
+		query += " WHERE excluded.last_update_utc > cookies.last_update_utc"
+	}
+	return query, nil
 }
 
 // Write encrypts and upserts cookies into profile's live Cookies DB and returns
-// the number of rows written. Each value is re-encrypted into a v10 blob (the
-// plaintext value column is left empty) and written with INSERT ... ON
-// CONFLICT(<this store's real unique index>) DO UPDATE, so a re-synced cookie
-// collapses onto its existing row. The cookie's own last_update_utc and
-// creation_utc are preserved, never stamped to "now". On a locked database this
-// returns -1 (soft busy) rather than forcing a write.
+// the number of rows actually inserted or updated. Each value is re-encrypted
+// into a v10 blob, leaving the plaintext value column empty. On stores with a
+// last_update_utc column, a conflict updates the on-disk row only when the
+// incoming timestamp is strictly newer; an equal or older timestamp is a no-op.
+// Cookie timestamps are preserved, never stamped to "now". On a locked database
+// this returns -1 (soft busy) rather than forcing a write.
 func Write(ctx context.Context, browser Browser, profile string, cookies []Cookie, key AesKey) (int, error) {
 	dsn := fmt.Sprintf("file:%s?_txlock=immediate&_pragma=busy_timeout(%d)", browser.CookiesDB(profile), busyTimeoutMS)
 	db, err := sql.Open(driverName, dsn)
@@ -394,6 +398,7 @@ func writeAll(ctx context.Context, db *sql.DB, query string, columns []string, c
 	if err != nil {
 		return 0, err
 	}
+	count := 0
 	for _, cookie := range cookies {
 		encrypted, err := EncryptValue(cookie.Value, key, cookie.HostKey)
 		if err != nil {
@@ -405,13 +410,20 @@ func writeAll(ctx context.Context, db *sql.DB, query string, columns []string, c
 		for i, c := range columns {
 			args[i] = sql.Named(c, values[c])
 		}
-		if _, err := tx.ExecContext(ctx, query, args...); err != nil {
+		result, err := tx.ExecContext(ctx, query, args...)
+		if err != nil {
 			_ = tx.Rollback()
 			return 0, err
 		}
+		affected, err := result.RowsAffected()
+		if err != nil {
+			_ = tx.Rollback()
+			return 0, err
+		}
+		count += int(affected)
 	}
 	if err := tx.Commit(); err != nil {
 		return 0, err
 	}
-	return len(cookies), nil
+	return count, nil
 }

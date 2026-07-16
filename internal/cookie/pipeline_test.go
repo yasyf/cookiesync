@@ -149,9 +149,40 @@ func TestExtractMatchesPythonPipeline(t *testing.T) {
 	}
 }
 
+func TestSyncable(t *testing.T) {
+	now := float64(1_700_000_000)
+	tests := []struct {
+		name    string
+		expires ChromeMicros
+		want    bool
+	}{
+		{name: "live persistent row kept", expires: unixSecondsToChromeMicros(now + 1), want: true},
+		{name: "expired row dropped", expires: unixSecondsToChromeMicros(now - 1), want: false},
+		{name: "session-scoped row dropped", expires: 0, want: false},
+		{name: "expiry exactly now kept", expires: unixSecondsToChromeMicros(now), want: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cookie := Cookie{Name: tt.name, ExpiresUTC: tt.expires}
+			if got := Syncable(cookie, now); got != tt.want {
+				t.Fatalf("Syncable() = %t, want %t", got, tt.want)
+			}
+
+			want := []Cookie{}
+			if tt.want {
+				want = []Cookie{cookie}
+			}
+			if got := FilterSyncable([]Cookie{cookie}, now); !reflect.DeepEqual(got, want) {
+				t.Fatalf("FilterSyncable() = %+v, want %+v", got, want)
+			}
+		})
+	}
+}
+
 // TestExtractApplyRoundTrip proves an Extract then Apply then Extract preserves the
-// cookie set exactly: the merged rows written back decrypt to the same values, with
-// last_update_utc and the encrypted blob's plaintext intact.
+// cookie set exactly. Stores with last_update_utc reject the identical timestamp,
+// while the second extract remains byte-for-byte equal to the first on every schema.
 func TestExtractApplyRoundTrip(t *testing.T) {
 	forEachSchema(t, func(t *testing.T, browser Browser, profile string) {
 		key := DeriveKey(SafeStorageKey("peanuts"))
@@ -166,26 +197,24 @@ func TestExtractApplyRoundTrip(t *testing.T) {
 			t.Fatalf("first extract = %+v, want one cookie value v1", first.Cookies)
 		}
 
-		// Mutate the value and apply it back.
-		updated := first.Cookies[0]
-		updated.Value = "v2"
-		n, err := Apply(context.Background(), []Cookie{updated}, browser, profile, key)
+		n, err := Apply(context.Background(), first.Cookies, browser, profile, key)
 		if err != nil {
 			t.Fatalf("Apply: %v", err)
 		}
-		if n != 1 {
-			t.Fatalf("Apply wrote %d rows, want 1", n)
+		wantApplied := 1
+		if hasColumn(t, dbPath, "last_update_utc") {
+			wantApplied = 0
+		}
+		if n != wantApplied {
+			t.Fatalf("Apply wrote %d rows, want %d", n, wantApplied)
 		}
 
 		second, err := Extract(context.Background(), "https://x.com/", browser, key, profile, true, false)
 		if err != nil {
 			t.Fatalf("re-Extract: %v", err)
 		}
-		if len(second.Cookies) != 1 || second.Cookies[0].Value != "v2" {
-			t.Fatalf("round-trip extract = %+v, want one cookie value v2", second.Cookies)
-		}
-		if second.Cookies[0].LastUpdateUTC != updated.LastUpdateUTC {
-			t.Fatalf("last_update_utc not preserved: got %d, want %d", second.Cookies[0].LastUpdateUTC, updated.LastUpdateUTC)
+		if !reflect.DeepEqual(second.Cookies, first.Cookies) {
+			t.Fatalf("round-trip extract = %+v, want %+v", second.Cookies, first.Cookies)
 		}
 	})
 }

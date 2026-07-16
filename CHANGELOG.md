@@ -4,6 +4,22 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.14.1] - 2026-07-15
+
+### Fixed
+- Cookie writes are monotone on `last_update_utc`: an apply no longer overwrites a newer
+  row with an older one. This closes the reproducible login clobber — a converge racing a
+  fresh login used to re-plant the stale cookie after every browser restart, and the
+  regression self-perpetuated because the browser never re-flushed its in-memory copy.
+  `Write` now reports rows actually changed, so a stale apply returns `applied: 0`.
+- Session-scoped and expired cookies no longer sync. Converge and the inbound apply
+  handler drop them before merging: a logout on one host can't kill the login everywhere,
+  and synced dead rows no longer vanish at the next browser startup.
+
+### Added
+- Converge warns when a source yields cookies stamped more than two minutes in the
+  future; cross-host clock skew silently corrupts newest-wins merges.
+
 ## [0.14.0] - 2026-07-15
 
 ### Added

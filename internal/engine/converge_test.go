@@ -11,6 +11,8 @@ import (
 	"github.com/yasyf/cookiesync/internal/state"
 )
 
+const testFutureExpiry cookie.ChromeMicros = 20_000_000_000_000_000
+
 // testLockFor is a fresh per-test apply-lock seam over a private keyedLocks.
 func testLockFor() func(string) *sync.Mutex {
 	var locks keyedLocks
@@ -94,8 +96,77 @@ func ck(host, name, value string, lastUpdate cookie.ChromeMicros) cookie.Cookie 
 		Name:          name,
 		Value:         value,
 		Path:          "/",
+		ExpiresUTC:    testFutureExpiry,
 		LastUpdateUTC: lastUpdate,
 		SameSite:      2,
+	}
+}
+
+func TestConvergeFiltersUnsyncableRows(t *testing.T) {
+	liveLocal := ck(".x.com", "local", "L", 100)
+	livePeer := ck(".x.com", "peer", "P", 200)
+	expired := ck(".x.com", "expired", "dead", 300)
+	expired.ExpiresUTC = 1
+	session := ck(".x.com", "session", "dead", 400)
+	session.ExpiresUTC = 0
+
+	tests := []struct {
+		name        string
+		local       []cookie.Cookie
+		peer        []cookie.Cookie
+		wantMerged  []cookie.Cookie
+		wantApplies int
+	}{
+		{
+			name:        "dead peer rows reach neither union nor apply payloads",
+			local:       []cookie.Cookie{liveLocal},
+			peer:        []cookie.Cookie{livePeer, expired, session},
+			wantMerged:  []cookie.Cookie{liveLocal, livePeer},
+			wantApplies: 1,
+		},
+		{
+			name:        "dead-only difference triggers no apply",
+			local:       []cookie.Cookie{liveLocal},
+			peer:        []cookie.Cookie{liveLocal, expired, session},
+			wantMerged:  []cookie.Cookie{liveLocal},
+			wantApplies: 0,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			local := &fakeSource{cookies: append([]cookie.Cookie(nil), tt.local...)}
+			peer := &fakeSource{cookies: append([]cookie.Cookie(nil), tt.peer...)}
+			self := "me@laptop"
+			anchor := state.Endpoint{Host: self, Browser: "chrome", Profile: "Default"}
+			peerEP := state.Endpoint{Host: "you@desktop", Browser: "chrome", Profile: "Default"}
+			deps := ConvergeDeps{
+				SelfTarget:  self,
+				Cache:       warmCache{},
+				Recorder:    &countingRecorder{},
+				Baselines:   newMemBaselines(),
+				LocalSource: local,
+				SourceFor:   func(string) Source { return peer },
+				LockFor:     testLockFor(),
+			}
+
+			merged, err := Converge(context.Background(), anchor, []state.Endpoint{peerEP}, "", deps)
+			if err != nil {
+				t.Fatalf("Converge: %v", err)
+			}
+			if !rowSetEqual(merged, tt.wantMerged) {
+				t.Fatalf("merged = %+v, want %+v", merged, tt.wantMerged)
+			}
+			if len(local.applies) != tt.wantApplies || len(peer.applies) != tt.wantApplies {
+				t.Fatalf("apply counts local=%d peer=%d, want %d each", len(local.applies), len(peer.applies), tt.wantApplies)
+			}
+			for endpoint, applies := range map[string][][]cookie.Cookie{"local": local.applies, "peer": peer.applies} {
+				for _, applied := range applies {
+					if !rowSetEqual(applied, tt.wantMerged) {
+						t.Fatalf("%s apply payload = %+v, want %+v", endpoint, applied, tt.wantMerged)
+					}
+				}
+			}
+		})
 	}
 }
 

@@ -394,6 +394,7 @@ func TestWriteInsertsThenUpsertsToSingleRow(t *testing.T) {
 
 		second := first
 		second.Value = "v2-newest"
+		second.LastUpdateUTC = sampleUpdate + 1
 		if n, err := Write(context.Background(), browser, profile, []Cookie{second}, key); err != nil || n != 1 {
 			t.Fatalf("second Write = (%d, %v), want (1, nil)", n, err)
 		}
@@ -477,6 +478,7 @@ func TestUpsertUpdatesExpiryAndFlags(t *testing.T) {
 		}
 		refreshed := sampleCookie(".example.com", "sid", "v2")
 		refreshed.ExpiresUTC = ChromeMicros(13_999_000_000_000_000)
+		refreshed.LastUpdateUTC = sampleUpdate + 1
 		refreshed.IsHTTPOnly = false
 		refreshed.SameSite = 0
 		if _, err := Write(context.Background(), browser, profile, []Cookie{refreshed}, key); err != nil {
@@ -501,6 +503,194 @@ func TestUpsertUpdatesExpiryAndFlags(t *testing.T) {
 			t.Errorf("samesite = %d, want 0", samesite)
 		}
 	})
+}
+
+func TestWriteRejectsOlderCookie(t *testing.T) {
+	forEachSchema(t, func(t *testing.T, browser Browser, profile string) {
+		if !hasColumn(t, browser.CookiesDB(profile), "last_update_utc") {
+			t.Skip("schema has no last_update_utc column")
+		}
+		key := testKey(t)
+		newer := sampleCookie(".example.com", "sid", "newer")
+		newer.LastUpdateUTC = sampleUpdate + 2
+		if n, err := Write(context.Background(), browser, profile, []Cookie{newer}, key); err != nil || n != 1 {
+			t.Fatalf("newer Write = (%d, %v), want (1, nil)", n, err)
+		}
+
+		older := newer
+		older.Value = "older"
+		older.LastUpdateUTC = sampleUpdate + 1
+		if n, err := Write(context.Background(), browser, profile, []Cookie{older}, key); err != nil || n != 0 {
+			t.Fatalf("older Write = (%d, %v), want (0, nil)", n, err)
+		}
+		rows, err := Read(context.Background(), browser, profile)
+		if err != nil {
+			t.Fatalf("Read: %v", err)
+		}
+		if len(rows) != 1 {
+			t.Fatalf("got %d rows, want 1", len(rows))
+		}
+		if got := mustDecrypt(t, rows[0].EncryptedValue, key, rows[0].HostKey); got != newer.Value {
+			t.Errorf("decrypted = %q, want %q", got, newer.Value)
+		}
+		if rows[0].LastUpdateUTC != newer.LastUpdateUTC {
+			t.Errorf("last_update_utc = %d, want %d", rows[0].LastUpdateUTC, newer.LastUpdateUTC)
+		}
+	})
+}
+
+func TestWriteAcceptsNewerCookie(t *testing.T) {
+	forEachSchema(t, func(t *testing.T, browser Browser, profile string) {
+		if !hasColumn(t, browser.CookiesDB(profile), "last_update_utc") {
+			t.Skip("schema has no last_update_utc column")
+		}
+		key := testKey(t)
+		original := sampleCookie(".example.com", "sid", "original")
+		if n, err := Write(context.Background(), browser, profile, []Cookie{original}, key); err != nil || n != 1 {
+			t.Fatalf("original Write = (%d, %v), want (1, nil)", n, err)
+		}
+
+		newer := original
+		newer.Value = "newer"
+		newer.ExpiresUTC = sampleExpires + 1
+		newer.LastUpdateUTC = sampleUpdate + 1
+		newer.IsSecure = false
+		newer.IsHTTPOnly = false
+		newer.SameSite = 0
+		if n, err := Write(context.Background(), browser, profile, []Cookie{newer}, key); err != nil || n != 1 {
+			t.Fatalf("newer Write = (%d, %v), want (1, nil)", n, err)
+		}
+		rows, err := Read(context.Background(), browser, profile)
+		if err != nil {
+			t.Fatalf("Read: %v", err)
+		}
+		if len(rows) != 1 {
+			t.Fatalf("got %d rows, want 1", len(rows))
+		}
+		row := rows[0]
+		if got := mustDecrypt(t, row.EncryptedValue, key, row.HostKey); got != newer.Value {
+			t.Errorf("decrypted = %q, want %q", got, newer.Value)
+		}
+		if row.LastUpdateUTC != newer.LastUpdateUTC {
+			t.Errorf("last_update_utc = %d, want %d", row.LastUpdateUTC, newer.LastUpdateUTC)
+		}
+		if row.ExpiresUTC != newer.ExpiresUTC {
+			t.Errorf("expires_utc = %d, want %d", row.ExpiresUTC, newer.ExpiresUTC)
+		}
+		if row.IsSecure != newer.IsSecure {
+			t.Errorf("is_secure = %v, want %v", row.IsSecure, newer.IsSecure)
+		}
+		if row.IsHTTPOnly != newer.IsHTTPOnly {
+			t.Errorf("is_httponly = %v, want %v", row.IsHTTPOnly, newer.IsHTTPOnly)
+		}
+		if row.SameSite != newer.SameSite {
+			t.Errorf("samesite = %d, want %d", row.SameSite, newer.SameSite)
+		}
+	})
+}
+
+func TestWriteRejectsEqualTimestampCookie(t *testing.T) {
+	forEachSchema(t, func(t *testing.T, browser Browser, profile string) {
+		if !hasColumn(t, browser.CookiesDB(profile), "last_update_utc") {
+			t.Skip("schema has no last_update_utc column")
+		}
+		key := testKey(t)
+		original := sampleCookie(".example.com", "sid", "original")
+		if n, err := Write(context.Background(), browser, profile, []Cookie{original}, key); err != nil || n != 1 {
+			t.Fatalf("original Write = (%d, %v), want (1, nil)", n, err)
+		}
+
+		equal := original
+		equal.Value = "equal"
+		equal.ExpiresUTC = sampleExpires + 1
+		if n, err := Write(context.Background(), browser, profile, []Cookie{equal}, key); err != nil || n != 0 {
+			t.Fatalf("equal Write = (%d, %v), want (0, nil)", n, err)
+		}
+		rows, err := Read(context.Background(), browser, profile)
+		if err != nil {
+			t.Fatalf("Read: %v", err)
+		}
+		if len(rows) != 1 {
+			t.Fatalf("got %d rows, want 1", len(rows))
+		}
+		if got := mustDecrypt(t, rows[0].EncryptedValue, key, rows[0].HostKey); got != original.Value {
+			t.Errorf("decrypted = %q, want %q", got, original.Value)
+		}
+		if rows[0].LastUpdateUTC != original.LastUpdateUTC {
+			t.Errorf("last_update_utc = %d, want %d", rows[0].LastUpdateUTC, original.LastUpdateUTC)
+		}
+		if rows[0].ExpiresUTC != original.ExpiresUTC {
+			t.Errorf("expires_utc = %d, want %d", rows[0].ExpiresUTC, original.ExpiresUTC)
+		}
+	})
+}
+
+func TestWriteInsertsNewKey(t *testing.T) {
+	forEachSchema(t, func(t *testing.T, browser Browser, profile string) {
+		key := testKey(t)
+		first := sampleCookie(".example.com", "first", "one")
+		if n, err := Write(context.Background(), browser, profile, []Cookie{first}, key); err != nil || n != 1 {
+			t.Fatalf("first Write = (%d, %v), want (1, nil)", n, err)
+		}
+
+		second := sampleCookie(".example.com", "second", "two")
+		if n, err := Write(context.Background(), browser, profile, []Cookie{second}, key); err != nil || n != 1 {
+			t.Fatalf("second Write = (%d, %v), want (1, nil)", n, err)
+		}
+		rows, err := Read(context.Background(), browser, profile)
+		if err != nil {
+			t.Fatalf("Read: %v", err)
+		}
+		if len(rows) != 2 {
+			t.Fatalf("got %d rows, want 2", len(rows))
+		}
+		values := make(map[string]string, len(rows))
+		for _, row := range rows {
+			values[row.Name] = mustDecrypt(t, row.EncryptedValue, key, row.HostKey)
+		}
+		if got := values[first.Name]; got != first.Value {
+			t.Errorf("first value = %q, want %q", got, first.Value)
+		}
+		if got := values[second.Name]; got != second.Value {
+			t.Errorf("second value = %q, want %q", got, second.Value)
+		}
+	})
+}
+
+func TestWriteV18UpsertIsUnguarded(t *testing.T) {
+	browser := makeBrowser(t, t.TempDir(), "Default")
+	profile := "Default"
+	dbPath := browser.CookiesDB(profile)
+	initDB(t, dbPath, v18SQL)
+	if hasColumn(t, dbPath, "last_update_utc") {
+		t.Fatal("v18 schema unexpectedly has last_update_utc")
+	}
+
+	key := testKey(t)
+	newer := sampleCookie(".example.com", "sid", "newer")
+	newer.LastUpdateUTC = sampleUpdate + 1
+	if n, err := Write(context.Background(), browser, profile, []Cookie{newer}, key); err != nil || n != 1 {
+		t.Fatalf("newer Write = (%d, %v), want (1, nil)", n, err)
+	}
+	older := newer
+	older.Value = "older"
+	older.LastUpdateUTC = sampleUpdate - 1
+	if n, err := Write(context.Background(), browser, profile, []Cookie{older}, key); err != nil || n != 1 {
+		t.Fatalf("older Write = (%d, %v), want (1, nil)", n, err)
+	}
+	rows, err := Read(context.Background(), browser, profile)
+	if err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("got %d rows, want 1", len(rows))
+	}
+	if got := mustDecrypt(t, rows[0].EncryptedValue, key, rows[0].HostKey); got != older.Value {
+		t.Errorf("decrypted = %q, want %q", got, older.Value)
+	}
+	if rows[0].LastUpdateUTC != 0 {
+		t.Errorf("last_update_utc = %d, want 0", rows[0].LastUpdateUTC)
+	}
 }
 
 func TestFullRoundtripPreservesValueAndFlags(t *testing.T) {

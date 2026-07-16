@@ -87,6 +87,23 @@ func isLive(cookie Cookie, now float64, includeExpired bool) bool {
 	return expires >= now
 }
 
+// Syncable reports whether cookie is persistent and has not expired at now.
+func Syncable(cookie Cookie, now float64) bool {
+	expires, session := chromeMicrosToUnix(cookie.ExpiresUTC)
+	return !session && expires >= now
+}
+
+// FilterSyncable returns the persistent cookies that have not expired at now.
+func FilterSyncable(cookies []Cookie, now float64) []Cookie {
+	filtered := make([]Cookie, 0, len(cookies))
+	for _, cookie := range cookies {
+		if Syncable(cookie, now) {
+			filtered = append(filtered, cookie)
+		}
+	}
+	return filtered
+}
+
 // Extract decrypts the cookies the browser would send to url's host from profile,
 // using the already-obtained key. Rows are host-filtered, decrypted (v20 app-bound
 // and otherwise-undecryptable rows skipped), and expired cookies dropped unless
