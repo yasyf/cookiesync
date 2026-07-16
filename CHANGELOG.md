@@ -4,6 +4,21 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.15.0] - 2026-07-16
+
+### Changed
+- The Touch ID key helper is now the shared `authkit` cask; the `cookiesync-keyhelper`
+  cask is retired and no longer built. A fresh `brew install cookiesync` pulls `authkit`
+  as a cask dependency. An existing install swaps helpers by hand:
+
+  ```sh
+  brew uninstall --cask cookiesync-keyhelper
+  brew install --cask authkit
+  ```
+
+  Existing vault items stay readable with no re-enrollment — authkit carries the same
+  keychain access group.
+
 ## [0.14.2] - 2026-07-16
 
 ### Fixed
@@ -267,7 +282,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `synckitd install` now owns the agents. The host mesh is read from the shared
   `~/.config/synckit`.
 
-[Unreleased]: https://github.com/yasyf/cookiesync/compare/v0.11.1...HEAD
+[Unreleased]: https://github.com/yasyf/cookiesync/compare/v0.15.0...HEAD
+[0.15.0]: https://github.com/yasyf/cookiesync/releases/tag/v0.15.0
+[0.14.2]: https://github.com/yasyf/cookiesync/releases/tag/v0.14.2
+[0.14.1]: https://github.com/yasyf/cookiesync/releases/tag/v0.14.1
+[0.14.0]: https://github.com/yasyf/cookiesync/releases/tag/v0.14.0
 [0.11.1]: https://github.com/yasyf/cookiesync/releases/tag/v0.11.1
 [0.11.0]: https://github.com/yasyf/cookiesync/releases/tag/v0.11.0
 [0.10.5]: https://github.com/yasyf/cookiesync/releases/tag/v0.10.5
