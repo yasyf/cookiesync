@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math/big"
+	"strings"
 	"sync"
 
 	"github.com/yasyf/cookiesync/internal/cookie"
@@ -79,6 +80,9 @@ func Seed(ctx context.Context, c *Conn, state cookie.StorageState) (SeedReport, 
 func seedWebStorage(ctx context.Context, c *Conn, hub *seedEvents, pageID string, origins []cookie.OriginStorage) (local, session int, err error) {
 	var work []cookie.OriginStorage
 	for _, o := range origins {
+		if !seedableOrigin(o.Origin) {
+			continue
+		}
 		if len(o.LocalStorage) > 0 || len(o.SessionStorage) > 0 {
 			work = append(work, o)
 		}
@@ -130,6 +134,13 @@ func seedWebStorage(ctx context.Context, c *Conn, hub *seedEvents, pageID string
 		return local, session, fmt.Errorf("reset seed page: %w", err)
 	}
 	return local, session, nil
+}
+
+// seedableOrigin reports whether an origin's web storage can be replayed: only
+// http(s) accepts a Page.navigate + localStorage write, and privileged schemes
+// (chrome-extension://, chrome://, devtools://) deny it.
+func seedableOrigin(origin string) bool {
+	return strings.HasPrefix(origin, "https://") || strings.HasPrefix(origin, "http://")
 }
 
 // navigateAndWait drives one navigation on the seeding session and blocks until

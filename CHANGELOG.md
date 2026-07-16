@@ -4,6 +4,14 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.14.2] - 2026-07-16
+
+### Fixed
+- Opening a bridge no longer fails on a `chrome-extension://` (or `chrome://`, `devtools://`)
+  origin's web storage. Those privileged documents deny a `Page.navigate` + `localStorage`
+  write, which aborted the whole seed with a SecurityError; such origins are now skipped, since
+  their storage can't be replayed and is never part of a login.
+
 ## [0.14.1] - 2026-07-15
 
 ### Fixed
