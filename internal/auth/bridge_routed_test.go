@@ -8,6 +8,7 @@ import (
 
 	"github.com/yasyf/cookiesync/internal/cookie"
 	"github.com/yasyf/cookiesync/internal/state"
+	consentkit "github.com/yasyf/synckit/consent"
 	"github.com/yasyf/synckit/presence"
 )
 
@@ -89,9 +90,9 @@ func TestRoutedBridgeReleaseNonceMismatchIsAuthRequired(t *testing.T) {
 	st := stateWith(self, "", stateEndpoint(peer, "chrome", "Default"))
 
 	_, err := routedBridgeChrome(t, st, consent, runner, "the-real-nonce")
-	var authErr *AuthRequired
+	var authErr *consentkit.AuthRequired
 	if !errors.As(err, &authErr) {
-		t.Fatalf("nonce mismatch = %v, want *AuthRequired", err)
+		t.Fatalf("nonce mismatch = %v, want *consentkit.AuthRequired", err)
 	}
 	if consent.unpromptedCalled != 0 {
 		t.Fatalf("an unbound approval must NOT release the key, got %d", consent.unpromptedCalled)
@@ -128,7 +129,9 @@ func TestRoutedBridgeReleaseUnavailableRoutesOn(t *testing.T) {
 }
 
 // TestRoutedBridgeReleaseDenialIsTerminal proves a human decline ends the loop:
-// no further peer is asked and the release fails closed with AuthRequired.
+// no further peer is asked and the release surfaces the Router's terminal
+// *consentkit.Denied (denied is terminal; ClassifyBridgeApproval maps it to
+// VerdictDenied).
 func TestRoutedBridgeReleaseDenialIsTerminal(t *testing.T) {
 	self := "me@laptop"
 	first := "first@box"
@@ -144,9 +147,9 @@ func TestRoutedBridgeReleaseDenialIsTerminal(t *testing.T) {
 	st := stateWith(self, "", stateEndpoint(first, "chrome", "Default"), stateEndpoint(second, "chrome", "Default"))
 
 	_, err := routedBridgeChrome(t, st, consent, runner, nonce)
-	var authErr *AuthRequired
-	if !errors.As(err, &authErr) {
-		t.Fatalf("denial = %v, want *AuthRequired", err)
+	var denied *consentkit.Denied
+	if !errors.As(err, &denied) {
+		t.Fatalf("denial = %v, want *consentkit.Denied", err)
 	}
 	if asked := runner.consentTargetsFor("request_bridge_consent"); len(asked) != 1 || asked[0] != first {
 		t.Fatalf("consent dials = %v, want only the denying peer %s (denial is terminal)", asked, first)

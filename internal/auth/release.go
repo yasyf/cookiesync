@@ -5,6 +5,7 @@ import (
 
 	"github.com/yasyf/cookiesync/internal/cookie"
 	"github.com/yasyf/cookiesync/internal/state"
+	consentkit "github.com/yasyf/synckit/consent"
 	"github.com/yasyf/synckit/presence"
 	synckit "github.com/yasyf/synckit/rpc"
 )
@@ -72,8 +73,8 @@ func (b *Broker) releaseKey(ctx context.Context, st *state.State, req Req, self,
 // caller observes is always the one its flight actually used.
 func (b *Broker) routesConsent(ctx context.Context, st *state.State) (bool, error) {
 	if st.ConsentRouteHard && st.ConsentRouteTo != "" {
-		live, err := b.peerIsLive(ctx, st.ConsentRouteTo)
-		if err != nil && !probeRoutesAround(err) {
+		live, err := b.Router.Live(ctx, st.ConsentRouteTo)
+		if err != nil && !consentkit.ProbeRoutesAround(err) {
 			return false, err
 		}
 		if err == nil && live {

@@ -14,6 +14,7 @@ import (
 	"github.com/yasyf/cookiesync/internal/cookie"
 	"github.com/yasyf/cookiesync/internal/engine"
 	"github.com/yasyf/cookiesync/internal/state"
+	consentkit "github.com/yasyf/synckit/consent"
 	"github.com/yasyf/synckit/hostregistry"
 )
 
@@ -293,11 +294,11 @@ func (d *Daemon) handleRequestConsent(ctx context.Context, params map[string]any
 	}
 	_, _, keyErr := d.broker.Key(ctx, req)
 	switch auth.Classify(keyErr) {
-	case auth.VerdictOK:
+	case consentkit.VerdictOK:
 		return map[string]any{"status": "approved", "nonce": nonce, "endpoint": endpoint}, nil
-	case auth.VerdictDenied:
+	case consentkit.VerdictDenied:
 		return map[string]any{"status": "denied"}, nil
-	case auth.VerdictUnavailable:
+	case consentkit.VerdictUnavailable:
 		return map[string]any{"status": "unavailable"}, nil
 	default:
 		return nil, keyErr
@@ -335,11 +336,11 @@ func (d *Daemon) handleRequestBridgeConsent(ctx context.Context, params map[stri
 		Mode:      auth.ModeApprover,
 	})
 	switch auth.ClassifyBridgeApproval(approveErr) {
-	case auth.VerdictOK:
+	case consentkit.VerdictOK:
 		return map[string]any{"status": "approved", "nonce": nonce, "endpoint": endpoint}, nil
-	case auth.VerdictDenied:
+	case consentkit.VerdictDenied:
 		return map[string]any{"status": "denied"}, nil
-	case auth.VerdictUnavailable:
+	case consentkit.VerdictUnavailable:
 		return map[string]any{"status": "unavailable"}, nil
 	default:
 		return nil, approveErr
@@ -442,7 +443,7 @@ func (d *Daemon) getCookiesAll(ctx context.Context, requestor string, urls []str
 		return nil, err
 	}
 	if len(outcomes)+len(remotes) == 0 {
-		return nil, &auth.AuthRequired{Msg: "no browsers are tracked; run cookiesync browser add"}
+		return nil, &consentkit.AuthRequired{Msg: "no browsers are tracked; run cookiesync browser add"}
 	}
 
 	var sets []cookie.RankedSet
@@ -585,7 +586,7 @@ func (d *Daemon) getWebStorageAll(ctx context.Context, params map[string]any) (a
 		return nil, err
 	}
 	if len(outcomes) == 0 {
-		return nil, &auth.AuthRequired{Msg: "no local browsers are tracked; run cookiesync browser add"}
+		return nil, &consentkit.AuthRequired{Msg: "no local browsers are tracked; run cookiesync browser add"}
 	}
 
 	acc := map[string]*originAcc{}

@@ -12,7 +12,7 @@ import (
 	"time"
 
 	"github.com/yasyf/cookiesync/internal/helper"
-	"github.com/yasyf/cookiesync/internal/paths"
+	"github.com/yasyf/synckit/authkit"
 )
 
 // The helper-exec seam is doubled by the scripted fakeHelper and the clock is
@@ -227,14 +227,13 @@ func TestOpenStates(t *testing.T) {
 }
 
 func TestOpenFailsClosedWhenHelperMissing(t *testing.T) {
-	missing := filepath.Join(t.TempDir(), "absent", "cookiesync-keyhelper")
-	restore := paths.SetHelperBinaryForTest(missing)
-	t.Cleanup(restore)
+	missing := filepath.Join(t.TempDir(), "absent", "authkit")
+	t.Setenv(authkit.HelperEnvVar, missing)
 
 	_, err := Open(context.Background(), helper.Bridge{})
-	var helperErr *paths.HelperError
+	var helperErr *authkit.HelperError
 	if !errors.As(err, &helperErr) {
-		t.Fatalf("err = %v, want *paths.HelperError", err)
+		t.Fatalf("err = %v, want *authkit.HelperError", err)
 	}
 }
 

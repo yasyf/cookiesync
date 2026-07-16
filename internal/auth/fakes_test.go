@@ -364,6 +364,24 @@ func (r *approverMesh) probedTargets() []string {
 	return targets
 }
 
+// whoamiErrMesh wraps an approverMesh, failing the whoami leg for one target
+// with a fixed error; every other call delegates to the embedded mesh.
+type whoamiErrMesh struct {
+	*approverMesh
+	target string
+	err    error
+}
+
+func (r *whoamiErrMesh) Run(ctx context.Context, target, cmd string, stdin []byte) (string, error) {
+	if target == r.target && strings.Contains(cmd, "whoami") {
+		r.mu.Lock()
+		r.calls = append(r.calls, runnerCall{target: target, cmd: cmd})
+		r.mu.Unlock()
+		return "", r.err
+	}
+	return r.approverMesh.Run(ctx, target, cmd, stdin)
+}
+
 // staticProbe returns a fixed session snapshot.
 func staticProbe(snap presence.SessionSnapshot) Probe {
 	return func(_ context.Context) (presence.SessionSnapshot, error) { return snap, nil }

@@ -10,6 +10,7 @@ import (
 
 	"github.com/yasyf/cookiesync/internal/cookie"
 	"github.com/yasyf/cookiesync/internal/state"
+	consentkit "github.com/yasyf/synckit/consent"
 	"github.com/yasyf/synckit/presence"
 	synckit "github.com/yasyf/synckit/rpc"
 	"golang.org/x/sync/singleflight"
@@ -40,10 +41,10 @@ type batchResult struct {
 	surface  Surface
 }
 
-// Broker is the single owner of every key path: it holds the grants store, the
-// key cache, the prompt gate, the release singleflight, and the consent nonce
-// source, and serves keys only through Key, LocalKeys, and the grant-blind
-// CachedKey data-plane read.
+// Broker is the single owner of every key path: it holds the generic grants
+// store, the key cache, the prompt gate, the release singleflight, and the
+// routed-consent Router, and serves keys only through Key, LocalKeys, and the
+// grant-blind CachedKey data-plane read.
 //
 // batchFlight collapses concurrent Key calls into one flight per release mode,
 // requestor, and browser, so a burst of cold releases from one principal for
@@ -59,38 +60,35 @@ type Broker struct {
 	consent cookie.Consent
 	cache   Cache
 	probe   Probe
-	runner  SSHRunner
 	state   StateLoader
+	grants  *consentkit.Grants
+
+	// Router walks approver candidates for a routed release. Exported so a
+	// sibling-package test can pin its nonce source to assert the echo binding.
+	Router *consentkit.Router
 
 	// KeybagProbe is the ioreg-only console read Status uses (netstat stays
 	// off this path); defaults to probe — production pins presence.Console.
 	KeybagProbe Probe
 
-	// Nonce mints routed-consent nonces; a field so a test can pin the echo
-	// binding. Defaults to the crypto/rand source.
-	Nonce func() (string, error)
-
 	batchFlight singleflight.Group
-
-	grantMu sync.Mutex
-	grants  map[string]time.Time // requestor + ":" + browser → expiry; pruned on read
 
 	promptGate sync.Mutex
 }
 
-// NewBroker builds the broker over injected collaborators. KeybagProbe defaults
-// to probe and Nonce to the crypto/rand source; override the fields after
-// construction to pin them.
+// NewBroker builds the broker over injected collaborators, wiring the generic
+// Router over runner (probing peers via "cookiesync rpc whoami") and a fresh
+// grant store. KeybagProbe defaults to probe; override the fields — or
+// router.Nonce / router timeouts — after construction to pin them.
 func NewBroker(consent cookie.Consent, c Cache, probe Probe, runner SSHRunner, st StateLoader) *Broker {
 	return &Broker{
 		consent:     consent,
 		cache:       c,
 		probe:       probe,
-		runner:      runner,
 		state:       st,
+		Router:      consentkit.NewRouter(runner, "cookiesync rpc whoami"),
+		grants:      consentkit.NewGrants(),
 		KeybagProbe: probe,
-		Nonce:       newNonce,
-		grants:      map[string]time.Time{},
 	}
 }
 
@@ -120,7 +118,7 @@ func (b *Broker) Key(ctx context.Context, req Req) (cookie.AesKey, Surface, erro
 			return nil, SurfaceNone, err
 		}
 		if !live {
-			return nil, SurfaceNone, &AuthRequired{Msg: "no live session to approve consent"}
+			return nil, SurfaceNone, &consentkit.AuthRequired{Msg: "no live session to approve consent"}
 		}
 	}
 	self, err := meshSelf(ctx)
@@ -219,7 +217,7 @@ func (b *Broker) LocalKeysWithState(ctx context.Context, requestor, reason strin
 	sort.Slice(locals, func(i, j int) bool { return locals[i].ID() < locals[j].ID() })
 	if budget == PrimeAll {
 		if len(locals) == 0 {
-			return nil, &AuthRequired{Msg: "no local browsers are tracked; run cookiesync browser add"}
+			return nil, &consentkit.AuthRequired{Msg: "no local browsers are tracked; run cookiesync browser add"}
 		}
 		return b.primeAll(ctx, requestor, reason, self, locals)
 	}
@@ -322,7 +320,7 @@ func (b *Broker) primeAll(ctx context.Context, requestor, reason, self string, l
 		if firstErr != nil {
 			return nil, firstErr
 		}
-		return nil, &AuthRequired{Msg: "no primed key stayed warm; retry cookiesync auth"}
+		return nil, &consentkit.AuthRequired{Msg: "no primed key stayed warm; retry cookiesync auth"}
 	}
 	return outcomes, nil
 }

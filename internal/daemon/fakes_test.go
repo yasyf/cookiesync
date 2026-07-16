@@ -17,14 +17,16 @@ import (
 	"github.com/yasyf/cookiesync/internal/cache"
 	"github.com/yasyf/cookiesync/internal/cookie"
 	"github.com/yasyf/cookiesync/internal/state"
+	consentkit "github.com/yasyf/synckit/consent"
 	"github.com/yasyf/synckit/cregistry"
 )
 
 // releaseLocal keeps the pre-broker release-mode name these tests exercise.
 const releaseLocal = auth.ModeLocal
 
-// AuthRequired keeps the pre-broker error name resolvable in these tests.
-type AuthRequired = auth.AuthRequired
+// AuthRequired keeps the pre-broker error name resolvable in these tests; it is
+// now the generic consent fail-closed error.
+type AuthRequired = consentkit.AuthRequired
 
 // primeAuth drives the broker release the way the pre-broker daemon seam did,
 // so the release tests keep their call shape.

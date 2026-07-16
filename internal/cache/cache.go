@@ -5,7 +5,7 @@
 // the at-rest cache bytes are Secure-Enclave-wrapped: a leaked blob or core dump
 // is useless off-box, since only the live per-boot Enclave key can unwrap it.
 //
-// The cache drives the installed, Developer-ID-signed cookiesync-keyhelper.app
+// The cache drives the installed, Developer-ID-signed authkit.app
 // (cache-newkey / cache-wrap / cache-unwrap / cache-dropkey) through the Helper
 // seam; a missing helper fails closed. Its wrap state moves between the ENCLAVE
 // and MEMORY epochs, with CLOSED terminal: whenever the Enclave refuses the

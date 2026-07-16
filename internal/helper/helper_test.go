@@ -12,15 +12,13 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/yasyf/cookiesync/internal/paths"
+	"github.com/yasyf/synckit/authkit"
 )
-
-const staleHelperUnknownSubcommandStderr = "keyhelper: unknown subcommand 'vault-batch-retrieve'\n"
 
 // writeScript writes an executable shell script at a temp path and returns it.
 func writeScript(t *testing.T, body string) string {
 	t.Helper()
-	path := filepath.Join(t.TempDir(), "cookiesync-keyhelper")
+	path := filepath.Join(t.TempDir(), "authkit")
 	if err := os.WriteFile(path, []byte("#!/bin/sh\n"+body), 0o755); err != nil { //nolint:gosec // test fixture must be executable.
 		t.Fatalf("write script: %v", err)
 	}
@@ -41,9 +39,9 @@ func TestRunReportsExitCodeNotError(t *testing.T) {
 }
 
 func TestRunCapturesStderrOnCleanNonZeroExit(t *testing.T) {
-	// A non-zero exit is not an error, but the helper's stderr diagnostic (the
-	// failing operation + OSStatus) must reach the caller for logging/classifying.
-	const diagnostic = "keyhelper: SecKeyCreateRandomKey failed: interaction not allowed (OSStatus -25308)"
+	// A non-zero exit is not an error, but the helper's stderr diagnostic must
+	// still reach the caller for logging/classifying.
+	const diagnostic = "authkit: SecKeyCreateRandomKey failed: interaction not allowed (OSStatus -25308)"
 	script := writeScript(t, "printf 'partial'\nprintf '%s\\n' \""+diagnostic+"\" >&2\nexit 3\n")
 	res, err := Bridge{Binary: script}.CacheNewkey(context.Background(), "label")
 	if err != nil {
@@ -60,22 +58,9 @@ func TestRunCapturesStderrOnCleanNonZeroExit(t *testing.T) {
 	}
 }
 
-func TestVaultRetrieveSetsReasonEnv(t *testing.T) {
-	// The helper echoes COOKIESYNC_TOUCHID_REASON to stdout so we can assert the
-	// bridge always sets it — the Touch ID UX fix.
-	script := writeScript(t, `printf '%s' "$COOKIESYNC_TOUCHID_REASON"`+"\n")
-	res, err := Bridge{Binary: script}.VaultRetrieve(context.Background(), "vault", "unlock your Chrome cookies to post a tweet")
-	if err != nil {
-		t.Fatalf("VaultRetrieve: %v", err)
-	}
-	if got := string(res.Stdout); got != "unlock your Chrome cookies to post a tweet" {
-		t.Fatalf("reason env = %q", got)
-	}
-}
-
 func TestCacheWrapUnwrapAreBinarySafe(t *testing.T) {
-	// cache-wrap/unwrap pass raw bytes through stdin/stdout, including NULs and
-	// high bytes. The fake XORs, proving the bridge does not mangle binary I/O.
+	// cache-wrap/unwrap pass raw bytes through stdin/stdout; the fake XORs to
+	// prove the bridge does not mangle binary I/O.
 	script := writeScript(t, `exec /usr/bin/perl -0777 -pe 's/(.)/chr(ord($1)^0x5A)/ges'`+"\n")
 	bridge := Bridge{Binary: script}
 	plaintext := []byte{0x00, 0x01, 0xFF, 0x5A, 0x80, 0x0A, 0x00}
@@ -97,10 +82,9 @@ func TestCacheWrapUnwrapAreBinarySafe(t *testing.T) {
 }
 
 func TestVaultBatchRetrieveArgsAndReason(t *testing.T) {
-	// The fake echoes argv to stdout and the reason env var to stderr, proving the
-	// bridge flattens items into repeated <vault> <safe-storage> pairs and threads
-	// reason through COOKIESYNC_TOUCHID_REASON like VaultRetrieve.
-	script := writeScript(t, `printf '%s\n' "$@"`+"\n"+`printf '%s' "$COOKIESYNC_TOUCHID_REASON" >&2`+"\n")
+	// The fake echoes argv to stdout and AUTHKIT_REASON to stderr, proving the
+	// bridge flattens items into <vault> <safe-storage> pairs and sets the reason.
+	script := writeScript(t, `printf '%s\n' "$@"`+"\n"+`printf '%s' "$AUTHKIT_REASON" >&2`+"\n")
 	items := []VaultItem{
 		{Vault: "cookiesync-vault-chrome", SafeStorageService: "Chrome Safe Storage"},
 		{Vault: "cookiesync-vault-brave", SafeStorageService: "Brave Safe Storage"},
@@ -211,80 +195,16 @@ func TestParseBatchLines(t *testing.T) {
 	}
 }
 
-func TestIsUnknownSubcommand(t *testing.T) {
-	tests := []struct {
-		name string
-		res  Result
-		want bool
-	}{
-		{
-			name: "stale helper rejection",
-			res:  Result{Code: 2, Stderr: []byte(staleHelperUnknownSubcommandStderr)},
-			want: true,
-		},
-		{
-			name: "exit 2 with a different diagnostic",
-			res:  Result{Code: 2, Stderr: []byte("keyhelper: unavailable: no biometrics or passcode\n")},
-			want: false,
-		},
-		{
-			name: "matching stderr but exit 1",
-			res:  Result{Code: 1, Stderr: []byte(staleHelperUnknownSubcommandStderr)},
-			want: false,
-		},
-		{
-			name: "matching stderr but exit 0",
-			res:  Result{Code: 0, Stderr: []byte(staleHelperUnknownSubcommandStderr)},
-			want: false,
-		},
-		{
-			name: "missing trailing newline",
-			res:  Result{Code: 2, Stderr: []byte("keyhelper: unknown subcommand 'vault-batch-retrieve'")},
-			want: false,
-		},
-		{
-			name: "extra trailing output",
-			res:  Result{Code: 2, Stderr: []byte(staleHelperUnknownSubcommandStderr + "keyhelper: usage\n")},
-			want: false,
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if got := IsUnknownSubcommand(tt.res); got != tt.want {
-				t.Fatalf("IsUnknownSubcommand = %v, want %v", got, tt.want)
-			}
-		})
-	}
-}
-
-func TestVaultBatchRetrieveStaleHelperSniff(t *testing.T) {
-	// End-to-end through the real exec path: a fake that mimics a <= v0.7.0
-	// helper's unknown-subcommand rejection must be recognized as stale.
-	script := writeScript(t, `printf '%s\n' "keyhelper: unknown subcommand 'vault-batch-retrieve'" >&2`+"\nexit 2\n")
-	res, err := Bridge{Binary: script}.VaultBatchRetrieve(
-		context.Background(),
-		[]VaultItem{{Vault: "cookiesync-vault-chrome", SafeStorageService: "Chrome Safe Storage"}},
-		"unlock 1 browser to sync",
-	)
-	if err != nil {
-		t.Fatalf("VaultBatchRetrieve: %v", err)
-	}
-	if !IsUnknownSubcommand(res) {
-		t.Fatalf("IsUnknownSubcommand = false for Code=%d Stderr=%q", res.Code, res.Stderr)
-	}
-}
-
 func TestMissingHelperFailsClosed(t *testing.T) {
-	missing := filepath.Join(t.TempDir(), "absent", "cookiesync-keyhelper")
-	restore := paths.SetHelperBinaryForTest(missing)
-	t.Cleanup(restore)
+	missing := filepath.Join(t.TempDir(), "absent", "authkit")
+	t.Setenv(authkit.HelperEnvVar, missing)
 
 	_, err := Bridge{}.VaultStatus(context.Background(), "vault")
-	var helperErr *paths.HelperError
+	var helperErr *authkit.HelperError
 	if !errors.As(err, &helperErr) {
-		t.Fatalf("err = %v, want *paths.HelperError", err)
+		t.Fatalf("err = %v, want *authkit.HelperError", err)
 	}
-	if !strings.Contains(err.Error(), "cookiesync install") {
-		t.Fatalf("HelperError = %q, want it to mention 'cookiesync install'", err.Error())
+	if !strings.Contains(err.Error(), "authkit") {
+		t.Fatalf("HelperError = %q, want it to mention 'authkit'", err.Error())
 	}
 }

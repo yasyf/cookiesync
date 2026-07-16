@@ -28,7 +28,7 @@ const deadWhoami = `{"on_console":true,"locked":true,"console_user":"peer"}`
 // pinnedNonce wires a daemon's nonce source to a fixed value, so a test can assert the
 // approval binds to exactly that nonce.
 func pinnedNonce(d *Daemon, nonce string) {
-	d.broker.Nonce = func() (string, error) { return nonce, nil }
+	d.broker.Router.Nonce = func() (string, error) { return nonce, nil }
 }
 
 // TestHandleRequestConsentUnavailableWithoutSession proves request_consent returns

@@ -16,6 +16,7 @@ import (
 	"github.com/yasyf/cookiesync/internal/paths"
 	"github.com/yasyf/cookiesync/internal/rpc"
 	"github.com/yasyf/cookiesync/internal/state"
+	"github.com/yasyf/synckit/authkit"
 	"github.com/yasyf/synckit/manifest"
 	"github.com/yasyf/synckit/syncservice"
 )
@@ -122,7 +123,7 @@ func realDoctorEnv() doctorEnv {
 // "biometry=… passcode=… vault=…" line means the contract is supported; a stale helper
 // (no such line) fails. Mirrors the Python doctor's signature + contract check.
 func checkHelper(ctx context.Context) check {
-	binary, err := paths.RequireHelper()
+	binary, err := authkit.RequireHelper()
 	if err != nil {
 		return check{label: "key helper", detail: err.Error()}
 	}
@@ -305,9 +306,9 @@ func quarantineChecks(baselines map[string]state.Baseline) []check {
 // missing helper is reported, and the manifest registers anyway (the helper fails closed
 // at runtime without it).
 func noteHelper(cmd *cobra.Command) {
-	if binary, err := paths.RequireHelper(); err == nil {
+	if binary, err := authkit.RequireHelper(); err == nil {
 		cmd.Printf("Key helper present: %s\n", binary)
 		return
 	}
-	cmd.PrintErrln("Key helper not installed; install it via Homebrew: brew install yasyf/tap/cookiesync-keyhelper")
+	cmd.PrintErrln("Key helper not installed; install it via Homebrew: brew install --cask authkit")
 }

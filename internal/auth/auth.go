@@ -20,6 +20,7 @@ import (
 	"github.com/yasyf/cookiesync/internal/cookie"
 	"github.com/yasyf/cookiesync/internal/mesh"
 	"github.com/yasyf/cookiesync/internal/state"
+	consentkit "github.com/yasyf/synckit/consent"
 	"github.com/yasyf/synckit/presence"
 )
 
@@ -113,33 +114,6 @@ type Status struct {
 	KeybagLocked  bool
 }
 
-// Verdict classifies a release error for a renderer.
-type Verdict int
-
-const (
-	// VerdictOK is a nil error: the release succeeded.
-	VerdictOK Verdict = iota
-	// VerdictUnavailable means this host cannot release right now — no live
-	// session, a locked keybag, or no reachable approver — and the caller
-	// should retry elsewhere or later.
-	VerdictUnavailable
-	// VerdictDenied means a human declined the consent prompt.
-	VerdictDenied
-	// VerdictFatal is everything else: a real failure the renderer surfaces.
-	VerdictFatal
-)
-
-// AuthRequired reports that the local key cache is cold and no live session —
-// local or routed — could release the key. It is the error the consent path
-// fails closed with, and a routed approval that fails to bind (a nonce or
-// endpoint mismatch) raises it too: an unbound approval is a security failure,
-// never a retry. Callers branch on it via errors.As.
-type AuthRequired struct { //nolint:revive // the established name of this error across the daemon's docs and wire hints; auth.Required loses the meaning.
-	Msg string
-}
-
-func (e *AuthRequired) Error() string { return e.Msg }
-
 // approverUnavailableError marks an approver-side failure — a flaky presence
 // probe or a broken initial cache read — as retryable by another mesh host.
 type approverUnavailableError struct {
@@ -149,39 +123,36 @@ type approverUnavailableError struct {
 func (e *approverUnavailableError) Error() string { return e.err.Error() }
 func (e *approverUnavailableError) Unwrap() error { return e.err }
 
-// Classify maps a release error to the verdict a renderer branches on: nil is
-// OK, a locked keybag, a fail-closed AuthRequired, or an approver's failed
-// probe or broken cache is Unavailable, a declined prompt is Denied, and
-// anything else is Fatal. The keybag check runs first — a ConsentError wrapping
-// ErrKeybagLocked is retryable, never a denial.
-func Classify(err error) Verdict {
+// Classify maps a release error to a verdict: a locked keybag or an approver's
+// failed probe/broken cache is Unavailable, a declined prompt is Denied, and
+// everything else delegates to consentkit.Classify (fail-closed AuthRequired →
+// Unavailable, routed Denied → Denied, else Fatal). The keybag check runs
+// first, so a ConsentError wrapping ErrKeybagLocked is retryable, never a
+// denial.
+func Classify(err error) consentkit.Verdict {
 	if err == nil {
-		return VerdictOK
+		return consentkit.VerdictOK
 	}
 	if errors.Is(err, cookie.ErrKeybagLocked) {
-		return VerdictUnavailable
-	}
-	var authErr *AuthRequired
-	if errors.As(err, &authErr) {
-		return VerdictUnavailable
+		return consentkit.VerdictUnavailable
 	}
 	var unavailErr *approverUnavailableError
 	if errors.As(err, &unavailErr) {
-		return VerdictUnavailable
+		return consentkit.VerdictUnavailable
 	}
 	var declined *cookie.ConsentError
 	if errors.As(err, &declined) {
-		return VerdictDenied
+		return consentkit.VerdictDenied
 	}
-	return VerdictFatal
+	return consentkit.Classify(err)
 }
 
 // ClassifyBridgeApproval maps a bridge-approval error to a verdict, differing
 // from Classify only for a missing bridge vault: Unavailable (so routed consent
 // advances to another approver) rather than Denied (which ends the loop).
-func ClassifyBridgeApproval(err error) Verdict {
+func ClassifyBridgeApproval(err error) consentkit.Verdict {
 	if errors.Is(err, cookie.ErrBridgeVaultMissing) {
-		return VerdictUnavailable
+		return consentkit.VerdictUnavailable
 	}
 	return Classify(err)
 }

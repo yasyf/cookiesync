@@ -19,8 +19,8 @@ import (
 	"github.com/yasyf/cookiesync/internal/cookie"
 	"github.com/yasyf/cookiesync/internal/engine"
 	"github.com/yasyf/cookiesync/internal/helper"
-	"github.com/yasyf/cookiesync/internal/paths"
 	"github.com/yasyf/cookiesync/internal/state"
+	"github.com/yasyf/synckit/authkit"
 	"github.com/yasyf/synckit/hostregistry"
 )
 
@@ -1676,8 +1676,7 @@ func TestRequestedEndpointLastSurvivesRealCacheHeal(t *testing.T) {
 	// One open probe + two bulk Puts' probes stay refused; the fourth probe — the
 	// requested endpoint's Put — heals.
 	binary := writeHealingCacheHelper(t, 4)
-	restore := paths.SetHelperBinaryForTest(binary)
-	t.Cleanup(restore)
+	t.Setenv(authkit.HelperEnvVar, binary)
 
 	keyCache, err := cache.Open(ctx, helper.Bridge{})
 	if err != nil {

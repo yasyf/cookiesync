@@ -67,9 +67,7 @@ func TestReleaseUsesEffectiveTTLForCacheAndGrant(t *testing.T) {
 			if got := cache.putTTL(endpointID(self, "chrome", "Default")); got != tc.want {
 				t.Fatalf("cache.Put ttl = %v, want %v", got, tc.want)
 			}
-			b.grantMu.Lock()
-			expiry, ok := b.grants["local:chrome"]
-			b.grantMu.Unlock()
+			expiry, ok := b.grants.Granted("local", "chrome")
 			if !ok {
 				t.Fatalf("the release must grant local:chrome")
 			}
@@ -105,9 +103,7 @@ func TestCapGrantOnlyShortens(t *testing.T) {
 				b.Grant("local", []cookie.BrowserName{"chrome"}, tc.existing)
 			}
 			b.CapGrant("local", "chrome", tc.cap)
-			b.grantMu.Lock()
-			expiry, ok := b.grants["local:chrome"]
-			b.grantMu.Unlock()
+			expiry, ok := b.grants.Granted("local", "chrome")
 			if ok != tc.wantGrant {
 				t.Fatalf("grant present = %v, want %v", ok, tc.wantGrant)
 			}

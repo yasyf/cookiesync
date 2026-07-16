@@ -15,6 +15,7 @@ import (
 	"github.com/yasyf/cookiesync/internal/cache"
 	"github.com/yasyf/cookiesync/internal/cookie"
 	"github.com/yasyf/cookiesync/internal/helper"
+	consentkit "github.com/yasyf/synckit/consent"
 	"github.com/yasyf/synckit/hostregistry"
 	"github.com/yasyf/synckit/presence"
 )
@@ -192,9 +193,7 @@ func TestReleaseGrantCappedWhenPutDemotesMidCall(t *testing.T) {
 	if err != nil || !ok || string(got) != string(consent.key) {
 		t.Fatalf("post-release Get = %q, %v, %v, want the key warm in memory", got, ok, err)
 	}
-	b.grantMu.Lock()
-	expiry, granted := b.grants["local:chrome"]
-	b.grantMu.Unlock()
+	expiry, granted := b.grants.Granted("local", "chrome")
 	if !granted {
 		t.Fatalf("the release must grant local:chrome")
 	}
@@ -259,9 +258,7 @@ func TestKeyRePublishesWhenEpochRetiresRightAfterFlightPut(t *testing.T) {
 			if keyCache.Degraded() != tc.wantDegraded {
 				t.Fatalf("Degraded = %v, want %v", keyCache.Degraded(), tc.wantDegraded)
 			}
-			b.grantMu.Lock()
-			expiry, granted := b.grants["local:chrome"]
-			b.grantMu.Unlock()
+			expiry, granted := b.grants.Granted("local", "chrome")
 			if !granted {
 				t.Fatalf("the release must grant local:chrome")
 			}
@@ -313,9 +310,7 @@ func TestDegradedRePutNeverExtendsNearExpiryGrant(t *testing.T) {
 	if puts := keyCache.putOrder(); len(puts) != 2 || puts[1] != id {
 		t.Fatalf("puts = %v, want the seed then the re-Put of %s", puts, id)
 	}
-	b.grantMu.Lock()
-	expiry, granted := b.grants["local:chrome"]
-	b.grantMu.Unlock()
+	expiry, granted := b.grants.Granted("local", "chrome")
 	if !granted {
 		t.Fatalf("the near-expiry grant must survive the re-Put")
 	}
@@ -465,9 +460,9 @@ func TestConcurrentDistinctBrowserKeysNeverShareAFlight(t *testing.T) {
 
 	arc := <-arcDone
 	chrome := <-chromeDone
-	var authErr *AuthRequired
+	var authErr *consentkit.AuthRequired
 	if !errors.As(arc.err, &authErr) {
-		t.Fatalf("arc (unavailable approver, no fallback) = %v, want *AuthRequired", arc.err)
+		t.Fatalf("arc (unavailable approver, no fallback) = %v, want *consentkit.AuthRequired", arc.err)
 	}
 	if chrome.err != nil {
 		t.Fatalf("chrome must not receive arc's routed failure, got %v", chrome.err)
@@ -540,7 +535,7 @@ func TestKeyApproverProbeErrorClassifiesUnavailable(t *testing.T) {
 	if !errors.Is(err, probeErr) {
 		t.Fatalf("Key over a failed probe = %v, want it to wrap %v", err, probeErr)
 	}
-	if got := Classify(err); got != VerdictUnavailable {
+	if got := Classify(err); got != consentkit.VerdictUnavailable {
 		t.Fatalf("Classify(probe error) = %v, want VerdictUnavailable", got)
 	}
 	if len(consent.promptedReasons) != 0 {
@@ -632,7 +627,7 @@ func TestKeyHardRouteMalformedWhoamiIsFatal(t *testing.T) {
 	runner := &approverMesh{whoami: map[string]string{"you@desktop": "not json"}}
 
 	got := hardRouteLocalRelease(t, runner)
-	if got.errText == "" || !strings.Contains(got.errText, "parse whoami from you@desktop") {
+	if got.errText == "" || !strings.Contains(got.errText, "parse presence from you@desktop") {
 		t.Fatalf("malformed whoami err = %q, want a fatal parse failure", got.errText)
 	}
 	if len(got.prompts) != 0 || got.unprompted != 0 {

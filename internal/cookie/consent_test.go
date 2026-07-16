@@ -13,7 +13,7 @@ import (
 	"testing"
 
 	"github.com/yasyf/cookiesync/internal/helper"
-	"github.com/yasyf/cookiesync/internal/paths"
+	"github.com/yasyf/synckit/authkit"
 )
 
 // Parity oracles ported from the original Python tests/cookie/test_consent.py. The
@@ -25,12 +25,6 @@ const (
 	testPassword    = "peanuts-safe-storage-key"
 	testArcPassword = "arc-safe-storage-secret"
 )
-
-// staleBatchStderr duplicates helper.unknownSubcommandStderr as a tripwire: a fake
-// helper emitting exactly this line with exit 2 must route ObtainKeys onto the
-// per-browser vault-retrieve fallback. If the deployed helper's diagnostic ever
-// changes, this test and the sniffing constant must change together.
-const staleBatchStderr = "keyhelper: unknown subcommand 'vault-batch-retrieve'\n"
 
 func chrome(t *testing.T) Browser {
 	t.Helper()
@@ -54,35 +48,29 @@ func b64(s string) string {
 	return base64.StdEncoding.EncodeToString([]byte(s))
 }
 
-// fakeHelperSpec scripts a fake helper's per-verb exit code, stdout, and stderr.
-// retrieveCode2, when set, is returned on the second and later vault-retrieve
-// calls (the ACL re-enroll retry, or the second browser of a stale-helper loop).
+// fakeHelperSpec scripts a fake helper's vault-batch-retrieve exit code, stdout,
+// and stderr.
 type fakeHelperSpec struct {
-	batchCode     int
-	batchOut      string
-	batchStderr   string
-	retrieveCode  int
-	retrieveOut   string
-	retrieveCode2 int
-	retrieveOut2  string
-	enrollCode    int
+	batchCode   int
+	batchOut    string
+	batchStderr string
 }
 
 // writeFakeHelper writes an executable shell script that emulates the helper's
-// vault-* subcommands per spec, appending one line per invocation
-// ("<verb> reason=<COOKIESYNC_TOUCHID_REASON>") to a log file and dumping a
-// vault-batch-retrieve's item args, one per line, to an args file. Any other verb
-// (vault-status above all) exits 99, so a resurrected blank-sheet probe fails the
-// test loudly. It returns the script, log, and args paths.
+// vault-batch-retrieve subcommand per spec, appending one line per invocation
+// ("<verb> reason=<AUTHKIT_REASON>") to a log file and dumping the item args,
+// one per line, to an args file. Any other verb (vault-status above all) exits
+// 99, so a resurrected blank-sheet probe fails the test loudly. It returns the
+// script, log, and args paths.
 func writeFakeHelper(t *testing.T, spec fakeHelperSpec) (script, logPath, argsPath string) {
 	t.Helper()
 	dir := t.TempDir()
-	script = filepath.Join(dir, "cookiesync-keyhelper")
+	script = filepath.Join(dir, "authkit")
 	logPath = filepath.Join(dir, "calls.log")
 	argsPath = filepath.Join(dir, "batch.args")
 	body := `#!/bin/sh
 verb="$1"
-printf '%s reason=%s\n' "$verb" "$COOKIESYNC_TOUCHID_REASON" >> "` + logPath + `"
+printf '%s reason=%s\n' "$verb" "$AUTHKIT_REASON" >> "` + logPath + `"
 case "$verb" in
 vault-batch-retrieve)
   shift
@@ -90,18 +78,6 @@ vault-batch-retrieve)
   printf '%s' "` + spec.batchOut + `"
   printf '%s' "` + spec.batchStderr + `" >&2
   exit ` + strconv.Itoa(spec.batchCode) + `
-  ;;
-vault-retrieve)
-  n=$(grep -c '^vault-retrieve ' "` + logPath + `")
-  if [ "$n" -ge 2 ]; then
-    printf '%s' "` + spec.retrieveOut2 + `"
-    exit ` + strconv.Itoa(spec.retrieveCode2) + `
-  fi
-  printf '%s' "` + spec.retrieveOut + `"
-  exit ` + strconv.Itoa(spec.retrieveCode) + `
-  ;;
-vault-enroll)
-  exit ` + strconv.Itoa(spec.enrollCode) + `
   ;;
 *)
   echo "unexpected verb $verb" >&2
@@ -158,8 +134,8 @@ func verbCount(lines []string, verb string) int {
 	return n
 }
 
-// reasonsFor collects the COOKIESYNC_TOUCHID_REASON each invocation of verb
-// carried, in call order.
+// reasonsFor collects the AUTHKIT_REASON each invocation of verb carried, in
+// call order.
 func reasonsFor(lines []string, verb string) []string {
 	var reasons []string
 	for _, line := range lines {
@@ -170,19 +146,16 @@ func reasonsFor(lines []string, verb string) []string {
 	return reasons
 }
 
-// assertNoBlankPrompts fails if any prompting helper invocation — vault-retrieve
-// or vault-batch-retrieve — ran without a reason, or if the blank-sheet
-// vault-status probe ran at all.
+// assertNoBlankPrompts fails if any vault-batch-retrieve invocation ran without
+// a reason, or if the blank-sheet vault-status probe ran at all.
 func assertNoBlankPrompts(t *testing.T, lines []string) {
 	t.Helper()
 	if got := verbCount(lines, "vault-status"); got != 0 {
 		t.Fatalf("vault-status count = %d, want 0 (the blank-sheet probe is dead)", got)
 	}
-	for _, verb := range []string{"vault-retrieve", "vault-batch-retrieve"} {
-		for i, reason := range reasonsFor(lines, verb) {
-			if reason == "" {
-				t.Fatalf("%s call %d carried an empty reason", verb, i)
-			}
+	for i, reason := range reasonsFor(lines, "vault-batch-retrieve") {
+		if reason == "" {
+			t.Fatalf("vault-batch-retrieve call %d carried an empty reason", i)
 		}
 	}
 }
@@ -469,174 +442,12 @@ func TestObtainKeysErrorLineCarriesPerItemError(t *testing.T) {
 	}
 }
 
-func TestStaleHelperFallsBackToPerBrowserRetrieve(t *testing.T) {
-	script, logPath, _ := writeFakeHelper(t, fakeHelperSpec{
-		batchCode:     2,
-		batchStderr:   staleBatchStderr,
-		retrieveCode:  0,
-		retrieveOut:   testPassword,
-		retrieveCode2: 0,
-		retrieveOut2:  testArcPassword,
-	})
-	c := TouchIDConsent{Helper: helper.Bridge{Binary: script}}
-
-	outcomes, err := c.ObtainKeys(context.Background(), []Browser{chrome(t), arc(t)}, "post a tweet")
-	if err != nil {
-		t.Fatalf("ObtainKeys: %v", err)
-	}
-	for i, password := range []string{testPassword, testArcPassword} {
-		if want := DeriveKey(SafeStorageKey(password)); !bytes.Equal(outcomes[i].Key, want) {
-			t.Fatalf("outcome %d key mismatch", i)
-		}
-	}
-	lines := readLog(t, logPath)
-	if got := verbCount(lines, "vault-batch-retrieve"); got != 1 {
-		t.Fatalf("vault-batch-retrieve count = %d, want 1 (the stale-helper attempt)", got)
-	}
-	if got := verbCount(lines, "vault-retrieve"); got != 2 {
-		t.Fatalf("vault-retrieve count = %d, want 2 (one per browser)", got)
-	}
-	assertNoBlankPrompts(t, lines)
-	wantReasons := []string{
-		"unlock your Chrome cookies to post a tweet",
-		"unlock your Arc cookies to post a tweet",
-	}
-	if got := reasonsFor(lines, "vault-retrieve"); !slices.Equal(got, wantReasons) {
-		t.Fatalf("vault-retrieve reasons = %q, want %q", got, wantReasons)
-	}
-}
-
-func TestStaleHelperPerBrowserFailureIsolated(t *testing.T) {
-	cases := []struct {
-		name string
-		spec fakeHelperSpec
-		run  func(t *testing.T, c TouchIDConsent)
-	}{
-		{
-			name: "sibling retrieve fails while requested succeeds",
-			spec: fakeHelperSpec{
-				batchCode:     2,
-				batchStderr:   staleBatchStderr,
-				retrieveCode:  0,
-				retrieveOut:   testPassword,
-				retrieveCode2: 1,
-			},
-			run: func(t *testing.T, c TouchIDConsent) {
-				outcomes, err := c.ObtainKeys(context.Background(), []Browser{chrome(t), arc(t)}, "post a tweet")
-				if err != nil {
-					t.Fatalf("ObtainKeys: %v", err)
-				}
-				if want := DeriveKey(SafeStorageKey(testPassword)); !bytes.Equal(outcomes[0].Key, want) {
-					t.Fatalf("outcome 0 key mismatch")
-				}
-				if outcomes[0].Missing || outcomes[0].Err != nil {
-					t.Fatalf("outcome 0 = %+v, want key only", outcomes[0])
-				}
-				var consentErr *ConsentError
-				if !errors.As(outcomes[1].Err, &consentErr) {
-					t.Fatalf("outcome 1 err = %v, want *ConsentError", outcomes[1].Err)
-				}
-				if outcomes[1].Missing || outcomes[1].Key != nil {
-					t.Fatalf("outcome 1 = %+v, want Err only", outcomes[1])
-				}
-			},
-		},
-		{
-			name: "requested retrieve fails surfaces via the wrapper",
-			spec: fakeHelperSpec{
-				batchCode:    2,
-				batchStderr:  staleBatchStderr,
-				retrieveCode: 1,
-			},
-			run: func(t *testing.T, c TouchIDConsent) {
-				_, err := c.ObtainKey(context.Background(), chrome(t), "post a tweet")
-				var consentErr *ConsentError
-				if !errors.As(err, &consentErr) {
-					t.Fatalf("err = %v, want *ConsentError", err)
-				}
-				if !strings.Contains(consentErr.Msg, "cancelled or denied") {
-					t.Fatalf("ConsentError msg = %q, want it to mention cancelled or denied", consentErr.Msg)
-				}
-			},
-		},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			script, _, _ := writeFakeHelper(t, tc.spec)
-			c := TouchIDConsent{Helper: helper.Bridge{Binary: script}}
-			tc.run(t, c)
-		})
-	}
-}
-
-func TestStaleHelperReenrollsInvalidatedVault(t *testing.T) {
-	// The stale-helper loop keeps the single-path ACL healing: the first retrieve
-	// hits errSecItemNotFound (exit 2: the biometryCurrentSet ACL invalidated), so
-	// it re-enrolls and retries once, preserving the reason.
-	script, logPath, _ := writeFakeHelper(t, fakeHelperSpec{
-		batchCode:     2,
-		batchStderr:   staleBatchStderr,
-		retrieveCode:  2,
-		retrieveOut:   "",
-		retrieveCode2: 0,
-		retrieveOut2:  testPassword,
-		enrollCode:    0,
-	})
-	c := TouchIDConsent{Helper: helper.Bridge{Binary: script}}
-
-	key, err := c.ObtainKey(context.Background(), chrome(t), "post a tweet")
-	if err != nil {
-		t.Fatalf("ObtainKey: %v", err)
-	}
-	if want := DeriveKey(SafeStorageKey(testPassword)); !bytes.Equal(key, want) {
-		t.Fatalf("key mismatch")
-	}
-	lines := readLog(t, logPath)
-	if got := verbCount(lines, "vault-enroll"); got != 1 {
-		t.Fatalf("vault-enroll count = %d, want 1", got)
-	}
-	if got := verbCount(lines, "vault-retrieve"); got != 2 {
-		t.Fatalf("vault-retrieve count = %d, want 2 (one prompt + one ACL retry)", got)
-	}
-	assertNoBlankPrompts(t, lines)
-	wantReasons := []string{
-		"unlock your Chrome cookies to post a tweet",
-		"unlock your Chrome cookies to post a tweet",
-	}
-	if got := reasonsFor(lines, "vault-retrieve"); !slices.Equal(got, wantReasons) {
-		t.Fatalf("vault-retrieve reasons = %q, want %q", got, wantReasons)
-	}
-}
-
-func TestStaleHelperEnrollFailureRaisesConsentError(t *testing.T) {
-	script, logPath, _ := writeFakeHelper(t, fakeHelperSpec{
-		batchCode:    2,
-		batchStderr:  staleBatchStderr,
-		retrieveCode: 2,
-		enrollCode:   2,
-	})
-	c := TouchIDConsent{Helper: helper.Bridge{Binary: script}}
-
-	_, err := c.ObtainKey(context.Background(), chrome(t), "post a tweet")
-	var consentErr *ConsentError
-	if !errors.As(err, &consentErr) {
-		t.Fatalf("err = %v, want *ConsentError", err)
-	}
-	if !strings.Contains(consentErr.Msg, "enroll") {
-		t.Fatalf("ConsentError msg = %q, want it to mention enroll", consentErr.Msg)
-	}
-	lines := readLog(t, logPath)
-	if got := verbCount(lines, "vault-enroll"); got != 1 {
-		t.Fatalf("vault-enroll count = %d, want 1", got)
-	}
-}
-
 func TestUnavailableFallsBackToSecurityRead(t *testing.T) {
-	// A genuine exit 2 — no biometry and no passcode, not the stale-helper
-	// diagnostic — degrades to the bare per-browser Keychain read.
+	// A vault-batch-retrieve exit 2 — no biometry and no passcode — degrades to
+	// the bare per-browser Keychain read.
 	script, logPath, _ := writeFakeHelper(t, fakeHelperSpec{
 		batchCode:   2,
-		batchStderr: "keyhelper: unavailable: no biometrics or passcode\n",
+		batchStderr: "authkit: unavailable: no biometrics or passcode\n",
 	})
 	securityBin = writeFakeSecurity(t, 0, testPassword+"\n")
 	t.Cleanup(func() { securityBin = "/usr/bin/security" })
@@ -700,14 +511,13 @@ func TestObtainKeyUnpromptedDoesBareSecurityReadNoTouchID(t *testing.T) {
 func TestObtainKeyFailsClosedWhenHelperMissing(t *testing.T) {
 	// The signed helper is absent: ObtainKey fails closed via RequireHelper rather
 	// than degrading to an unsigned build. The Touch ID prompt never runs.
-	missing := filepath.Join(t.TempDir(), "absent", "cookiesync-keyhelper")
-	restore := paths.SetHelperBinaryForTest(missing)
-	t.Cleanup(restore)
+	missing := filepath.Join(t.TempDir(), "absent", "authkit")
+	t.Setenv(authkit.HelperEnvVar, missing)
 	c := TouchIDConsent{} // zero-value bridge resolves via RequireHelper
 
 	_, err := c.ObtainKey(context.Background(), chrome(t), "post a tweet")
-	var helperErr *paths.HelperError
+	var helperErr *authkit.HelperError
 	if !errors.As(err, &helperErr) {
-		t.Fatalf("err = %v, want *paths.HelperError", err)
+		t.Fatalf("err = %v, want *authkit.HelperError", err)
 	}
 }

@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/yasyf/cookiesync/internal/cookie"
+	consentkit "github.com/yasyf/synckit/consent"
 	"github.com/yasyf/synckit/presence"
 )
 
@@ -133,9 +134,9 @@ func TestReleaseBridge(t *testing.T) {
 			attended: false,
 			consent:  &fakeConsent{key: cookieTestKey, biometricKey: bridgeTestKey},
 			check: func(r bridgeRun) {
-				var authErr *AuthRequired
+				var authErr *consentkit.AuthRequired
 				if !errors.As(r.err, &authErr) {
-					r.t.Fatalf("err = %v, want *AuthRequired on a cold (routed) host", r.err)
+					r.t.Fatalf("err = %v, want *consentkit.AuthRequired on a cold (routed) host", r.err)
 				}
 				if r.key != nil {
 					r.t.Fatalf("key = %q, want nil when routing is unavailable", r.key)

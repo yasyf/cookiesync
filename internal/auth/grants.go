@@ -21,43 +21,28 @@ import (
 // never outlive a short window.
 const degradedAuthTTL = cache.DegradedTTL
 
-// Granted reports whether requestor holds a live grant for browser, pruning
-// every expired grant on the way.
+// Granted reports whether requestor holds a live grant for browser. The browser
+// name is the generic grant subject.
 func (b *Broker) Granted(requestor string, browser cookie.BrowserName) bool {
-	now := time.Now()
-	b.grantMu.Lock()
-	defer b.grantMu.Unlock()
-	for key, expiry := range b.grants {
-		if now.After(expiry) {
-			delete(b.grants, key)
-		}
-	}
-	_, ok := b.grants[requestor+":"+string(browser)]
+	_, ok := b.grants.Granted(requestor, string(browser))
 	return ok
 }
 
 // Grant authorizes requestor for every browser a release covered, expiring
 // after ttl.
 func (b *Broker) Grant(requestor string, browsers []cookie.BrowserName, ttl time.Duration) {
-	expiry := time.Now().Add(ttl)
-	b.grantMu.Lock()
-	defer b.grantMu.Unlock()
-	for _, browser := range browsers {
-		b.grants[requestor+":"+string(browser)] = expiry
+	subjects := make([]string, len(browsers))
+	for i, browser := range browsers {
+		subjects[i] = string(browser)
 	}
+	b.grants.Grant(requestor, subjects, ttl)
 }
 
 // CapGrant shortens requestor's live grant for browser to expire no later than
 // now + ttl. It only ever moves an expiry earlier — never creating or extending
 // authority — and is a no-op when no grant exists.
 func (b *Broker) CapGrant(requestor string, browser cookie.BrowserName, ttl time.Duration) {
-	capped := time.Now().Add(ttl)
-	b.grantMu.Lock()
-	defer b.grantMu.Unlock()
-	key := requestor + ":" + string(browser)
-	if expiry, ok := b.grants[key]; ok && expiry.After(capped) {
-		b.grants[key] = capped
-	}
+	b.grants.Cap(requestor, string(browser), ttl)
 }
 
 // effectiveTTL is the single derivation point for a release's grant window: the

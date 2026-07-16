@@ -10,7 +10,7 @@ require (
 	github.com/coder/websocket v1.8.15
 	github.com/spf13/cobra v1.10.2
 	github.com/syndtr/goleveldb v1.0.0
-	github.com/yasyf/synckit v0.15.0
+	github.com/yasyf/synckit v0.16.0
 	golang.org/x/crypto v0.48.0
 	golang.org/x/sync v0.20.0
 	golang.org/x/term v0.40.0
@@ -61,3 +61,8 @@ require (
 	modernc.org/mathutil v1.7.1 // indirect
 	modernc.org/memory v1.11.0 // indirect
 )
+
+// Integration-time pin to the local synckit worktree carrying the consent/ +
+// authkit/ surface this release consumes. The orchestrator drops this replace
+// and bumps the require above to the tagged v0.16.0 at merge.
+replace github.com/yasyf/synckit => /Users/yasyf/Code/wt-cc-sudo/synckit

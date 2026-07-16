@@ -108,8 +108,8 @@ type Consent interface {
 
 // TouchIDConsent is a Secure-Enclave-bound key vault: one biometric tap unlocks
 // the cached Safe Storage key. The biometric vault and re-store run inside the
-// installed, Developer-ID-signed cookiesync-keyhelper.app via the helper bridge; a
-// missing helper fails closed rather than degrading to an unsigned build.
+// installed, Developer-ID-signed authkit.app via the helper bridge; a missing
+// helper fails closed rather than degrading to an unsigned build.
 type TouchIDConsent struct {
 	// Helper is the bridge to the signed key helper. The zero value resolves the
 	// installed helper on each call.
@@ -181,9 +181,8 @@ func (c TouchIDConsent) ObtainKeyBiometric(ctx context.Context, browser Browser,
 // item in-helper under the same authentication — no probe, no second tap. A
 // denied sheet or a locked keybag fails the whole batch with a ConsentError; a
 // host with no biometry and no passcode degrades to bare per-browser Keychain
-// reads; a stale installed helper that predates the batch verb degrades to one
-// vault-retrieve prompt per browser. Every helper prompt on this path carries
-// the composed reason, so the helper never shows its generic default.
+// reads. Every helper prompt on this path carries the composed reason, so the
+// helper never shows its generic default.
 func (c TouchIDConsent) ObtainKeys(ctx context.Context, browsers []Browser, reason string) ([]KeyOutcome, error) {
 	items := make([]helper.VaultItem, len(browsers))
 	for i, b := range browsers {
@@ -193,80 +192,18 @@ func (c TouchIDConsent) ObtainKeys(ctx context.Context, browsers []Browser, reas
 	if err != nil {
 		return nil, err
 	}
-	switch {
-	case res.Code == 0:
+	switch res.Code {
+	case 0:
 		return batchOutcomes(browsers, res)
-	case res.Code == 1:
+	case 1:
 		return nil, &ConsentError{Msg: "Touch ID authentication was cancelled or denied"}
-	case helper.IsUnknownSubcommand(res):
-		return c.staleHelperOutcomes(ctx, browsers, reason), nil
-	case res.Code == 2:
+	case 2:
 		return bareOutcomes(ctx, browsers), nil
-	case res.Code == helper.CodePresenceUnavailable:
+	case helper.CodePresenceUnavailable:
 		return nil, &ConsentError{Msg: "the keychain keybag is locked (screen locked or no user present); retry after unlock", Err: ErrKeybagLocked}
 	default:
 		return nil, fmt.Errorf("vault-batch-retrieve exited %d: %s", res.Code, bytes.TrimSpace(res.Stderr))
 	}
-}
-
-// staleHelperOutcomes is the mixed-version fallback for an installed helper that
-// predates vault-batch-retrieve: one vault-retrieve prompt per browser, each
-// worded for that browser alone. A failed retrieve is that browser's outcome,
-// never the whole batch's — the requested browser's failure fails the batch
-// downstream, keyed on outcomes[0].
-func (c TouchIDConsent) staleHelperOutcomes(ctx context.Context, browsers []Browser, reason string) []KeyOutcome {
-	outcomes := make([]KeyOutcome, len(browsers))
-	for i, b := range browsers {
-		key, err := c.retrieve(ctx, vaultName(b), b.KeychainService, ComposeReason(b.Display, reason))
-		if err != nil {
-			outcomes[i] = KeyOutcome{Browser: b, Err: err}
-			continue
-		}
-		outcomes[i] = KeyOutcome{Browser: b, Key: key}
-	}
-	return outcomes
-}
-
-// retrieve prompts Touch ID once and returns the derived key. On exit 2
-// (errSecItemNotFound / errSecAuthFailed: the biometryCurrentSet ACL invalidated
-// because the fingerprint set changed) it re-enrolls once and retries the prompt
-// once, preserving the reason; a second failure is a ConsentError.
-func (c TouchIDConsent) retrieve(ctx context.Context, vault, safeStorageService, reason string) (AesKey, error) {
-	result, err := c.Helper.VaultRetrieve(ctx, vault, reason)
-	if err != nil {
-		return nil, err
-	}
-	switch result.Code {
-	case 0:
-		return DeriveKey(SafeStorageKey(result.Stdout)), nil
-	case 1:
-		return nil, &ConsentError{Msg: "Touch ID authentication was cancelled or denied"}
-	default:
-		if enrollErr := c.enroll(ctx, vault, safeStorageService); enrollErr != nil {
-			return nil, enrollErr
-		}
-		second, secondErr := c.Helper.VaultRetrieve(ctx, vault, reason)
-		if secondErr != nil {
-			return nil, secondErr
-		}
-		if second.Code == 0 {
-			return DeriveKey(SafeStorageKey(second.Stdout)), nil
-		}
-		return nil, &ConsentError{Msg: "Touch ID vault retrieval failed after re-enrollment"}
-	}
-}
-
-// enroll stores the Safe Storage password into the biometry-bound vault. A
-// non-zero exit surfaces as a ConsentError rather than a raw exit code.
-func (c TouchIDConsent) enroll(ctx context.Context, vault, safeStorageService string) error {
-	result, err := c.Helper.VaultEnroll(ctx, vault, safeStorageService)
-	if err != nil {
-		return err
-	}
-	if result.Code != 0 {
-		return &ConsentError{Msg: fmt.Sprintf("could not enroll the Touch ID vault for %q (exit %d)", safeStorageService, result.Code)}
-	}
-	return nil
 }
 
 // batchOutcomes maps an approved vault-batch-retrieve's stdout lines onto

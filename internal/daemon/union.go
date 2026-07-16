@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/yasyf/cookiesync/internal/auth"
+	consentkit "github.com/yasyf/synckit/consent"
 	"github.com/yasyf/synckit/hostregistry"
 )
 
@@ -63,13 +64,13 @@ func noContributionError(warnings, pending []string) error {
 
 func renderLocalKeyWarning(endpoint string, err error) string {
 	switch auth.Classify(err) {
-	case auth.VerdictUnavailable:
+	case consentkit.VerdictUnavailable:
 		return fmt.Sprintf("skip cold %s: run cookiesync auth (%v)", endpoint, err)
-	case auth.VerdictDenied:
+	case consentkit.VerdictDenied:
 		return fmt.Sprintf("skip cold %s: consent declined (%v)", endpoint, err)
-	case auth.VerdictFatal:
+	case consentkit.VerdictFatal:
 		return fmt.Sprintf("skip cold %s: %v", endpoint, err)
-	case auth.VerdictOK:
+	case consentkit.VerdictOK:
 		panic("auth.Classify returned VerdictOK for a local key error")
 	}
 	panic("auth.Classify returned an unknown verdict")

@@ -6,6 +6,7 @@ import (
 
 	"github.com/yasyf/cookiesync/internal/cookie"
 	"github.com/yasyf/cookiesync/internal/state"
+	consentkit "github.com/yasyf/synckit/consent"
 	"github.com/yasyf/synckit/presence"
 	synckit "github.com/yasyf/synckit/rpc"
 )
@@ -69,7 +70,7 @@ func (b *Broker) ApproveBridge(ctx context.Context, req Req) error {
 		return err
 	}
 	if !live {
-		return &AuthRequired{Msg: "no live session to approve bridge consent"}
+		return &consentkit.AuthRequired{Msg: "no live session to approve bridge consent"}
 	}
 	bw, err := cookie.Lookup(cookie.BrowserName(req.Browser))
 	if err != nil {

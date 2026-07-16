@@ -18,7 +18,7 @@ import (
 	"github.com/yasyf/cookiesync/internal/cookie"
 	"github.com/yasyf/cookiesync/internal/engine"
 	"github.com/yasyf/cookiesync/internal/helper"
-	"github.com/yasyf/cookiesync/internal/paths"
+	"github.com/yasyf/synckit/authkit"
 	synckit "github.com/yasyf/synckit/rpc"
 )
 
@@ -67,8 +67,7 @@ func TestBuildOpensAndDropsTheEnclaveKey(t *testing.T) {
 	cfg := t.TempDir()
 	t.Setenv("XDG_CONFIG_HOME", cfg)
 	binary, logPath := writeFakeCacheHelper(t)
-	restore := paths.SetHelperBinaryForTest(binary)
-	t.Cleanup(restore)
+	t.Setenv(authkit.HelperEnvVar, binary)
 	fakeMesh(t, "me@laptop")
 	ctx := context.Background()
 
@@ -117,8 +116,7 @@ func TestBuildOpensAndDropsTheEnclaveKey(t *testing.T) {
 func TestBuildDegradedPresenceStartsWithMemoryCache(t *testing.T) {
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	binary, logPath := writeStubHelper(t, 3, "keyhelper: cache-newkey failed: interaction not allowed (OSStatus -25308)")
-	restore := paths.SetHelperBinaryForTest(binary)
-	t.Cleanup(restore)
+	t.Setenv(authkit.HelperEnvVar, binary)
 	fakeMesh(t, "me@laptop")
 
 	var logs bytes.Buffer
@@ -178,8 +176,7 @@ func TestBuildDegradedPresenceStartsWithMemoryCache(t *testing.T) {
 func TestBuildNoEnclaveStaysFatal(t *testing.T) {
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	binary, _ := writeStubHelper(t, 2, "keyhelper: cache-newkey failed: no Secure Enclave (OSStatus -34018)")
-	restore := paths.SetHelperBinaryForTest(binary)
-	t.Cleanup(restore)
+	t.Setenv(authkit.HelperEnvVar, binary)
 	fakeMesh(t, "me@laptop")
 
 	d, closer, err := Build(context.Background())
