@@ -63,11 +63,11 @@ homebrew_casks:
       token: "{{ .Env.HOMEBREW_TAP_TOKEN }}"
     homepage: https://github.com/yasyf/cookiesync
     description: Sync your browser cookies across your Macs.
-    # The signed Secure-Enclave key helper ships as its own cask (published by
-    # release.yml). Installing cookiesync pulls it so the Touch ID-gated vault and
-    # the per-boot Enclave key cache are available before the first sync.
+    # The signed Secure-Enclave helper ships as the authkit cask (published from
+    # the authkit repo). Installing cookiesync pulls it so the Touch ID-gated vault
+    # and the per-boot Enclave key cache are available before the first sync.
     dependencies:
-      - cask: cookiesync-keyhelper
+      - cask: authkit
     # Strip the quarantine attribute so the (notarized, or unsigned) binary runs on
     # first launch.
     #
