@@ -61,8 +61,3 @@ require (
 	modernc.org/mathutil v1.7.1 // indirect
 	modernc.org/memory v1.11.0 // indirect
 )
-
-// Integration-time pin to the local synckit worktree carrying the consent/ +
-// authkit/ surface this release consumes. The orchestrator drops this replace
-// and bumps the require above to the tagged v0.16.0 at merge.
-replace github.com/yasyf/synckit => /Users/yasyf/Code/wt-cc-sudo/synckit
