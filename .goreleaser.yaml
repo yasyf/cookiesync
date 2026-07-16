@@ -28,8 +28,8 @@ archives:
     name_template: "{{ .ProjectName }}_{{ .Os }}_{{ .Arch }}"
 
 # Developer-ID sign + notarize the darwin binaries so Gatekeeper clears the CLI on
-# first launch, gated on the MACOS_* secrets (no-op when unset). The Swift key
-# helper is signed separately in release.yml; this block covers the Go binary only.
+# first launch, gated on the MACOS_* secrets (no-op when unset). This block covers
+# the Go binary only; the Touch ID helper ships from the separate authkit cask.
 notarize:
   macos:
     - enabled: '{{ if envOrDefault "MACOS_SIGN_P12" "" }}true{{ else }}false{{ end }}'
