@@ -73,10 +73,11 @@ func TestRoutedBridgeReleaseApprovedShellsBridgeConsent(t *testing.T) {
 	}
 }
 
-// TestRoutedBridgeReleaseNonceMismatchIsAuthRequired proves an approval that does
-// not echo the exact nonce is a security failure (AuthRequired), never retried,
-// and the local key is never released.
-func TestRoutedBridgeReleaseNonceMismatchIsAuthRequired(t *testing.T) {
+// TestRoutedBridgeReleaseNonceMismatchIsBindingMismatch proves an approval that
+// does not echo the exact nonce is a fatal *consentkit.BindingMismatch — an
+// attack/corruption signal that stops the request, never a retryable
+// AuthRequired — and the local key is never released.
+func TestRoutedBridgeReleaseNonceMismatchIsBindingMismatch(t *testing.T) {
 	self := "me@laptop"
 	peer := "you@desktop"
 	endpoint := endpointID(self, "chrome", "Default")
@@ -90,9 +91,12 @@ func TestRoutedBridgeReleaseNonceMismatchIsAuthRequired(t *testing.T) {
 	st := stateWith(self, "", stateEndpoint(peer, "chrome", "Default"))
 
 	_, err := routedBridgeChrome(t, st, consent, runner, "the-real-nonce")
-	var authErr *consentkit.AuthRequired
-	if !errors.As(err, &authErr) {
-		t.Fatalf("nonce mismatch = %v, want *consentkit.AuthRequired", err)
+	var mismatch *consentkit.BindingMismatch
+	if !errors.As(err, &mismatch) {
+		t.Fatalf("nonce mismatch = %v, want *consentkit.BindingMismatch", err)
+	}
+	if got := Classify(err); got != consentkit.VerdictFatal {
+		t.Fatalf("Classify(binding mismatch) = %v, want VerdictFatal (never retryable)", got)
 	}
 	if consent.unpromptedCalled != 0 {
 		t.Fatalf("an unbound approval must NOT release the key, got %d", consent.unpromptedCalled)
