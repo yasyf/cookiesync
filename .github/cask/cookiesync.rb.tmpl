@@ -54,4 +54,10 @@ cask "cookiesync" do
                    must_succeed: false,
                    print_stderr: false
   end
+
+  caveats <<~EOS
+    Wire up the watch daemon and reconcile tick, then track your first browser:
+
+      cookiesync install
+  EOS
 end

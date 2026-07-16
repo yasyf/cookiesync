@@ -12,11 +12,13 @@ permissions:
   contents: write
 
 jobs:
-  # Shared pipeline: verify-tag-on-main, goreleaser `release --clean` (with retries;
+  # Shared pipeline: verify-tag-on-main and goreleaser `release --clean` (with retries;
   # .goreleaser.yaml sets release.replace_existing_artifacts so a retry after a partial
-  # publish is idempotent), and the cookiesync cask push to yasyf/homebrew-tap. The
-  # default quill/ubuntu path fits: the CLI is pure Go, and .goreleaser.yaml's notarize
-  # block reads the same MACOS_* env names the reusable workflow exports.
+  # publish is idempotent). It builds + signs + notarizes the CLI binaries and creates
+  # the GitHub release; the cookiesync cask is pushed by app-build, not here (the
+  # homebrew_casks block was removed — see .goreleaser.yaml). The default quill/ubuntu
+  # path fits: the CLI is pure Go, and .goreleaser.yaml's notarize block reads the same
+  # MACOS_* env names the reusable workflow exports.
   release:
     uses: yasyf/homebrew-tap/.github/workflows/release-go.yml@v1
     secrets: inherit
@@ -101,7 +103,10 @@ jobs:
           zip="dist/CookieSync-${GITHUB_REF_NAME}-darwin.zip"
           ditto -c -k --keepParent "$BUNDLE" "$zip"
           sha="$(shasum -a 256 "$zip" | awk '{print $1}')"
-          shasum -a 256 "$zip" > "$zip.sha256"
+          # Write the .sha256 with the zip's BASENAME (not the dist/ path) so a
+          # `shasum -c` from the download directory resolves the sibling file.
+          base="$(basename "$zip")"
+          ( cd dist && shasum -a 256 "$base" > "$base.sha256" )
           echo "zip=$zip" >> "$GITHUB_OUTPUT"
           echo "sha256=$sha" >> "$GITHUB_OUTPUT"
 
