@@ -42,6 +42,7 @@ func TestReleaseBridge(t *testing.T) {
 	tests := []struct {
 		name     string
 		attended bool
+		probe    Probe
 		consent  *fakeConsent
 		check    func(r bridgeRun)
 	}{
@@ -130,6 +131,34 @@ func TestReleaseBridge(t *testing.T) {
 			},
 		},
 		{
+			name:     "probe failure degrades to the local tap",
+			attended: true,
+			probe: func(context.Context) (presence.SessionSnapshot, error) {
+				return presence.SessionSnapshot{}, errors.New("ioreg: signal: killed")
+			},
+			consent: &fakeConsent{key: cookieTestKey, biometricKey: bridgeTestKey},
+			check: func(r bridgeRun) {
+				if r.err != nil {
+					r.t.Fatalf("ReleaseBridge over a failed probe must attempt the local tap, got %v", r.err)
+				}
+				if string(r.key) != string(bridgeTestKey) {
+					r.t.Fatalf("key = %q, want the biometric bridge key", r.key)
+				}
+				if r.surface != SurfaceLocal {
+					r.t.Fatalf("surface = %v, want SurfaceLocal", r.surface)
+				}
+				if got := r.consent.biometricCount(); got != 1 {
+					r.t.Fatalf("ObtainKeyBiometric calls = %d, want 1 (the strict tap still gates)", got)
+				}
+				if got := r.consent.promptCount(); got != 0 {
+					r.t.Fatalf("passcode-capable calls = %d, want 0", got)
+				}
+				if got := len(r.cache.putOrder()); got != 0 {
+					r.t.Fatalf("cache Puts = %d, want 0", got)
+				}
+			},
+		},
+		{
 			name:     "routed host fails with AuthRequired",
 			attended: false,
 			consent:  &fakeConsent{key: cookieTestKey, biometricKey: bridgeTestKey},
@@ -169,6 +198,9 @@ func TestReleaseBridge(t *testing.T) {
 			probe := staticProbe(liveSession(currentUser(t)))
 			if !tt.attended {
 				probe = staticProbe(presence.SessionSnapshot{OnConsole: true, Locked: true, ConsoleUser: currentUser(t)})
+			}
+			if tt.probe != nil {
+				probe = tt.probe
 			}
 			b := newTestBroker(tt.consent, fc, probe, &recordingRunner{}, st)
 			req := Req{Requestor: "req:claude", Browser: "chrome", Profile: "Default", Reason: testConsentReason, Mode: ModeLocal}

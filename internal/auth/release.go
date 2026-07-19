@@ -61,16 +61,15 @@ func (b *Broker) releaseKey(ctx context.Context, st *state.State, req Req, self,
 	return b.releaseAllLocal(ctx, st, req, self, id)
 }
 
-// routesConsent reports whether a ModeLocal release routes the user-presence
-// gate to a peer instead of prompting Touch ID locally: a hard consent route
-// (ConsentRouteHard) to a live ConsentRouteTo peer wins outright — this host
-// routes even when it looks locally attended — and a cold local session routes
-// to the active peer. A hard-routed peer whose whoami leg failed at ssh
-// (probeRoutesAround) counts as not live — exactly like routedRelease's probe
-// loop — never as a fatal local-release failure; a whoami reply that does not
-// parse stays fatal. It is derived once inside each release flight
-// (releaseKey), never snapshotted at call start, so the routed/local split a
-// caller observes is always the one its flight actually used.
+// routesConsent reports whether a local release — key or bridge open — routes
+// the user-presence gate to a peer instead of prompting locally: a hard route
+// (ConsentRouteHard) to a live ConsentRouteTo peer wins outright, and a cold
+// local session routes to the active peer; derived once per flight (releaseKey,
+// ReleaseBridge), so callers observe the split their flight used.
+//
+// A probe that failed to run degrades: an ssh whoami flake (probeRoutesAround)
+// counts as not live, a starved local probe as attended; a snapshot that does
+// not parse stays fatal.
 func (b *Broker) routesConsent(ctx context.Context, st *state.State) (bool, error) {
 	if st.ConsentRouteHard && st.ConsentRouteTo != "" {
 		live, err := b.Router.Live(ctx, st.ConsentRouteTo)
@@ -83,7 +82,7 @@ func (b *Broker) routesConsent(ctx context.Context, st *state.State) (bool, erro
 	}
 	snap, err := b.probe(ctx)
 	if err != nil {
-		return false, err
+		return false, nil
 	}
 	live, err := presence.Attended(snap)
 	if err != nil {

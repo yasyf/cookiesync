@@ -543,6 +543,40 @@ func TestKeyApproverProbeErrorClassifiesUnavailable(t *testing.T) {
 	}
 }
 
+// TestKeyLocalProbeErrorDegradesToLocalGate proves a ModeLocal release whose
+// presence probe fails to run (a starved ioreg) attempts the local Touch ID
+// gate instead of dying: one prompt, key released and cached, no error.
+func TestKeyLocalProbeErrorDegradesToLocalGate(t *testing.T) {
+	ctx := context.Background()
+	self := "me@laptop"
+	fakeMesh(t, self)
+	probeErr := errors.New("ioreg: signal: killed")
+	probe := func(context.Context) (presence.SessionSnapshot, error) {
+		return presence.SessionSnapshot{}, probeErr
+	}
+	consent := &fakeConsent{key: cookie.DeriveKey(cookie.SafeStorageKey("peanuts"))}
+	cache := newFakeCache()
+	b := newTestBroker(consent, cache, probe, &recordingRunner{}, stateWith(self, ""))
+
+	key, surface, err := b.Key(ctx, Req{Requestor: "local", Browser: "chrome", Profile: "Default", Reason: testConsentReason, Mode: ModeLocal})
+	if err != nil {
+		t.Fatalf("Key over a failed probe must attempt the local gate, got %v", err)
+	}
+	if string(key) != string(consent.key) {
+		t.Fatalf("Key = %q, want the released key %q", key, consent.key)
+	}
+	if surface != SurfaceLocal {
+		t.Fatalf("surface = %v, want SurfaceLocal", surface)
+	}
+	if len(consent.batchCalls) != 1 {
+		t.Fatalf("consent evaluations = %d, want exactly 1 local prompt", len(consent.batchCalls))
+	}
+	got, ok, err := cache.Get(ctx, endpointID(self, "chrome", "Default"))
+	if err != nil || !ok || string(got) != string(key) {
+		t.Fatalf("post-release Get = %q, %v, %v, want the key cached warm", got, ok, err)
+	}
+}
+
 // localReleaseOutcome is every observable a hard-route ModeLocal release
 // leaves behind, comparable across runner scenarios.
 type localReleaseOutcome struct {
