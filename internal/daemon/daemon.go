@@ -261,13 +261,13 @@ func Serve(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	ln, err := synckit.Listen(sock)
+	ln, err := synckit.Listen(ctx, sock)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = ln.Close() }()
 
-	return synckit.Serve(ctx, ln, d.Dispatcher())
+	return synckit.NewServer(d.Dispatcher()).Serve(ctx, ln)
 }
 
 // endpointID is an endpoint's stable identity, host:browser:profile — the cache

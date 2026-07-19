@@ -10,7 +10,8 @@ require (
 	github.com/coder/websocket v1.8.15
 	github.com/spf13/cobra v1.10.2
 	github.com/syndtr/goleveldb v1.0.0
-	github.com/yasyf/synckit v0.16.0
+	github.com/yasyf/daemonkit v0.1.1-0.20260719045607-173abb1e83d4
+	github.com/yasyf/synckit v0.20.0
 	golang.org/x/crypto v0.48.0
 	golang.org/x/sync v0.20.0
 	golang.org/x/term v0.40.0
@@ -31,8 +32,8 @@ require (
 	github.com/clipperhouse/stringish v0.1.1 // indirect
 	github.com/clipperhouse/uax29/v2 v2.5.0 // indirect
 	github.com/dustin/go-humanize v1.0.1 // indirect
+	github.com/ebitengine/purego v0.10.1 // indirect
 	github.com/erikgeiser/coninput v0.0.0-20211004153227-1c3628e74d0f // indirect
-	github.com/gofrs/flock v0.13.0 // indirect
 	github.com/golang/snappy v0.0.0-20180518054509-2e65f85255db // indirect
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/inconshreveable/mousetrap v1.1.0 // indirect

@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/yasyf/cookiesync/internal/cookie"
+	"github.com/yasyf/daemonkit/wire"
 	synckit "github.com/yasyf/synckit/rpc"
 )
 
@@ -28,21 +29,25 @@ func TestPeerSIDRequestorOverSocket(t *testing.T) {
 	d := New(consent, newFakeCache(), nil, staticProbe(liveSession(currentUser(t))), &recordingRunner{}, fixedState{st: st}, fixedState{st: st})
 
 	sock := filepath.Join(t.TempDir(), "d.sock")
-	ln, err := synckit.Listen(sock)
+	ctx, cancel := context.WithCancel(context.Background())
+	ln, err := synckit.Listen(ctx, sock)
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
-	ctx, cancel := context.WithCancel(context.Background())
-	served := make(chan error, 1)
-	go func() { served <- synckit.Serve(ctx, ln, d.Dispatcher()) }()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_ = synckit.NewServer(d.Dispatcher()).Serve(ctx, ln)
+	}()
 	t.Cleanup(func() {
 		cancel()
-		if err := <-served; err != nil {
-			t.Errorf("serve: %v", err)
-		}
+		_ = ln.Close()
+		<-done
 	})
 
-	resp, err := synckit.Call(context.Background(), sock, &synckit.Request{
+	client := synckit.NewClient(synckit.ClientConfig{Dial: wire.UnixDialer(sock), Build: synckit.Build})
+	defer func() { _ = client.Close() }()
+	resp, err := client.Call(context.Background(), &synckit.Request{
 		Method: "prime_auth", Params: map[string]any{"browser": "chrome"},
 	})
 	if err != nil {

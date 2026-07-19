@@ -12,6 +12,7 @@ import (
 	"fmt"
 
 	"github.com/yasyf/cookiesync/internal/paths"
+	"github.com/yasyf/daemonkit/wire"
 	synckit "github.com/yasyf/synckit/rpc"
 )
 
@@ -27,7 +28,9 @@ func Call(ctx context.Context, method string, params map[string]any) (any, error
 	if params == nil {
 		params = map[string]any{}
 	}
-	resp, err := synckit.Call(ctx, sock, &synckit.Request{Method: method, Params: params})
+	client := synckit.NewClient(synckit.ClientConfig{Dial: wire.UnixDialer(sock), Build: synckit.Build})
+	defer func() { _ = client.Close() }()
+	resp, err := client.Call(ctx, &synckit.Request{Method: method, Params: params})
 	if err != nil {
 		return nil, fmt.Errorf("%w; is the daemon running? (cookiesync install)", err)
 	}
