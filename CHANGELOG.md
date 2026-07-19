@@ -4,6 +4,31 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.17.0] - 2026-07-19
+
+### Fixed
+- `cookiesync auth` no longer dies with `run ioreg: signal: killed` when the host is under
+  sustained load. Two-part fix. synckit 0.20.0's launchd templates drop
+  `ProcessType: Background` from the resident helper and `synckitd serve` agents — the
+  `darwinbg` clamp starved their forked probe subprocesses (a priority-4 `ioreg` child
+  accrued ~0.01s of CPU per 1.5s of wall time) past the 2s probe bound, so the probe's
+  `exec.CommandContext` SIGKILLed them; the periodic reconcile tick keeps `Background`.
+  And a presence probe that fails to run now degrades instead of killing the release:
+  the local-vs-routed gate decision falls through to the local Touch ID tap — which
+  still gates — instead of propagating the probe error. Approver-side probe failures
+  keep answering `unavailable`, so mesh failover is unchanged.
+
+  **Upgrade note:** the cask postflight restarts the helper but does not re-render
+  launchd plists. After `brew upgrade synckitd cookiesync`, run `synckitd install` and
+  `cookiesync install` once so the de-clamped plists take effect (the synckitd formula
+  also does not restart the running daemon).
+
+### Changed
+- synckit 0.16.0 → 0.20.0: the RPC transport now runs on daemonkit sub-primitives. The
+  frame bytes are frozen (goldens byte-identical), so mixed-version peers interop
+  unchanged; cookiesync's client and daemon call sites moved to the session API
+  (`rpc.NewClient` / `rpc.NewServer`).
+
 ## [0.16.0] - 2026-07-17
 
 ### Changed
