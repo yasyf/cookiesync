@@ -3,7 +3,6 @@ package cli
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"os"
 	"strings"
@@ -217,12 +216,12 @@ func TestInstallWritesManifest(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read manifest: %v", err)
 	}
-	var m manifest.Manifest
-	if err := json.Unmarshal(data, &m); err != nil {
-		t.Fatalf("manifest is not valid JSON: %v\n%s", err, data)
+	if bytes.Contains(data, []byte(`"launchd"`)) || bytes.Contains(data, []byte(`"label"`)) {
+		t.Fatalf("manifest contains removed service fields:\n%s", data)
 	}
-	if err := m.Validate(); err != nil {
-		t.Fatalf("written manifest does not validate: %v", err)
+	m, err := manifest.Load(path)
+	if err != nil {
+		t.Fatalf("written manifest does not strictly load: %v", err)
 	}
 	if m.Name != "cookiesync" || m.Binary != "cookiesync" {
 		t.Fatalf("manifest name/binary = %q/%q, want cookiesync/cookiesync", m.Name, m.Binary)
@@ -247,6 +246,9 @@ func TestInstallWritesManifest(t *testing.T) {
 	}
 	if m.Helper == nil || m.Helper.Command != "helper-serve" {
 		t.Fatalf("manifest helper = %+v, want command helper-serve", m.Helper)
+	}
+	if m.Helper.SessionType != manifest.SessionTypeAqua {
+		t.Fatalf("manifest helper session = %q, want Aqua", m.Helper.SessionType)
 	}
 }
 

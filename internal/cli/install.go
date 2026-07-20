@@ -89,11 +89,9 @@ func cookiesyncManifest() (manifest.Manifest, error) {
 			ServeArgs: []string{"rpc-serve"},
 			Sock:      sock,
 		},
-		Launchd: &manifest.LaunchdSpec{SessionType: "Aqua"},
 		Helper: &manifest.HelperSpec{
 			Command:     "helper-serve",
-			SessionType: "Aqua",
-			Label:       "helper",
+			SessionType: manifest.SessionTypeAqua,
 		},
 	}, nil
 }
