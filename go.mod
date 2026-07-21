@@ -10,7 +10,7 @@ require (
 	github.com/coder/websocket v1.8.15
 	github.com/spf13/cobra v1.10.2
 	github.com/syndtr/goleveldb v1.0.0
-	github.com/yasyf/daemonkit v0.2.0
+	github.com/yasyf/daemonkit v0.3.0
 	github.com/yasyf/synckit v0.24.0
 	golang.org/x/crypto v0.48.0
 	golang.org/x/sync v0.20.0
