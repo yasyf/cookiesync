@@ -4,9 +4,12 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"os"
 	"sort"
 	"strings"
 	"testing"
+
+	"github.com/yasyf/cookiesync/internal/cookie"
 )
 
 // stubOpenBridge swaps the openBridge seam for the duration of a test.
@@ -58,13 +61,54 @@ func TestBridgeOpenJSON(t *testing.T) {
 	if err := json.Unmarshal(out.Bytes(), &got); err != nil {
 		t.Fatalf("bridge open --json is not valid JSON: %v\n%s", err, out.String())
 	}
-	assertExactKeys(t, "bridge open --json", got, "url", "endpoint", "browser", "profile", "expires_in")
+	assertExactKeys(t, "bridge open --json", got, "protocol_version", "url", "endpoint", "browser", "profile", "expires_in")
+	if got["protocol_version"] != float64(cookie.ProtocolVersion) {
+		t.Fatalf("bridge open --json protocol_version = %v, want %d", got["protocol_version"], cookie.ProtocolVersion)
+	}
 	if got["url"] != "ws://127.0.0.1:9222/devtools/browser/tok" {
 		t.Fatalf("bridge open --json url = %v, want the ws endpoint: %s", got["url"], out.String())
 	}
 	// No human "bridge ready" line leaks alongside the JSON.
 	if strings.Contains(out.String(), "bridge ready") {
 		t.Fatalf("bridge open --json leaked a human line: %s", out.String())
+	}
+}
+
+func TestBridgeCapabilityStateUsesExactV1AndDiscardsForeignState(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	const key = ":chrome:Default"
+	if err := saveCap(key, "cap-v1"); err != nil {
+		t.Fatalf("saveCap: %v", err)
+	}
+	path, err := capFile(key)
+	if err != nil {
+		t.Fatalf("capFile: %v", err)
+	}
+	raw, err := os.ReadFile(path) //nolint:gosec // G304: capFile returns a sha256 name under the test config dir.
+	if err != nil {
+		t.Fatalf("read capability: %v", err)
+	}
+	if string(raw) != `{"protocol_version":1,"capability":"cap-v1"}` {
+		t.Fatalf("capability state = %s, want exact v1 envelope", raw)
+	}
+	if got, ok := loadCap(key); !ok || got != "cap-v1" {
+		t.Fatalf("loadCap = %q/%v, want cap-v1/true", got, ok)
+	}
+
+	for _, foreign := range []string{
+		"legacy-plaintext-capability",
+		`{"protocol_version":2,"capability":"cap-old"}`,
+		`{"protocol_version":1,"capability":"cap-v1","legacy":true}`,
+	} {
+		if err := os.WriteFile(path, []byte(foreign), 0o600); err != nil {
+			t.Fatalf("write foreign capability: %v", err)
+		}
+		if got, ok := loadCap(key); ok || got != "" {
+			t.Fatalf("loadCap(%s) = %q/%v, want discard", foreign, got, ok)
+		}
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Fatalf("foreign capability still exists: %v", err)
+		}
 	}
 }
 

@@ -11,6 +11,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/yasyf/cookiesync/internal/cookie"
 	"github.com/yasyf/cookiesync/internal/rpc"
 )
 
@@ -52,19 +53,20 @@ func rpcPassthrough(cmd *cobra.Command, method string, params map[string]any) er
 	return err
 }
 
-// readWireCookies reads the bare JSON array of wire cookies the rpc apply stdin
-// contract carries, returning it as the generic slice the apply param forwards to the
-// daemon unchanged.
-func readWireCookies(r io.Reader) ([]any, error) {
+// readWireCookies reads and validates the exact v1 apply envelope.
+func readWireCookies(r io.Reader) (cookie.Envelope, error) {
 	data, err := io.ReadAll(r)
 	if err != nil {
-		return nil, err
+		return cookie.Envelope{}, err
 	}
-	var cookies []any
-	if err := json.Unmarshal(data, &cookies); err != nil {
-		return nil, fmt.Errorf("parse cookies from stdin: %w", err)
+	if _, err := cookie.UnmarshalCookies(data); err != nil {
+		return cookie.Envelope{}, fmt.Errorf("parse cookies from stdin: %w", err)
 	}
-	return cookies, nil
+	var envelope cookie.Envelope
+	if err := json.Unmarshal(data, &envelope); err != nil {
+		return cookie.Envelope{}, err
+	}
+	return envelope, nil
 }
 
 func newRPCExtractCmd() *cobra.Command {
@@ -111,7 +113,7 @@ func newRPCGetCookiesCmd() *cobra.Command {
 			}
 			params := map[string]any{
 				"browser": browser, "profile": profile, "origin": origin,
-				"url": args[0], "urls": asAnySlice(args),
+				"urls": asAnySlice(args),
 			}
 			if r, ok := resolveRequestor(); ok {
 				params["requestor"] = r
@@ -137,7 +139,7 @@ func newRPCGetWebStorageCmd() *cobra.Command {
 			// consent-gated like get_cookies; web storage is never pulled across hosts, so
 			// there is no ssh fan-out. --browser scopes to one browser (else every local
 			// browser is unioned), pairing with the same-browser cookies read.
-			params := map[string]any{"url": args[0], "urls": asAnySlice(args)}
+			params := map[string]any{"urls": asAnySlice(args)}
 			if browser != "" {
 				params["browser"] = browser
 				params["profile"] = profile
@@ -160,14 +162,15 @@ func newRPCApplyCmd() *cobra.Command {
 		Short: "Ingest a merged wire cookie array from stdin into this host's store (used by peers over ssh).",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			cookies, err := readWireCookies(cmd.InOrStdin())
+			envelope, err := readWireCookies(cmd.InOrStdin())
 			if err != nil {
 				return err
 			}
 			// A passthrough to the resident daemon: it records the anti-echo digest and
 			// writes with the cached key. origin is carried for symmetry.
 			return rpcPassthrough(cmd, "apply", map[string]any{
-				"browser": browser, "profile": profile, "origin": origin, "cookies": cookies,
+				"browser": browser, "profile": profile, "origin": origin,
+				"protocol_version": envelope.ProtocolVersion, "cookies": envelope.Cookies,
 			})
 		},
 	}

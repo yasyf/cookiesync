@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/base64"
@@ -8,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"os/exec"
@@ -92,14 +94,15 @@ const (
 // Proxy record also carries the peer Host and Capability the sweep remote-closes
 // B by, so an origin crash never strands B's logged-in Chrome until its TTL.
 type bridgeRecord struct {
-	Kind       bridgeRecordKind `json:"kind"`
-	PID        int              `json:"pid"`
-	Endpoint   string           `json:"endpoint"`
-	DataDir    string           `json:"data_dir"`
-	Start      string           `json:"start"`
-	Comm       string           `json:"comm"`
-	Host       string           `json:"host,omitempty"`
-	Capability string           `json:"capability,omitempty"`
+	ProtocolVersion uint64           `json:"protocol_version"`
+	Kind            bridgeRecordKind `json:"kind"`
+	PID             int              `json:"pid"`
+	Endpoint        string           `json:"endpoint"`
+	DataDir         string           `json:"data_dir"`
+	Start           string           `json:"start"`
+	Comm            string           `json:"comm"`
+	Host            string           `json:"host,omitempty"`
+	Capability      string           `json:"capability,omitempty"`
 }
 
 // procIdentity pins a live process by its launch time and executable, the pair
@@ -136,12 +139,13 @@ func (s *bridgeSession) Live() bool {
 // a cross-host open (advertise set), so a local open stays byte-identical.
 func (s *bridgeSession) OpenResult() map[string]any {
 	result := map[string]any{
-		"url":        s.wsURL,
-		"endpoint":   s.endpoint,
-		"browser":    s.browser,
-		"profile":    s.profile,
-		"capability": s.capability,
-		"expires_in": time.Until(s.expiry).Seconds(),
+		"protocol_version": cookie.ProtocolVersion,
+		"url":              s.wsURL,
+		"endpoint":         s.endpoint,
+		"browser":          s.browser,
+		"profile":          s.profile,
+		"capability":       s.capability,
+		"expires_in":       time.Until(s.expiry).Seconds(),
 	}
 	if s.proxyPort != 0 {
 		result["proxy_port"] = s.proxyPort
@@ -152,11 +156,12 @@ func (s *bridgeSession) OpenResult() map[string]any {
 // StatusResult renders the frozen bridge_status reply.
 func (s *bridgeSession) StatusResult() map[string]any {
 	return map[string]any{
-		"endpoint":   s.endpoint,
-		"browser":    s.browser,
-		"profile":    s.profile,
-		"expires_in": time.Until(s.expiry).Seconds(),
-		"pid":        s.proc.Pid(),
+		"protocol_version": cookie.ProtocolVersion,
+		"endpoint":         s.endpoint,
+		"browser":          s.browser,
+		"profile":          s.profile,
+		"expires_in":       time.Until(s.expiry).Seconds(),
+		"pid":              s.proc.Pid(),
 	}
 }
 
@@ -459,7 +464,7 @@ func (d *Daemon) handleBridgeStatus(_ context.Context, params map[string]any) (a
 	sess, ok := d.bridges[capability]
 	d.bridgeMu.Unlock()
 	if !ok || !sess.Live() {
-		return map[string]any{}, nil
+		return map[string]any{"protocol_version": cookie.ProtocolVersion}, nil
 	}
 	return sess.StatusResult(), nil
 }
@@ -470,7 +475,10 @@ func (d *Daemon) handleBridgeClose(_ context.Context, params map[string]any) (an
 	if err != nil {
 		return nil, err
 	}
-	return map[string]any{"closed": d.teardownBridge(capability)}, nil
+	return map[string]any{
+		"protocol_version": cookie.ProtocolVersion,
+		"closed":           d.teardownBridge(capability),
+	}, nil
 }
 
 // closeAllBridges stops the reaper and tears down every live session on
@@ -567,7 +575,13 @@ func reapOrphanBridge(ctx context.Context, runner engine.SSHRunner, recordPath s
 		return
 	}
 	var rec bridgeRecord
-	if err := json.Unmarshal(raw, &rec); err != nil || rec.PID <= 0 {
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&rec); err != nil || rec.ProtocolVersion != cookie.ProtocolVersion || rec.PID <= 0 {
+		_ = os.RemoveAll(sessionDir)
+		return
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
 		_ = os.RemoveAll(sessionDir)
 		return
 	}
@@ -670,7 +684,7 @@ func writeRecord(ctx context.Context, dataDir string, rec bridgeRecord) error {
 	if !ok {
 		return fmt.Errorf("bridge process %d exited before it could be recorded", rec.PID)
 	}
-	rec.Start, rec.Comm = id.start, id.comm
+	rec.ProtocolVersion, rec.Start, rec.Comm = cookie.ProtocolVersion, id.start, id.comm
 	raw, err := json.Marshal(rec)
 	if err != nil {
 		return fmt.Errorf("marshal bridge record: %w", err)

@@ -131,7 +131,7 @@ func TestGetCookiesUngrantedRequestorPromptsThenSilent(t *testing.T) {
 	d := New(consent, cache, nil, staticProbe(liveSession(currentUser(t))), &recordingRunner{}, fixedState{st: st}, fixedState{st: st})
 	_, _ = cache.Put(ctx, endpointID(self, "chrome", "Default"), []byte(key), 0)
 
-	got, err := d.handleGetCookies(ctx, map[string]any{"browser": "chrome", "url": "https://x.com/"})
+	got, err := d.handleGetCookies(ctx, map[string]any{"browser": "chrome", "urls": []any{"https://x.com/"}})
 	if err != nil {
 		t.Fatalf("handleGetCookies: %v", err)
 	}
@@ -142,7 +142,7 @@ func TestGetCookiesUngrantedRequestorPromptsThenSilent(t *testing.T) {
 		t.Fatalf("ungranted get_cookies over a warm cache = %d evaluations, want 1 (warmth alone must not serve)", len(consent.batchCalls))
 	}
 
-	if _, err := d.handleGetCookies(ctx, map[string]any{"browser": "chrome", "url": "https://x.com/"}); err != nil {
+	if _, err := d.handleGetCookies(ctx, map[string]any{"browser": "chrome", "urls": []any{"https://x.com/"}}); err != nil {
 		t.Fatalf("repeat handleGetCookies: %v", err)
 	}
 	if len(consent.batchCalls) != 1 {
@@ -255,7 +255,7 @@ func TestGetCookiesUnionForgedOriginCannotRideHostGrant(t *testing.T) {
 	_, _ = cache.Put(ctx, endpointID(self, "chrome", "Default"), []byte(key), 0)
 	d.grant("host:evil", []cookie.BrowserName{"chrome"}, time.Hour)
 
-	got, err := d.handleGetCookies(ctx, map[string]any{"url": "https://x.com/", "origin": "evil"})
+	got, err := d.handleGetCookies(ctx, map[string]any{"urls": []any{"https://x.com/"}, "origin": "evil"})
 	if err != nil {
 		t.Fatalf("handleGetCookies union forged origin: %v", err)
 	}

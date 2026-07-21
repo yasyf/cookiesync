@@ -51,7 +51,7 @@ func proxyBridgeSessionFor(d *Daemon, capability string) (*proxyBridgeSession, b
 // cannedBridgeOpenReply is the peer's bridge_open reply the recordingRunner
 // serves: the ws url advertises the origin's forwarded loopback and embeds the
 // peer token, and capB is the peer-side capability the origin manages it by.
-const cannedBridgeOpenReply = `{"url":"ws://127.0.0.1:5555/tok-b/devtools/browser/uuid-b","endpoint":"you@desktop:chrome:Default","browser":"chrome","profile":"Default","capability":"cap-b-secret","expires_in":600,"proxy_port":6000,"seed":{"attempted":5,"seeded":2,"skipped":3,"undecryptable":1,"expired":1,"cdp_rejected":1}}`
+const cannedBridgeOpenReply = `{"protocol_version":1,"url":"ws://127.0.0.1:5555/tok-b/devtools/browser/uuid-b","endpoint":"you@desktop:chrome:Default","browser":"chrome","profile":"Default","capability":"cap-b-secret","expires_in":600,"proxy_port":6000,"seed":{"attempted":5,"seeded":2,"skipped":3,"undecryptable":1,"expired":1,"cdp_rejected":1}}`
 
 // newProxyDaemon builds a daemon wired for a cross-host open: a mesh with the peer
 // present, a runner serving the canned bridge_open reply, and the tunnel/keepalive
@@ -312,7 +312,7 @@ func TestRemoteBridgeOpenRetriesOnlyOnForwardExit(t *testing.T) {
 // capability but missing the url/proxy_port closes the peer bridge rather than leak
 // it, registers nothing, and never surfaces the capability or token in the error.
 func TestRemoteBridgeOpenClosesIncompleteReply(t *testing.T) {
-	incomplete := `{"capability":"cap-b-secret","endpoint":"you@desktop:chrome:Default","browser":"chrome","profile":"Default","expires_in":600}`
+	incomplete := `{"protocol_version":1,"capability":"cap-b-secret","endpoint":"you@desktop:chrome:Default","browser":"chrome","profile":"Default","expires_in":600}`
 	runner := &recordingRunner{byMethod: map[string]string{"bridge_open": incomplete}}
 	d, _, _ := newProxyDaemon(t, runner)
 

@@ -10,11 +10,11 @@ require (
 	github.com/coder/websocket v1.8.15
 	github.com/spf13/cobra v1.10.2
 	github.com/syndtr/goleveldb v1.0.0
-	github.com/yasyf/daemonkit v0.1.1-0.20260720044448-4a9ddca29637
+	github.com/yasyf/daemonkit v0.1.1-0.20260721013056-c39154cdbd0a
 	github.com/yasyf/synckit v0.23.1-0.20260720044904-67f73b701f2b
 	golang.org/x/crypto v0.48.0
 	golang.org/x/sync v0.20.0
-	golang.org/x/term v0.40.0
+	golang.org/x/term v0.45.0
 	modernc.org/sqlite v1.52.0
 )
 
@@ -56,7 +56,7 @@ require (
 	go.etcd.io/bbolt v1.5.0 // indirect
 	golang.org/x/mod v0.33.0 // indirect
 	golang.org/x/net v0.50.0 // indirect
-	golang.org/x/sys v0.46.0 // indirect
+	golang.org/x/sys v0.47.0 // indirect
 	golang.org/x/text v0.34.0 // indirect
 	golang.org/x/tools v0.42.0 // indirect
 	modernc.org/libc v1.72.3 // indirect

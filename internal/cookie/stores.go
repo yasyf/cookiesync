@@ -35,7 +35,6 @@ var ErrStoreBusy = errors.New("cookie store busy: owning browser is mid-write")
 // (no last_update_utc, no has_cross_site_ancestor) still builds a full EncryptedRow.
 var rowFieldDefaults = map[string]any{
 	"encrypted_value":         []byte(nil),
-	"value":                   "",
 	"source_scheme":           int64(2),
 	"source_port":             int64(443),
 	"top_frame_site_key":      "",
@@ -121,7 +120,6 @@ func rowFromColumns(columns []string, values []any) EncryptedRow {
 		HostKey:              HostKey(asString(cells["host_key"])),
 		Name:                 asString(cells["name"]),
 		EncryptedValue:       asBytes(cells["encrypted_value"]),
-		Value:                asString(cells["value"]),
 		Path:                 asString(cells["path"]),
 		ExpiresUTC:           ChromeMicros(asInt64(cells["expires_utc"])),
 		LastUpdateUTC:        ChromeMicros(asInt64(cells["last_update_utc"])),
@@ -259,7 +257,13 @@ func Read(ctx context.Context, browser Browser, profile string) ([]EncryptedRow,
 		return nil, err
 	}
 
-	rows, err := db.QueryContext(ctx, fmt.Sprintf("SELECT %s FROM cookies", strings.Join(columns, ", ")))
+	readColumns := make([]string, 0, len(columns))
+	for _, column := range columns {
+		if column != "value" {
+			readColumns = append(readColumns, column)
+		}
+	}
+	rows, err := db.QueryContext(ctx, fmt.Sprintf("SELECT %s FROM cookies", strings.Join(readColumns, ", ")))
 	if err != nil {
 		return nil, err
 	}
@@ -267,15 +271,15 @@ func Read(ctx context.Context, browser Browser, profile string) ([]EncryptedRow,
 
 	var out []EncryptedRow
 	for rows.Next() {
-		values := make([]any, len(columns))
-		ptrs := make([]any, len(columns))
+		values := make([]any, len(readColumns))
+		ptrs := make([]any, len(readColumns))
 		for i := range values {
 			ptrs[i] = &values[i]
 		}
 		if err := rows.Scan(ptrs...); err != nil {
 			return nil, err
 		}
-		out = append(out, rowFromColumns(columns, values))
+		out = append(out, rowFromColumns(readColumns, values))
 	}
 	return out, rows.Err()
 }

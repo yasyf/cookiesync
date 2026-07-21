@@ -371,10 +371,9 @@ func (d *Daemon) handleGetCookies(ctx context.Context, params map[string]any) (a
 // the one unified routing rule, failing closed with AuthRequired only when routing
 // finds no live approver. A local caller sends no origin; a peer-driven read (origin
 // set, so peerRequestor keys the grant "host:"+origin exactly like extract) names the
-// origin in the prompt and routes per this host's own consent config when cold. New
-// CLIs send "urls" (one or more hosts); older ones send a single "url" — both are
-// accepted, and every host is decrypted with the same released key (one prime covers
-// them all) and unioned by logical identity. Emits the frozen {"cookies": [...]}.
+// origin in the prompt and routes per this host's own consent config when cold. Every
+// host is decrypted with the same released key (one prime covers them all) and unioned
+// by logical identity. Emits the exact v1 cookie envelope.
 func (d *Daemon) getCookiesSingle(ctx context.Context, params map[string]any) (any, error) {
 	browser, err := stringParam(params, "browser")
 	if err != nil {
@@ -653,15 +652,9 @@ func (d *Daemon) remoteGetCookies(ctx context.Context, host, browser, profile st
 	if err != nil {
 		return nil, newPeerReadError(host, errors.Is(rctx.Err(), context.DeadlineExceeded), err)
 	}
-	var payload struct {
-		Cookies []cookie.WireCookie `json:"cookies"`
-	}
-	if err := json.Unmarshal([]byte(out), &payload); err != nil {
+	cookies, err := cookie.UnmarshalCookies([]byte(out))
+	if err != nil {
 		return nil, &PeerReadError{Host: host, Err: fmt.Errorf("parse rpc get_cookies: %w", err)}
-	}
-	cookies := make([]cookie.Cookie, len(payload.Cookies))
-	for i, w := range payload.Cookies {
-		cookies[i] = cookie.FromWire(w)
 	}
 	return cookies, nil
 }
@@ -673,7 +666,7 @@ func cookiesPayload(cookies []cookie.Cookie) map[string]any {
 	for i, c := range cookies {
 		wire[i] = cookie.ToWire(c)
 	}
-	return map[string]any{"cookies": wire}
+	return map[string]any{"protocol_version": cookie.ProtocolVersion, "cookies": wire}
 }
 
 // originAcc unions one origin's web storage across endpoints, first contributor winning
@@ -729,14 +722,13 @@ func sortStorageEntries(entries []cookie.WebStorageEntry) {
 	sort.Slice(entries, func(i, j int) bool { return entries[i].Name < entries[j].Name })
 }
 
-// originsPayload is the frozen {"origins": [...]} envelope a web-storage set crosses the
-// boundary as, each origin in the frozen wire shape.
+// originsPayload is the exact v1 web-storage envelope.
 func originsPayload(origins []cookie.OriginStorage) map[string]any {
 	wire := make([]cookie.WireOrigin, len(origins))
 	for i, o := range origins {
 		wire[i] = cookie.OriginToWire(o)
 	}
-	return map[string]any{"origins": wire}
+	return map[string]any{"protocol_version": cookie.ProtocolVersion, "origins": wire}
 }
 
 // wireCookiesParam reads the "cookies" param — a JSON array of wire cookie objects —
@@ -747,7 +739,11 @@ func wireCookiesParam(params map[string]any, key string) ([]cookie.Cookie, error
 	if !ok {
 		return nil, fmt.Errorf("missing required param %q", key)
 	}
-	data, err := json.Marshal(raw)
+	protocol, ok := params["protocol_version"]
+	if !ok {
+		return nil, errors.New("missing required param \"protocol_version\"")
+	}
+	data, err := json.Marshal(map[string]any{"protocol_version": protocol, "cookies": raw})
 	if err != nil {
 		return nil, fmt.Errorf("re-encode %q: %w", key, err)
 	}
@@ -758,23 +754,19 @@ func wireCookiesParam(params map[string]any, key string) ([]cookie.Cookie, error
 	return cookies, nil
 }
 
-// urlsParam reads the dual url/urls field: a non-empty "urls" list wins; otherwise the
-// single "url" string is used. At least one url is required.
+// urlsParam reads the exact v1 non-empty "urls" list.
 func urlsParam(params map[string]any) ([]string, error) {
-	if raw, ok := params["urls"].([]any); ok && len(raw) > 0 {
-		urls := make([]string, len(raw))
-		for i, v := range raw {
-			s, ok := v.(string)
-			if !ok {
-				return nil, fmt.Errorf("urls[%d] is %T, want string", i, v)
-			}
-			urls[i] = s
+	raw, ok := params["urls"].([]any)
+	if !ok || len(raw) == 0 {
+		return nil, errors.New("get_cookies requires non-empty urls")
+	}
+	urls := make([]string, len(raw))
+	for i, v := range raw {
+		s, ok := v.(string)
+		if !ok || s == "" {
+			return nil, fmt.Errorf("urls[%d] is %T, want non-empty string", i, v)
 		}
-		return urls, nil
+		urls[i] = s
 	}
-	url, err := stringParam(params, "url")
-	if err != nil {
-		return nil, errors.New("get_cookies requires url or urls")
-	}
-	return []string{url}, nil
+	return urls, nil
 }

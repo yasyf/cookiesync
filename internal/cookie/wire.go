@@ -1,18 +1,23 @@
 package cookie
 
-import "encoding/json"
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"io"
+)
+
+// ProtocolVersion is the only cookie-owned wire epoch this binary accepts.
+const ProtocolVersion = 1
 
 // WireCookie is the newline-free JSON wire shape a Cookie crosses the rpc boundary as.
 //
-// The field names and order are the FROZEN contract the ssh peer protocol and the
+// The field names and order are the exact v1 contract the ssh peer protocol and the
 // agent-browser skill depend on: host_key, name, value, path, expires_utc,
 // last_update_utc, creation_utc, is_secure, is_httponly, samesite, source_scheme,
-// source_port, top_frame_site_key, has_cross_site_ancestor. It mirrors the Python
-// dataclasses.asdict(Cookie) output byte-for-byte, so a Go daemon and a Python peer (or
-// two Go daemons) interoperate. The model Cookie carries branded field types for the
-// rest of the codebase; WireCookie is the plain-typed projection used only at the
-// boundary, which keeps the JSON key order pinned independently of the model's Go field
-// order.
+// source_port, top_frame_site_key, has_cross_site_ancestor. The model Cookie carries
+// branded field types; WireCookie is the plain-typed projection used only at the
+// boundary, keeping the JSON key order independent of the model's Go field order.
 type WireCookie struct {
 	HostKey              string       `json:"host_key"`
 	Name                 string       `json:"name"`
@@ -71,27 +76,35 @@ func FromWire(w WireCookie) Cookie {
 	}
 }
 
-// MarshalCookies encodes a cookie set as the {"cookies": [...]} payload the rpc
-// extract contract emits, with each cookie in the frozen wire shape.
+// Envelope is the exact v1 cookie-set wire envelope.
+type Envelope struct {
+	ProtocolVersion uint64       `json:"protocol_version"`
+	Cookies         []WireCookie `json:"cookies"`
+}
+
+// MarshalCookies encodes a cookie set in the exact v1 wire envelope.
 func MarshalCookies(cookies []Cookie) ([]byte, error) {
 	wire := make([]WireCookie, len(cookies))
 	for i, c := range cookies {
 		wire[i] = ToWire(c)
 	}
-	return json.Marshal(struct {
-		Cookies []WireCookie `json:"cookies"`
-	}{Cookies: wire})
+	return json.Marshal(Envelope{ProtocolVersion: ProtocolVersion, Cookies: wire})
 }
 
-// UnmarshalCookies decodes a bare JSON array of wire cookies (the rpc apply stdin
-// payload) back into the cookie model.
+// UnmarshalCookies decodes the exact v1 cookie-set envelope.
 func UnmarshalCookies(data []byte) ([]Cookie, error) {
-	var wire []WireCookie
-	if err := json.Unmarshal(data, &wire); err != nil {
+	var envelope Envelope
+	if err := decodeWire(data, &envelope); err != nil {
 		return nil, err
 	}
-	cookies := make([]Cookie, len(wire))
-	for i, w := range wire {
+	if envelope.ProtocolVersion != ProtocolVersion {
+		return nil, fmt.Errorf("cookie protocol version %d, want %d", envelope.ProtocolVersion, ProtocolVersion)
+	}
+	if envelope.Cookies == nil {
+		return nil, fmt.Errorf("cookie protocol v1 requires cookies array")
+	}
+	cookies := make([]Cookie, len(envelope.Cookies))
+	for i, w := range envelope.Cookies {
 		cookies[i] = FromWire(w)
 	}
 	return cookies, nil
@@ -110,6 +123,12 @@ type WireOrigin struct {
 	Origin         string             `json:"origin"`
 	LocalStorage   []WireStorageEntry `json:"localStorage"`
 	SessionStorage []WireStorageEntry `json:"sessionStorage"`
+}
+
+// OriginEnvelope is the exact v1 web-storage wire envelope.
+type OriginEnvelope struct {
+	ProtocolVersion uint64       `json:"protocol_version"`
+	Origins         []WireOrigin `json:"origins"`
 }
 
 func storageEntriesToWire(entries []WebStorageEntry) []WireStorageEntry {
@@ -146,27 +165,42 @@ func OriginFromWire(w WireOrigin) OriginStorage {
 	}
 }
 
-// MarshalOrigins encodes an origin set as the {"origins": [...]} payload the
-// get_web_storage rpc contract emits, each origin in the frozen wire shape.
+// MarshalOrigins encodes an origin set in the exact v1 wire envelope.
 func MarshalOrigins(origins []OriginStorage) ([]byte, error) {
 	wire := make([]WireOrigin, len(origins))
 	for i, o := range origins {
 		wire[i] = OriginToWire(o)
 	}
-	return json.Marshal(struct {
-		Origins []WireOrigin `json:"origins"`
-	}{Origins: wire})
+	return json.Marshal(OriginEnvelope{ProtocolVersion: ProtocolVersion, Origins: wire})
 }
 
-// UnmarshalOrigins decodes a bare JSON array of wire origins back into the model.
+// UnmarshalOrigins decodes the exact v1 web-storage envelope.
 func UnmarshalOrigins(data []byte) ([]OriginStorage, error) {
-	var wire []WireOrigin
-	if err := json.Unmarshal(data, &wire); err != nil {
+	var envelope OriginEnvelope
+	if err := decodeWire(data, &envelope); err != nil {
 		return nil, err
 	}
-	origins := make([]OriginStorage, len(wire))
-	for i, w := range wire {
+	if envelope.ProtocolVersion != ProtocolVersion {
+		return nil, fmt.Errorf("origin protocol version %d, want %d", envelope.ProtocolVersion, ProtocolVersion)
+	}
+	if envelope.Origins == nil {
+		return nil, fmt.Errorf("origin protocol v1 requires origins array")
+	}
+	origins := make([]OriginStorage, len(envelope.Origins))
+	for i, w := range envelope.Origins {
 		origins[i] = OriginFromWire(w)
 	}
 	return origins, nil
+}
+
+func decodeWire(data []byte, value any) error {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(value); err != nil {
+		return err
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		return fmt.Errorf("cookie wire carries trailing JSON")
+	}
+	return nil
 }

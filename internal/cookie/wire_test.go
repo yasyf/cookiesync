@@ -25,9 +25,8 @@ func wireSample() Cookie {
 	}
 }
 
-// TestWireCookieJSONMatchesFrozenContract pins one cookie's wire JSON to the exact
-// bytes the Python dataclasses.asdict(Cookie) emits — the frozen field names and order
-// the ssh peer protocol and agent-browser skill depend on.
+// TestWireCookieJSONMatchesFrozenContract pins one cookie's exact v1 field names,
+// order, and bytes.
 func TestWireCookieJSONMatchesFrozenContract(t *testing.T) {
 	const want = `{"host_key":".x.com","name":"sid","value":"abc123","path":"/","expires_utc":13400000000000000,"last_update_utc":13350000000000000,"creation_utc":13300000000000000,"is_secure":true,"is_httponly":true,"samesite":2,"source_scheme":2,"source_port":443,"top_frame_site_key":"","has_cross_site_ancestor":0}`
 	got, err := json.Marshal(ToWire(wireSample()))
@@ -39,10 +38,9 @@ func TestWireCookieJSONMatchesFrozenContract(t *testing.T) {
 	}
 }
 
-// TestMarshalCookiesEnvelopeMatchesFrozenContract pins the {"cookies": [...]} payload
-// the rpc extract contract emits to the exact Python bytes.
+// TestMarshalCookiesEnvelopeMatchesFrozenContract pins the exact v1 payload.
 func TestMarshalCookiesEnvelopeMatchesFrozenContract(t *testing.T) {
-	const want = `{"cookies":[{"host_key":".x.com","name":"sid","value":"abc123","path":"/","expires_utc":13400000000000000,"last_update_utc":13350000000000000,"creation_utc":13300000000000000,"is_secure":true,"is_httponly":true,"samesite":2,"source_scheme":2,"source_port":443,"top_frame_site_key":"","has_cross_site_ancestor":0}]}`
+	const want = `{"protocol_version":1,"cookies":[{"host_key":".x.com","name":"sid","value":"abc123","path":"/","expires_utc":13400000000000000,"last_update_utc":13350000000000000,"creation_utc":13300000000000000,"is_secure":true,"is_httponly":true,"samesite":2,"source_scheme":2,"source_port":443,"top_frame_site_key":"","has_cross_site_ancestor":0}]}`
 	got, err := MarshalCookies([]Cookie{wireSample()})
 	if err != nil {
 		t.Fatalf("MarshalCookies: %v", err)
@@ -52,11 +50,10 @@ func TestMarshalCookiesEnvelopeMatchesFrozenContract(t *testing.T) {
 	}
 }
 
-// TestCookieWireRoundTrip proves a cookie survives a wire encode/decode unchanged, so
-// the rpc apply stdin (a bare array of wire cookies) reconstructs the model exactly.
+// TestCookieWireRoundTrip proves a cookie survives the exact v1 envelope.
 func TestCookieWireRoundTrip(t *testing.T) {
 	in := []Cookie{wireSample(), digestCookie(".y.com", "tok", "/app", 42)}
-	body, err := json.Marshal(toWireSlice(in))
+	body, err := MarshalCookies(in)
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
 	}
@@ -74,10 +71,44 @@ func TestCookieWireRoundTrip(t *testing.T) {
 	}
 }
 
-func toWireSlice(cookies []Cookie) []WireCookie {
-	out := make([]WireCookie, len(cookies))
-	for i, c := range cookies {
-		out[i] = ToWire(c)
+func TestCookieWireRejectsMissingWrongAndExtendedProtocol(t *testing.T) {
+	for _, body := range []string{
+		`{"cookies":[]}`,
+		`{"protocol_version":2,"cookies":[]}`,
+		`{"protocol_version":1,"cookies":[],"legacy":true}`,
+	} {
+		if _, err := UnmarshalCookies([]byte(body)); err == nil {
+			t.Fatalf("UnmarshalCookies(%s) succeeded", body)
+		}
 	}
-	return out
+}
+
+func TestOriginWireRoundTripAndRejectsForeignEpochs(t *testing.T) {
+	in := []OriginStorage{{
+		Origin:         "https://app.example",
+		LocalStorage:   []WebStorageEntry{{Name: "local", Value: "one"}},
+		SessionStorage: []WebStorageEntry{{Name: "session", Value: "two"}},
+	}}
+	body, err := MarshalOrigins(in)
+	if err != nil {
+		t.Fatalf("MarshalOrigins: %v", err)
+	}
+	got, err := UnmarshalOrigins(body)
+	if err != nil {
+		t.Fatalf("UnmarshalOrigins: %v", err)
+	}
+	if len(got) != 1 || got[0].Origin != in[0].Origin || len(got[0].LocalStorage) != 1 || got[0].LocalStorage[0] != in[0].LocalStorage[0] {
+		t.Fatalf("origin round trip = %+v, want %+v", got, in)
+	}
+
+	for _, foreign := range []string{
+		`{"origins":[]}`,
+		`{"protocol_version":2,"origins":[]}`,
+		`{"protocol_version":1,"origins":[],"legacy":true}`,
+		`{"protocol_version":1}`,
+	} {
+		if _, err := UnmarshalOrigins([]byte(foreign)); err == nil {
+			t.Fatalf("UnmarshalOrigins(%s) succeeded", foreign)
+		}
+	}
 }

@@ -1,11 +1,14 @@
 package engine
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"time"
 
+	"github.com/yasyf/cookiesync/internal/cookie"
 	"github.com/yasyf/cookiesync/internal/state"
 	"github.com/yasyf/synckit/cregistry"
 	"github.com/yasyf/synckit/syncservice"
@@ -42,6 +45,11 @@ type SSHFetcher struct {
 	dial func(peer string) stateGetter
 }
 
+type registryEnvelope struct {
+	ProtocolVersion uint64                                 `json:"protocol_version"`
+	Browsers        cregistry.Registry[state.EndpointMeta] `json:"browsers"`
+}
+
 // NewSSHFetcher builds the peer-registry fetcher that dials each peer's rpc-serve bridge
 // over ssh-stdio.
 func NewSSHFetcher() SSHFetcher {
@@ -68,15 +76,26 @@ func (f SSHFetcher) Fetch(ctx context.Context, peer string) (cregistry.Registry[
 	if err != nil {
 		return nil, fmt.Errorf("get_state from %s: %w", peer, err)
 	}
-	reg := cregistry.New[state.EndpointMeta]()
-	if err := json.Unmarshal(raw, &reg); err != nil {
+	var envelope registryEnvelope
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&envelope); err != nil {
 		return nil, fmt.Errorf("parse registry from %s: %w", peer, err)
 	}
-	return reg, nil
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		return nil, fmt.Errorf("parse registry from %s: trailing JSON", peer)
+	}
+	if envelope.ProtocolVersion != cookie.ProtocolVersion || envelope.Browsers == nil {
+		return nil, fmt.Errorf("parse registry from %s: protocol version %d, want %d",
+			peer, envelope.ProtocolVersion, cookie.ProtocolVersion)
+	}
+	return envelope.Browsers, nil
 }
 
-// MarshalRegistry encodes a convergent endpoint registry as the JSON svc.get_state
-// emits — the byte shape the Fetcher round-trips.
+// MarshalRegistry encodes a convergent endpoint registry in the exact v1 envelope.
 func MarshalRegistry(reg cregistry.Registry[state.EndpointMeta]) ([]byte, error) {
-	return json.MarshalIndent(reg, "", "  ")
+	return json.MarshalIndent(registryEnvelope{
+		ProtocolVersion: cookie.ProtocolVersion,
+		Browsers:        reg,
+	}, "", "  ")
 }

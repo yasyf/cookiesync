@@ -32,12 +32,11 @@ func (r *recordingRunner) Run(_ context.Context, target, remoteCmd string, stdin
 	return r.reply, nil
 }
 
-// TestSSHBackendExtractParsesContract proves SSHBackend.Extract shells the frozen rpc
-// extract command (with quoted browser/profile/origin) and parses the {"cookies": [...]}
-// reply into the cookie model.
+// TestSSHBackendExtractParsesContract proves SSHBackend.Extract shells the rpc
+// extract command and parses the exact v1 cookie envelope.
 func TestSSHBackendExtractParsesContract(t *testing.T) {
 	runner := &recordingRunner{
-		reply: `{"cookies":[{"host_key":".x.com","name":"sid","value":"abc","path":"/","expires_utc":13400000000000000,"last_update_utc":13350000000000000,"creation_utc":13300000000000000,"is_secure":true,"is_httponly":true,"samesite":2,"source_scheme":2,"source_port":443,"top_frame_site_key":"","has_cross_site_ancestor":0}]}`,
+		reply: `{"protocol_version":1,"cookies":[{"host_key":".x.com","name":"sid","value":"abc","path":"/","expires_utc":13400000000000000,"last_update_utc":13350000000000000,"creation_utc":13300000000000000,"is_secure":true,"is_httponly":true,"samesite":2,"source_scheme":2,"source_port":443,"top_frame_site_key":"","has_cross_site_ancestor":0}]}`,
 	}
 	backend := NewSSHBackend(runner, "you@desktop", "me@laptop")
 
@@ -68,10 +67,9 @@ func TestSSHBackendExtractParsesContract(t *testing.T) {
 	}
 }
 
-// TestSSHBackendApplyPipesWireArray proves SSHBackend.Apply shells the frozen rpc apply
-// command and pipes a bare JSON array of wire cookies to its stdin, returning the
-// applied count from the reply.
-func TestSSHBackendApplyPipesWireArray(t *testing.T) {
+// TestSSHBackendApplyPipesWireEnvelope proves SSHBackend.Apply sends only the
+// exact v1 cookie envelope and returns the applied count.
+func TestSSHBackendApplyPipesWireEnvelope(t *testing.T) {
 	runner := &recordingRunner{reply: `{"applied":2}`}
 	backend := NewSSHBackend(runner, "you@desktop", "me@laptop")
 
@@ -89,10 +87,6 @@ func TestSSHBackendApplyPipesWireArray(t *testing.T) {
 		if !strings.Contains(call.cmd, want) {
 			t.Fatalf("apply command %q missing %q", call.cmd, want)
 		}
-	}
-	// stdin must be a bare JSON array (the frozen apply payload), not an envelope.
-	if !strings.HasPrefix(strings.TrimSpace(string(call.stdin)), "[") {
-		t.Fatalf("apply stdin is not a bare array: %s", call.stdin)
 	}
 	parsed, err := cookie.UnmarshalCookies(call.stdin)
 	if err != nil {
@@ -212,6 +206,24 @@ func TestSSHFetcherRoundTrip(t *testing.T) {
 	}
 	if !getter.closed {
 		t.Fatalf("fetcher did not close the typed client")
+	}
+}
+
+func TestSSHFetcherRejectsForeignRegistryEpochs(t *testing.T) {
+	for _, body := range []string{
+		`{"browsers":{}}`,
+		`{"protocol_version":2,"browsers":{}}`,
+		`{"protocol_version":1,"browsers":{},"legacy":true}`,
+		`{"protocol_version":1}`,
+	} {
+		getter := &fakeStateGetter{raw: syncservice.RawRegistry(body)}
+		fetcher := newSSHFetcher(func(string) stateGetter { return getter })
+		if _, err := fetcher.Fetch(context.Background(), "you@desktop"); err == nil {
+			t.Fatalf("Fetch(%s) succeeded", body)
+		}
+		if !getter.closed {
+			t.Fatalf("Fetch(%s) did not close its client", body)
+		}
 	}
 }
 

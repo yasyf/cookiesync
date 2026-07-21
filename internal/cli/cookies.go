@@ -204,11 +204,10 @@ func newCookiesCmd() *cobra.Command {
 }
 
 // runCookies renders the merged cookies for every url in the chosen format. With an
-// explicit --browser it fetches that one browser in a single daemon call, sending the
-// dual url/urls wire so an older resident daemon still serves the first host (the Python
-// run_cookies path). With --browser omitted it auto-registers this host's installed
-// browsers when the registry has none, then unions every registered endpoint — local and
-// remote — rendering the merged set on stdout with per-endpoint skips on stderr.
+// explicit --browser it fetches that one browser in a single daemon call. With --browser
+// omitted it auto-registers this host's installed browsers when the registry has none,
+// then unions every registered endpoint — local and remote — rendering the merged set
+// on stdout with per-endpoint skips on stderr.
 func runCookies(cmd *cobra.Command, urls []string, browser, profile, format string) error {
 	switch cookie.OutputFormat(format) {
 	case cookie.FormatPlaywright, cookie.FormatNetscape, cookie.FormatHeader, cookie.FormatJSON, cookie.FormatWebStorage:
@@ -222,7 +221,6 @@ func runCookies(cmd *cobra.Command, urls []string, browser, profile, format stri
 		return runCookiesAll(cmd, urls, format)
 	}
 	params := map[string]any{
-		"url":     urls[0],
 		"urls":    asAnySlice(urls),
 		"browser": browser,
 		"profile": profile,
@@ -231,10 +229,14 @@ func runCookies(cmd *cobra.Command, urls []string, browser, profile, format stri
 		params["requestor"] = r
 	}
 	var result struct {
-		Cookies []cookie.WireCookie `json:"cookies"`
+		ProtocolVersion uint64              `json:"protocol_version"`
+		Cookies         []cookie.WireCookie `json:"cookies"`
 	}
 	if err := rpc.CallJSON(cmd.Context(), "get_cookies", params, &result); err != nil {
 		return err
+	}
+	if result.ProtocolVersion != cookie.ProtocolVersion {
+		return fmt.Errorf("cookie protocol version %d, want %d", result.ProtocolVersion, cookie.ProtocolVersion)
 	}
 	origins, err := fetchOrigins(cmd, urls, browser, profile, format)
 	if err != nil {
@@ -246,25 +248,26 @@ func runCookies(cmd *cobra.Command, urls []string, browser, profile, format stri
 
 // runCookiesAll auto-registers this host's installed browsers when the registry has no
 // local endpoint, then unions the cookies for every url across every registered endpoint
-// in one daemon call. It sends the dual url/urls wire with no browser/profile, renders
-// the merged set on stdout, and writes each per-endpoint skip on stderr.
+// in one daemon call, renders the merged set on stdout, and writes each per-endpoint
+// skip on stderr.
 func runCookiesAll(cmd *cobra.Command, urls []string, format string) error {
 	if err := ensureLocalEndpoints(cmd.Context()); err != nil {
 		return err
 	}
-	params := map[string]any{
-		"url":  urls[0],
-		"urls": asAnySlice(urls),
-	}
+	params := map[string]any{"urls": asAnySlice(urls)}
 	if r, ok := resolveRequestor(); ok {
 		params["requestor"] = r
 	}
 	var result struct {
-		Cookies  []cookie.WireCookie `json:"cookies"`
-		Warnings []string            `json:"warnings"`
+		ProtocolVersion uint64              `json:"protocol_version"`
+		Cookies         []cookie.WireCookie `json:"cookies"`
+		Warnings        []string            `json:"warnings"`
 	}
 	if err := rpc.CallJSON(cmd.Context(), "get_cookies", params, &result); err != nil {
 		return err
+	}
+	if result.ProtocolVersion != cookie.ProtocolVersion {
+		return fmt.Errorf("cookie protocol version %d, want %d", result.ProtocolVersion, cookie.ProtocolVersion)
 	}
 	origins, err := fetchOrigins(cmd, urls, "", "", format)
 	if err != nil {
@@ -290,7 +293,7 @@ func fetchOrigins(cmd *cobra.Command, urls []string, browser, profile, format st
 	default:
 		return nil, nil
 	}
-	params := map[string]any{"url": urls[0], "urls": asAnySlice(urls)}
+	params := map[string]any{"urls": asAnySlice(urls)}
 	if browser != "" {
 		params["browser"] = browser
 		params["profile"] = profile
@@ -299,11 +302,15 @@ func fetchOrigins(cmd *cobra.Command, urls []string, browser, profile, format st
 		params["requestor"] = r
 	}
 	var result struct {
-		Origins  []cookie.WireOrigin `json:"origins"`
-		Warnings []string            `json:"warnings"`
+		ProtocolVersion uint64              `json:"protocol_version"`
+		Origins         []cookie.WireOrigin `json:"origins"`
+		Warnings        []string            `json:"warnings"`
 	}
 	if err := rpc.CallJSON(cmd.Context(), "get_web_storage", params, &result); err != nil {
 		return nil, err
+	}
+	if result.ProtocolVersion != cookie.ProtocolVersion {
+		return nil, fmt.Errorf("origin protocol version %d, want %d", result.ProtocolVersion, cookie.ProtocolVersion)
 	}
 	for _, warning := range result.Warnings {
 		cmd.PrintErrln(warning)

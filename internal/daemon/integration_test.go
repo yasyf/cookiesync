@@ -148,7 +148,7 @@ func TestGetCookiesHostFilters(t *testing.T) {
 	_, _ = cache.Put(ctx, endpointID("me@laptop", "chrome", "Default"), []byte(key), 0)
 	d.grant("local", []cookie.BrowserName{"chrome"}, time.Hour)
 
-	got, err := d.handleGetCookies(ctx, map[string]any{"browser": "chrome", "url": "https://x.com/"})
+	got, err := d.handleGetCookies(ctx, map[string]any{"browser": "chrome", "urls": []any{"https://x.com/"}})
 	if err != nil {
 		t.Fatalf("handleGetCookies: %v", err)
 	}
@@ -190,7 +190,7 @@ func TestGetCookiesUnionLocalAndRemote(t *testing.T) {
 	_, _ = cache.Put(ctx, endpointID(self, "chrome", "Default"), []byte(key), 0)
 	d.grant("local", []cookie.BrowserName{"chrome"}, time.Hour)
 
-	got, err := d.handleGetCookies(ctx, map[string]any{"url": "https://x.com/"})
+	got, err := d.handleGetCookies(ctx, map[string]any{"urls": []any{"https://x.com/"}})
 	if err != nil {
 		t.Fatalf("handleGetCookies union: %v", err)
 	}
@@ -255,7 +255,7 @@ func unionWarning(t *testing.T, peers []string, runner engine.SSHRunner, wantRem
 	d.grant("local", []cookie.BrowserName{"chrome"}, time.Hour)
 
 	start := time.Now()
-	got, err := d.handleGetCookies(ctx, map[string]any{"url": "https://x.com/"})
+	got, err := d.handleGetCookies(ctx, map[string]any{"urls": []any{"https://x.com/"}})
 	if err != nil {
 		t.Fatalf("handleGetCookies union: %v", err)
 	}
@@ -397,7 +397,7 @@ func TestGetCookiesUnionLocalWinsTie(t *testing.T) {
 	_, _ = cache.Put(ctx, endpointID(self, "chrome", "Default"), []byte(key), 0)
 	d.grant("local", []cookie.BrowserName{"chrome"}, time.Hour)
 
-	got, err := d.handleGetCookies(ctx, map[string]any{"url": "https://x.com/"})
+	got, err := d.handleGetCookies(ctx, map[string]any{"urls": []any{"https://x.com/"}})
 	if err != nil {
 		t.Fatalf("handleGetCookies union: %v", err)
 	}
@@ -441,7 +441,7 @@ func TestGetCookiesUnionColdLocalRoutesRemoteContributes(t *testing.T) {
 	d := New(consent, newFakeCache(), nil, staticProbe(SessionSnapshot{}), runner, fixedState{st: st}, fixedState{st: st})
 	pinnedNonce(d, nonce)
 
-	got, err := d.handleGetCookies(ctx, map[string]any{"url": "https://x.com/"})
+	got, err := d.handleGetCookies(ctx, map[string]any{"urls": []any{"https://x.com/"}})
 	if err != nil {
 		t.Fatalf("handleGetCookies union: %v", err)
 	}
@@ -490,7 +490,7 @@ func TestGetCookiesUnionColdLocalRouteDeniedRemoteContributes(t *testing.T) {
 	consent := &fakeConsent{key: cookie.DeriveKey(cookie.SafeStorageKey("peanuts"))}
 	d := New(consent, newFakeCache(), nil, staticProbe(SessionSnapshot{}), runner, fixedState{st: st}, fixedState{st: st})
 
-	got, err := d.handleGetCookies(ctx, map[string]any{"url": "https://x.com/"})
+	got, err := d.handleGetCookies(ctx, map[string]any{"urls": []any{"https://x.com/"}})
 	if err != nil {
 		t.Fatalf("handleGetCookies union: %v", err)
 	}
@@ -536,7 +536,7 @@ func TestGetCookiesUnionBrokenLocalStoreSkipped(t *testing.T) {
 	_, _ = cache.Put(ctx, endpointID(self, "chrome", "Ghost"), []byte(key), 0)
 	d.grant("local", []cookie.BrowserName{"chrome"}, time.Hour)
 
-	got, err := d.handleGetCookies(ctx, map[string]any{"url": "https://x.com/"})
+	got, err := d.handleGetCookies(ctx, map[string]any{"urls": []any{"https://x.com/"}})
 	if err != nil {
 		t.Fatalf("handleGetCookies union: %v", err)
 	}
@@ -569,7 +569,7 @@ func TestGetCookiesUnionLiveLocalOneEvaluation(t *testing.T) {
 	cache := newFakeCache()
 	d := New(consent, cache, nil, staticProbe(liveSession(currentUser(t))), &recordingRunner{}, fixedState{st: st}, fixedState{st: st})
 
-	got, err := d.handleGetCookies(ctx, map[string]any{"url": "https://x.com/"})
+	got, err := d.handleGetCookies(ctx, map[string]any{"urls": []any{"https://x.com/"}})
 	if err != nil {
 		t.Fatalf("handleGetCookies union: %v", err)
 	}
@@ -597,7 +597,7 @@ func TestGetCookiesUnionZeroContributorsErrors(t *testing.T) {
 	runner := &recordingRunner{err: errors.New("ssh down")}
 	d := New(&fakeConsent{}, newFakeCache(), nil, staticProbe(SessionSnapshot{}), runner, fixedState{st: st}, fixedState{st: st})
 
-	_, err := d.handleGetCookies(ctx, map[string]any{"url": "https://x.com/"})
+	_, err := d.handleGetCookies(ctx, map[string]any{"urls": []any{"https://x.com/"}})
 	if err == nil || !strings.Contains(err.Error(), "cookiesync auth") {
 		t.Fatalf("union with no contributors = %v, want an error suggesting cookiesync auth", err)
 	}
@@ -655,7 +655,7 @@ func TestUnionTotalShutoutErrorCarriesWarnings(t *testing.T) {
 			_, _ = cache.Put(ctx, endpointID(self, "chrome", "Ghost"), []byte(key), 0)
 			d.grant("local", []cookie.BrowserName{"chrome"}, time.Hour)
 
-			_, err := d.handleGetCookies(ctx, map[string]any{"url": "https://x.com/"})
+			_, err := d.handleGetCookies(ctx, map[string]any{"urls": []any{"https://x.com/"}})
 			if err == nil {
 				t.Fatalf("total shutout must error")
 			}
@@ -700,7 +700,7 @@ func TestGetCookiesSinglePeerDrivenGrantKeysOrigin(t *testing.T) {
 	_, _ = cache.Put(ctx, endpointID(self, "chrome", "Default"), []byte(key), 0)
 	d.grant("host:you@desktop", []cookie.BrowserName{"chrome"}, time.Hour)
 
-	got, err := d.handleGetCookies(ctx, map[string]any{"browser": "chrome", "url": "https://x.com/", "origin": "you@desktop"})
+	got, err := d.handleGetCookies(ctx, map[string]any{"browser": "chrome", "urls": []any{"https://x.com/"}, "origin": "you@desktop"})
 	if err != nil {
 		t.Fatalf("peer-driven single get_cookies: %v", err)
 	}
@@ -742,7 +742,7 @@ func TestGetCookiesSinglePeerDrivenColdRoutesConsent(t *testing.T) {
 	d := New(consent, newFakeCache(), nil, staticProbe(SessionSnapshot{}), runner, fixedState{st: st}, fixedState{st: st})
 	pinnedNonce(d, nonce)
 
-	got, err := d.handleGetCookies(ctx, map[string]any{"browser": "chrome", "url": "https://x.com/", "origin": peer})
+	got, err := d.handleGetCookies(ctx, map[string]any{"browser": "chrome", "urls": []any{"https://x.com/"}, "origin": peer})
 	if err != nil {
 		t.Fatalf("peer-driven cold read: %v", err)
 	}
@@ -786,7 +786,7 @@ func TestGetCookiesSinglePeerDrivenLivePromptsAndGrantsOrigin(t *testing.T) {
 	consent := &fakeConsent{key: key}
 	d := New(consent, newFakeCache(), nil, staticProbe(liveSession(currentUser(t))), runner, fixedState{st: st}, fixedState{st: st})
 
-	got, err := d.handleGetCookies(ctx, map[string]any{"browser": "chrome", "url": "https://x.com/", "origin": "you@laptop"})
+	got, err := d.handleGetCookies(ctx, map[string]any{"browser": "chrome", "urls": []any{"https://x.com/"}, "origin": "you@laptop"})
 	if err != nil {
 		t.Fatalf("peer-driven live read: %v", err)
 	}
@@ -878,7 +878,7 @@ func TestExtractApplyRoundTripWireContract(t *testing.T) {
 		cookie.ToWire(cookie.Cookie{HostKey: "x.com", Name: "sid", Value: "abc", Path: "/", ExpiresUTC: liveExpiresUTC, LastUpdateUTC: 13_350_000_000_000_000, SameSite: 2, SourceScheme: 2, SourcePort: 443}),
 		cookie.ToWire(cookie.Cookie{HostKey: "y.com", Name: "tok", Value: "xyz", Path: "/", ExpiresUTC: liveExpiresUTC, LastUpdateUTC: 13_350_000_000_000_001, SameSite: 1, SourceScheme: 2, SourcePort: 443}),
 	}
-	applyRes, err := d.handleApply(ctx, map[string]any{"browser": "chrome", "cookies": wireArrayToAny(t, in)})
+	applyRes, err := d.handleApply(ctx, map[string]any{"protocol_version": cookie.ProtocolVersion, "browser": "chrome", "cookies": wireArrayToAny(t, in)})
 	if err != nil {
 		t.Fatalf("handleApply: %v", err)
 	}
@@ -953,7 +953,7 @@ func TestApplySyncableCookiesOnly(t *testing.T) {
 			for i := range tt.payload {
 				wire[i] = cookie.ToWire(tt.payload[i])
 			}
-			res, err := d.handleApply(ctx, map[string]any{"browser": "chrome", "cookies": wireArrayToAny(t, wire)})
+			res, err := d.handleApply(ctx, map[string]any{"protocol_version": cookie.ProtocolVersion, "browser": "chrome", "cookies": wireArrayToAny(t, wire)})
 			if err != nil {
 				t.Fatalf("handleApply: %v", err)
 			}
@@ -1005,7 +1005,7 @@ func TestApplySerializesPerEndpoint(t *testing.T) {
 	done := make(chan outcome, n)
 	for range n {
 		go func() {
-			res, err := d.handleApply(ctx, map[string]any{"browser": "chrome", "cookies": payload})
+			res, err := d.handleApply(ctx, map[string]any{"protocol_version": cookie.ProtocolVersion, "browser": "chrome", "cookies": payload})
 			done <- outcome{res: res, err: err}
 		}()
 	}
@@ -1056,7 +1056,7 @@ func TestApplyDistinctEndpointsOverlap(t *testing.T) {
 	done := make(chan error, 2)
 	for _, profile := range []string{"Default", "Work"} {
 		go func() {
-			_, err := d.handleApply(ctx, map[string]any{"browser": "chrome", "profile": profile, "cookies": payload})
+			_, err := d.handleApply(ctx, map[string]any{"protocol_version": cookie.ProtocolVersion, "browser": "chrome", "profile": profile, "cookies": payload})
 			done <- err
 		}()
 	}
@@ -1151,7 +1151,7 @@ func TestConvergeLocalWriteSerializesWithApply(t *testing.T) {
 	})
 	applyDone := make(chan error, 1)
 	go func() {
-		_, err := fx.d.handleApply(ctx, map[string]any{"browser": "chrome", "cookies": payload})
+		_, err := fx.d.handleApply(ctx, map[string]any{"protocol_version": cookie.ProtocolVersion, "browser": "chrome", "cookies": payload})
 		applyDone <- err
 	}()
 
@@ -1188,7 +1188,7 @@ func TestConvergeLocalWriteOverlapsDistinctApply(t *testing.T) {
 	})
 	applyDone := make(chan error, 1)
 	go func() {
-		_, err := fx.d.handleApply(ctx, map[string]any{"browser": "chrome", "profile": "Work", "cookies": payload})
+		_, err := fx.d.handleApply(ctx, map[string]any{"protocol_version": cookie.ProtocolVersion, "browser": "chrome", "profile": "Work", "cookies": payload})
 		applyDone <- err
 	}()
 
@@ -1627,7 +1627,7 @@ func TestConcurrentCookiesAndPrimeShareOneSheet(t *testing.T) {
 	}
 	cookiesDone := make(chan outcome, 1)
 	go func() {
-		res, err := d.handleGetCookies(ctx, map[string]any{"url": "https://x.com/"})
+		res, err := d.handleGetCookies(ctx, map[string]any{"urls": []any{"https://x.com/"}})
 		cookiesDone <- outcome{res: res, err: err}
 	}()
 	primeDone := make(chan outcome, 1)
@@ -1864,15 +1864,10 @@ func wireCookieNames(t *testing.T, result any) map[string]cookie.WireCookie {
 	return out
 }
 
-// peerExtractReply renders the frozen {"cookies": [...]} reply a peer's rpc extract
-// streams back, carrying the given cookies as wire records.
+// peerExtractReply renders the exact v1 cookie envelope a peer streams back.
 func peerExtractReply(t *testing.T, cookies ...cookie.Cookie) string {
 	t.Helper()
-	wire := make([]cookie.WireCookie, len(cookies))
-	for i, c := range cookies {
-		wire[i] = cookie.ToWire(c)
-	}
-	data, err := json.Marshal(map[string]any{"cookies": wire})
+	data, err := cookie.MarshalCookies(cookies)
 	if err != nil {
 		t.Fatalf("marshal extract reply: %v", err)
 	}

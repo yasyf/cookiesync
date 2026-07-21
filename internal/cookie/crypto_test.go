@@ -112,13 +112,9 @@ func TestRoundtrip(t *testing.T) {
 	}
 }
 
-func TestEmptyBlobDecryptsToEmptyString(t *testing.T) {
-	got, err := DecryptValue(nil, key(t), goldenHost)
-	if err != nil {
-		t.Fatalf("DecryptValue: %v", err)
-	}
-	if got != "" {
-		t.Fatalf("DecryptValue(empty) = %q, want empty", got)
+func TestEmptyBlobIsRejected(t *testing.T) {
+	if _, err := DecryptValue(nil, key(t), goldenHost); err == nil {
+		t.Fatal("empty encrypted_value must not be accepted")
 	}
 }
 
@@ -233,13 +229,9 @@ func TestPKCS7UnpadRejectsBadPadding(t *testing.T) {
 	}
 }
 
-func TestLegacyPlaintextBlobDecodesVerbatim(t *testing.T) {
-	got, err := DecryptValue([]byte("legacy-plain-value"), AesKey(bytes.Repeat([]byte{0x00}, 16)), goldenHost)
-	if err != nil {
-		t.Fatalf("DecryptValue: %v", err)
-	}
-	if got != "legacy-plain-value" {
-		t.Fatalf("DecryptValue(legacy) = %q, want legacy-plain-value", got)
+func TestUnprefixedPlaintextBlobIsRejected(t *testing.T) {
+	if _, err := DecryptValue([]byte("legacy-plain-value"), AesKey(bytes.Repeat([]byte{0x00}, 16)), goldenHost); err == nil {
+		t.Fatal("unprefixed encrypted_value must not be accepted")
 	}
 }
 

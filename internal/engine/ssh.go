@@ -67,15 +67,9 @@ func (b SSHBackend) Extract(ctx context.Context, browser, profile string) (Extra
 	if err != nil {
 		return Extracted{}, err
 	}
-	var payload struct {
-		Cookies []cookie.WireCookie `json:"cookies"`
-	}
-	if err := json.Unmarshal([]byte(out), &payload); err != nil {
+	cookies, err := cookie.UnmarshalCookies([]byte(out))
+	if err != nil {
 		return Extracted{}, fmt.Errorf("parse rpc extract from %s: %w", b.target, err)
-	}
-	cookies := make([]cookie.Cookie, len(payload.Cookies))
-	for i, w := range payload.Cookies {
-		cookies[i] = cookie.FromWire(w)
 	}
 	return Extracted{Cookies: cookies}, nil
 }
@@ -83,7 +77,7 @@ func (b SSHBackend) Extract(ctx context.Context, browser, profile string) (Extra
 // Apply pipes the merged set as a JSON array of wire records to the peer's "cookiesync
 // rpc apply" stdin and returns the rows written.
 func (b SSHBackend) Apply(ctx context.Context, browser, profile string, cookies []cookie.Cookie) (int, error) {
-	body, err := json.Marshal(toWire(cookies))
+	body, err := cookie.MarshalCookies(cookies)
 	if err != nil {
 		return 0, err
 	}
@@ -129,12 +123,4 @@ func (b SSHBackend) applyCmd(browser, profile string) string {
 		"cookiesync rpc apply --browser %s --profile %s --origin %s",
 		hostregistry.ShellQuote(browser), hostregistry.ShellQuote(profile), hostregistry.ShellQuote(b.origin),
 	)
-}
-
-func toWire(cookies []cookie.Cookie) []cookie.WireCookie {
-	wire := make([]cookie.WireCookie, len(cookies))
-	for i, c := range cookies {
-		wire[i] = cookie.ToWire(c)
-	}
-	return wire
 }

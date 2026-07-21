@@ -95,7 +95,7 @@ func TestGetCookiesAllUsesOneStateSnapshot(t *testing.T) {
 	_, _ = cache.Put(ctx, endpointID(self, "chrome", "Default"), []byte(key), 0)
 	d.grant("local", []cookie.BrowserName{"chrome"}, time.Hour)
 
-	got, err := d.handleGetCookies(ctx, map[string]any{"url": "https://x.com/"})
+	got, err := d.handleGetCookies(ctx, map[string]any{"urls": []any{"https://x.com/"}})
 	if err != nil {
 		t.Fatalf("handleGetCookies union: %v", err)
 	}
@@ -455,7 +455,7 @@ func TestHandleGetCookiesColdCacheFailsClosed(t *testing.T) {
 	fakeMesh(t, "me@laptop")
 	d := New(&fakeConsent{}, newFakeCache(), nil, staticProbe(SessionSnapshot{}), &recordingRunner{}, fixedState{st: stateWith("me@laptop", "")}, fixedState{st: stateWith("me@laptop", "")})
 
-	_, err := d.handleGetCookies(context.Background(), map[string]any{"browser": "chrome", "url": "https://x.com"})
+	_, err := d.handleGetCookies(context.Background(), map[string]any{"browser": "chrome", "urls": []any{"https://x.com"}})
 	var authErr *AuthRequired
 	if !errors.As(err, &authErr) {
 		t.Fatalf("get_cookies cold = %v, want *AuthRequired", err)
@@ -469,7 +469,7 @@ func TestHandleGetWebStorageNoLocalBrowsersFailsClosed(t *testing.T) {
 	fakeMesh(t, "me@laptop")
 	d := New(&fakeConsent{}, newFakeCache(), nil, staticProbe(liveSession(currentUser(t))), &recordingRunner{}, fixedState{st: stateWith("me@laptop", "")}, fixedState{st: stateWith("me@laptop", "")})
 
-	_, err := d.handleGetWebStorage(context.Background(), map[string]any{"url": "https://x.com"})
+	_, err := d.handleGetWebStorage(context.Background(), map[string]any{"urls": []any{"https://x.com"}})
 	var authErr *AuthRequired
 	if !errors.As(err, &authErr) {
 		t.Fatalf("get_web_storage with no local browsers = %v, want *AuthRequired", err)
@@ -487,7 +487,7 @@ func TestHandleGetWebStorageColdUnattendedReturnsNoStorage(t *testing.T) {
 	st := stateWith("me@laptop", "", stateEndpoint("me@laptop", "chrome", "Default"))
 	d := New(consent, newFakeCache(), nil, staticProbe(SessionSnapshot{}), &recordingRunner{}, fixedState{st: st}, fixedState{st: st})
 
-	got, err := d.handleGetWebStorage(context.Background(), map[string]any{"url": "https://x.com"})
+	got, err := d.handleGetWebStorage(context.Background(), map[string]any{"urls": []any{"https://x.com"}})
 	if err != nil {
 		t.Fatalf("get_web_storage cold: %v", err)
 	}
@@ -518,48 +518,29 @@ func TestHandleGetWebStorageSingleColdFailsClosed(t *testing.T) {
 	st := stateWith("me@laptop", "", stateEndpoint("me@laptop", "chrome", "Default"))
 	d := New(&fakeConsent{}, newFakeCache(), nil, staticProbe(SessionSnapshot{}), &recordingRunner{}, fixedState{st: st}, fixedState{st: st})
 
-	_, err := d.handleGetWebStorage(context.Background(), map[string]any{"browser": "chrome", "url": "https://x.com"})
+	_, err := d.handleGetWebStorage(context.Background(), map[string]any{"browser": "chrome", "urls": []any{"https://x.com"}})
 	var authErr *AuthRequired
 	if !errors.As(err, &authErr) {
 		t.Fatalf("browser-scoped get_web_storage cold = %v, want *AuthRequired", err)
 	}
 }
 
-// TestGetCookiesDualURLField proves get_cookies accepts both the new "urls" list and
-// the legacy single "url" field (the dual-field backward-compat contract).
-func TestGetCookiesDualURLField(t *testing.T) {
-	tests := []struct {
-		name   string
-		params map[string]any
-		want   []string
-	}{
-		{"urls list wins", map[string]any{"urls": []any{"https://a.com", "https://b.com"}, "url": "https://ignored.com"}, []string{"https://a.com", "https://b.com"}},
-		{"single url fallback", map[string]any{"url": "https://only.com"}, []string{"https://only.com"}},
-		{"empty urls falls back to url", map[string]any{"urls": []any{}, "url": "https://fallback.com"}, []string{"https://fallback.com"}},
+func TestGetCookiesRequiresExactURLs(t *testing.T) {
+	want := []string{"https://a.com", "https://b.com"}
+	got, err := urlsParam(map[string]any{"urls": []any{want[0], want[1]}})
+	if err != nil || !slices.Equal(got, want) {
+		t.Fatalf("urlsParam = %v, %v, want %v", got, err, want)
 	}
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			got, err := urlsParam(tc.params)
-			if err != nil {
-				t.Fatalf("urlsParam: %v", err)
-			}
-			if len(got) != len(tc.want) {
-				t.Fatalf("urls = %v, want %v", got, tc.want)
-			}
-			for i := range got {
-				if got[i] != tc.want[i] {
-					t.Fatalf("urls[%d] = %q, want %q", i, got[i], tc.want[i])
-				}
-			}
-		})
-	}
-}
-
-// TestGetCookiesRequiresURL proves get_cookies errors when neither url nor urls is
-// present, rather than serving an empty document.
-func TestGetCookiesRequiresURL(t *testing.T) {
-	if _, err := urlsParam(map[string]any{"browser": "chrome"}); err == nil {
-		t.Fatalf("urlsParam with no url/urls should error")
+	for _, params := range []map[string]any{
+		{"url": "https://legacy.com"},
+		{"urls": []any{}},
+		{"urls": []any{""}},
+		{"urls": []any{42}},
+		{},
+	} {
+		if _, err := urlsParam(params); err == nil {
+			t.Fatalf("urlsParam(%v) succeeded", params)
+		}
 	}
 }
 

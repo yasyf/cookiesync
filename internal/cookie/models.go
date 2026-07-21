@@ -88,13 +88,11 @@ type Cookie struct {
 }
 
 // EncryptedRow is a raw, pre-decrypt cookie row straight off the Chrome SQLite
-// store. It carries both the EncryptedValue blob and the legacy plaintext Value
-// column.
+// store. Only canonical encrypted_value bytes cross this boundary.
 type EncryptedRow struct {
 	HostKey              HostKey
 	Name                 string
 	EncryptedValue       []byte
-	Value                string
 	Path                 string
 	ExpiresUTC           ChromeMicros
 	LastUpdateUTC        ChromeMicros

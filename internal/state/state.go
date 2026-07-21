@@ -1,6 +1,7 @@
 package state
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -12,17 +13,24 @@ import (
 	"github.com/yasyf/synckit/hostregistry"
 )
 
-// JSON keys cookiesync owns in the shared state.json. The host-registry's own keys
-// (self, hosts) are preserved untouched by every write here, since all writes go
-// through the foreign-key-preserving hostregistry raw writer.
 const (
-	keySelfTarget       = "self_target"
-	keyBrowsers         = "browsers"
-	keySettings         = "settings"
-	keyConsentRoute     = "consent_route_to"
-	keyConsentRouteHard = "consent_route_hard"
-	keyBaselines        = "row_baselines"
+	keyState = "cookiesync"
+	// SchemaVersion is the only cookiesync state epoch this binary accepts.
+	SchemaVersion = 1
 )
+
+var legacyStateKeys = [...]string{
+	"self_target",
+	"browsers",
+	"settings",
+	"consent_route_to",
+	"consent_route_hard",
+	"row_baselines",
+}
+
+// ErrSchemaMismatch means state.json contains cookie source state from another
+// fleet epoch. Source-of-truth fields require manual transfer into a fresh v1 file.
+var ErrSchemaMismatch = errors.New("cookiesync state schema mismatch; manually transfer self_target, browsers, settings, consent_route_to, and consent_route_hard into fresh schema_version 1 state")
 
 // Baseline is one endpoint's last-known-good extracted cookie rowcount and its
 // mass-drop quarantine state, keyed by endpoint id in state.json. A collapse flips
@@ -43,6 +51,16 @@ type State struct {
 	ConsentRouteHard bool
 	Browsers         cregistry.Registry[EndpointMeta]
 	Baselines        map[string]Baseline
+}
+
+type stateJSON struct {
+	SchemaVersion    uint64                           `json:"schema_version"`
+	SelfTarget       string                           `json:"self_target"`
+	Settings         settingsJSON                     `json:"settings"`
+	ConsentRouteTo   string                           `json:"consent_route_to"`
+	ConsentRouteHard bool                             `json:"consent_route_hard"`
+	Browsers         cregistry.Registry[EndpointMeta] `json:"browsers"`
+	Baselines        map[string]Baseline              `json:"row_baselines"`
 }
 
 // Endpoints returns the present (non-tombstoned) tracked endpoints, decoded from the
@@ -124,7 +142,11 @@ func (s *Store) LoadRegistry(_ context.Context) (cregistry.Registry[EndpointMeta
 	if err != nil {
 		return nil, err
 	}
-	return browsersFromRaw(raw)
+	st, err := stateFromRaw(raw)
+	if err != nil {
+		return nil, err
+	}
+	return st.Browsers, nil
 }
 
 // SaveRegistryUnlocked persists reg back into the browsers key of state.json,
@@ -134,7 +156,12 @@ func (s *Store) LoadRegistry(_ context.Context) (cregistry.Registry[EndpointMeta
 // self-deadlock. Use SaveRegistry for the standalone, lock-acquiring write.
 func (s *Store) SaveRegistryUnlocked(_ context.Context, reg cregistry.Registry[EndpointMeta]) error {
 	return s.cfg.UpdateRawUnlocked(func(raw map[string]json.RawMessage) error {
-		return putBrowsers(raw, reg)
+		st, err := stateFromRaw(raw)
+		if err != nil {
+			return err
+		}
+		st.Browsers = reg
+		return putState(raw, st)
 	})
 }
 
@@ -146,7 +173,11 @@ func (s *Store) Baselines(_ context.Context) (map[string]Baseline, error) {
 	if err != nil {
 		return nil, err
 	}
-	return baselinesFromRaw(raw)
+	st, err := stateFromRaw(raw)
+	if err != nil {
+		return nil, err
+	}
+	return st.Baselines, nil
 }
 
 // SaveBaselinesUnlocked persists the rowcount ledger into the row_baselines key of
@@ -154,7 +185,12 @@ func (s *Store) Baselines(_ context.Context) (map[string]Baseline, error) {
 // pass writing it already holds the (non-reentrant) lock.
 func (s *Store) SaveBaselinesUnlocked(_ context.Context, baselines map[string]Baseline) error {
 	return s.cfg.UpdateRawUnlocked(func(raw map[string]json.RawMessage) error {
-		return putBaselines(raw, baselines)
+		st, err := stateFromRaw(raw)
+		if err != nil {
+			return err
+		}
+		st.Baselines = baselines
+		return putState(raw, st)
 	})
 }
 
@@ -163,7 +199,12 @@ func (s *Store) SaveBaselinesUnlocked(_ context.Context, baselines map[string]Ba
 // holds the lock.
 func (s *Store) SaveRegistry(ctx context.Context, reg cregistry.Registry[EndpointMeta]) error {
 	return s.cfg.UpdateRaw(ctx, func(raw map[string]json.RawMessage) error {
-		return putBrowsers(raw, reg)
+		st, err := stateFromRaw(raw)
+		if err != nil {
+			return err
+		}
+		st.Browsers = reg
+		return putState(raw, st)
 	})
 }
 
@@ -174,15 +215,13 @@ func (s *Store) SaveRegistry(ctx context.Context, reg cregistry.Registry[Endpoin
 func (s *Store) AddBrowser(ctx context.Context, selfTarget string, endpoint Endpoint) error {
 	at := cregistry.UnixMicros(s.now())
 	return s.cfg.UpdateRaw(ctx, func(raw map[string]json.RawMessage) error {
-		reg, err := browsersFromRaw(raw)
+		st, err := stateFromRaw(raw)
 		if err != nil {
 			return err
 		}
-		reg.Add(string(endpoint.ID()), endpoint.Meta(), at)
-		if err := putBrowsers(raw, reg); err != nil {
-			return err
-		}
-		return putString(raw, keySelfTarget, selfTarget)
+		st.Browsers.Add(string(endpoint.ID()), endpoint.Meta(), at)
+		st.SelfTarget = selfTarget
+		return putState(raw, st)
 	})
 }
 
@@ -192,12 +231,12 @@ func (s *Store) AddBrowser(ctx context.Context, selfTarget string, endpoint Endp
 func (s *Store) RemoveBrowser(ctx context.Context, endpoint Endpoint) error {
 	at := cregistry.UnixMicros(s.now())
 	return s.cfg.UpdateRaw(ctx, func(raw map[string]json.RawMessage) error {
-		reg, err := browsersFromRaw(raw)
+		st, err := stateFromRaw(raw)
 		if err != nil {
 			return err
 		}
-		reg.Remove(string(endpoint.ID()), at)
-		return putBrowsers(raw, reg)
+		st.Browsers.Remove(string(endpoint.ID()), at)
+		return putState(raw, st)
 	})
 }
 
@@ -205,7 +244,12 @@ func (s *Store) RemoveBrowser(ctx context.Context, endpoint Endpoint) error {
 // checks to first.
 func (s *Store) SetConsentRoute(ctx context.Context, target string) error {
 	return s.cfg.UpdateRaw(ctx, func(raw map[string]json.RawMessage) error {
-		return putString(raw, keyConsentRoute, target)
+		st, err := stateFromRaw(raw)
+		if err != nil {
+			return err
+		}
+		st.ConsentRouteTo = target
+		return putState(raw, st)
 	})
 }
 
@@ -213,7 +257,12 @@ func (s *Store) SetConsentRoute(ctx context.Context, target string) error {
 // target even when this host looks locally attended.
 func (s *Store) SetConsentRouteHard(ctx context.Context, hard bool) error {
 	return s.cfg.UpdateRaw(ctx, func(raw map[string]json.RawMessage) error {
-		return putBool(raw, keyConsentRouteHard, hard)
+		st, err := stateFromRaw(raw)
+		if err != nil {
+			return err
+		}
+		st.ConsentRouteHard = hard
+		return putState(raw, st)
 	})
 }
 
@@ -226,125 +275,65 @@ func (s *Store) SetAuthTTL(ctx context.Context, ttl time.Duration) error {
 			return err
 		}
 		st.Settings.AuthTTL = ttl
-		return putSettings(raw, st.Settings)
+		return putState(raw, st)
 	})
 }
 
-// stateFromRaw decodes the cookiesync keys out of a raw state map, leaving defaults
-// where a key is absent.
+// stateFromRaw decodes the exact v1 cookiesync envelope. A missing envelope is
+// valid only before any cookiesync-owned state exists; legacy top-level fields
+// require manual source-of-truth transfer rather than an in-process migration.
 func stateFromRaw(raw map[string]json.RawMessage) (*State, error) {
-	st := &State{Settings: DefaultSettings(), Browsers: cregistry.New[EndpointMeta]()}
-	if v, ok := raw[keySelfTarget]; ok {
-		if err := json.Unmarshal(v, &st.SelfTarget); err != nil {
-			return nil, fmt.Errorf("parse self_target: %w", err)
+	for _, key := range legacyStateKeys {
+		if _, found := raw[key]; found {
+			return nil, fmt.Errorf("%w: legacy top-level field %q", ErrSchemaMismatch, key)
 		}
 	}
-	if v, ok := raw[keyConsentRoute]; ok {
-		if err := json.Unmarshal(v, &st.ConsentRouteTo); err != nil {
-			return nil, fmt.Errorf("parse consent_route_to: %w", err)
-		}
+	encoded, found := raw[keyState]
+	if !found {
+		return defaultState(), nil
 	}
-	if v, ok := raw[keyConsentRouteHard]; ok {
-		if err := json.Unmarshal(v, &st.ConsentRouteHard); err != nil {
-			return nil, fmt.Errorf("parse consent_route_hard: %w", err)
-		}
+	var persisted stateJSON
+	decoder := json.NewDecoder(bytes.NewReader(encoded))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&persisted); err != nil {
+		return nil, fmt.Errorf("%w: decode v1 envelope: %w", ErrSchemaMismatch, err)
 	}
-	if v, ok := raw[keySettings]; ok {
-		var sj settingsJSON
-		if err := json.Unmarshal(v, &sj); err != nil {
-			return nil, fmt.Errorf("parse settings: %w", err)
-		}
-		settings, err := settingsFromJSON(sj)
-		if err != nil {
-			return nil, fmt.Errorf("parse settings: %w", err)
-		}
-		st.Settings = settings
+	if persisted.SchemaVersion != SchemaVersion {
+		return nil, fmt.Errorf("%w: state=%d binary=%d", ErrSchemaMismatch, persisted.SchemaVersion, SchemaVersion)
 	}
-	reg, err := browsersFromRaw(raw)
+	if persisted.Browsers == nil || persisted.Baselines == nil {
+		return nil, fmt.Errorf("%w: v1 browsers and row_baselines must be objects", ErrSchemaMismatch)
+	}
+	settings, err := settingsFromJSON(persisted.Settings)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("%w: parse settings: %w", ErrSchemaMismatch, err)
 	}
-	st.Browsers = reg
-	baselines, err := baselinesFromRaw(raw)
-	if err != nil {
-		return nil, err
-	}
-	st.Baselines = baselines
-	return st, nil
+	return &State{
+		SelfTarget: persisted.SelfTarget, Settings: settings,
+		ConsentRouteTo: persisted.ConsentRouteTo, ConsentRouteHard: persisted.ConsentRouteHard,
+		Browsers: persisted.Browsers, Baselines: persisted.Baselines,
+	}, nil
 }
 
-// baselinesFromRaw decodes the rowcount ledger out of the row_baselines key, returning
-// an empty map when the key is absent.
-func baselinesFromRaw(raw map[string]json.RawMessage) (map[string]Baseline, error) {
-	baselines := map[string]Baseline{}
-	v, ok := raw[keyBaselines]
-	if !ok {
-		return baselines, nil
+func defaultState() *State {
+	return &State{
+		Settings: DefaultSettings(), Browsers: cregistry.New[EndpointMeta](),
+		Baselines: map[string]Baseline{},
 	}
-	if err := json.Unmarshal(v, &baselines); err != nil {
-		return nil, fmt.Errorf("parse row_baselines: %w", err)
-	}
-	return baselines, nil
 }
 
-// browsersFromRaw decodes the convergent endpoint registry out of the browsers key,
-// returning an empty registry when the key is absent.
-func browsersFromRaw(raw map[string]json.RawMessage) (cregistry.Registry[EndpointMeta], error) {
-	reg := cregistry.New[EndpointMeta]()
-	v, ok := raw[keyBrowsers]
-	if !ok {
-		return reg, nil
+func putState(raw map[string]json.RawMessage, st *State) error {
+	if st.Browsers == nil || st.Baselines == nil {
+		return errors.New("encode cookiesync state: browsers and baselines must be non-nil")
 	}
-	if err := json.Unmarshal(v, &reg); err != nil {
-		return nil, fmt.Errorf("parse browsers registry: %w", err)
-	}
-	if reg == nil {
-		reg = cregistry.New[EndpointMeta]()
-	}
-	return reg, nil
-}
-
-func putBrowsers(raw map[string]json.RawMessage, reg cregistry.Registry[EndpointMeta]) error {
-	encoded, err := json.Marshal(reg)
+	encoded, err := json.Marshal(stateJSON{
+		SchemaVersion: SchemaVersion, SelfTarget: st.SelfTarget, Settings: st.Settings.toJSON(),
+		ConsentRouteTo: st.ConsentRouteTo, ConsentRouteHard: st.ConsentRouteHard,
+		Browsers: st.Browsers, Baselines: st.Baselines,
+	})
 	if err != nil {
-		return fmt.Errorf("encode browsers registry: %w", err)
+		return fmt.Errorf("encode cookiesync state: %w", err)
 	}
-	raw[keyBrowsers] = encoded
-	return nil
-}
-
-func putBaselines(raw map[string]json.RawMessage, baselines map[string]Baseline) error {
-	encoded, err := json.Marshal(baselines)
-	if err != nil {
-		return fmt.Errorf("encode row_baselines: %w", err)
-	}
-	raw[keyBaselines] = encoded
-	return nil
-}
-
-func putSettings(raw map[string]json.RawMessage, settings Settings) error {
-	encoded, err := json.Marshal(settings.toJSON())
-	if err != nil {
-		return fmt.Errorf("encode settings: %w", err)
-	}
-	raw[keySettings] = encoded
-	return nil
-}
-
-func putString(raw map[string]json.RawMessage, key, value string) error {
-	encoded, err := json.Marshal(value)
-	if err != nil {
-		return fmt.Errorf("encode %s: %w", key, err)
-	}
-	raw[key] = encoded
-	return nil
-}
-
-func putBool(raw map[string]json.RawMessage, key string, value bool) error {
-	encoded, err := json.Marshal(value)
-	if err != nil {
-		return fmt.Errorf("encode %s: %w", key, err)
-	}
-	raw[key] = encoded
+	raw[keyState] = encoded
 	return nil
 }

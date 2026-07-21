@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -15,6 +16,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/yasyf/cookiesync/internal/cookie"
 	"github.com/yasyf/cookiesync/internal/paths"
 	"github.com/yasyf/cookiesync/internal/rpc"
 )
@@ -25,13 +27,14 @@ const bridgeDefaultProfile = "Default"
 
 // bridgeOpenResult is the frozen bridge_open reply.
 type bridgeOpenResult struct {
-	URL        string     `json:"url"`
-	Endpoint   string     `json:"endpoint"`
-	Browser    string     `json:"browser"`
-	Profile    string     `json:"profile"`
-	Capability string     `json:"capability"`
-	ExpiresIn  float64    `json:"expires_in"`
-	Seed       seedReport `json:"seed"`
+	ProtocolVersion uint64     `json:"protocol_version"`
+	URL             string     `json:"url"`
+	Endpoint        string     `json:"endpoint"`
+	Browser         string     `json:"browser"`
+	Profile         string     `json:"profile"`
+	Capability      string     `json:"capability"`
+	ExpiresIn       float64    `json:"expires_in"`
+	Seed            seedReport `json:"seed"`
 }
 
 // seedReport mirrors the daemon's per-cause seed breakdown: Attempted ==
@@ -56,28 +59,36 @@ type rejectedCookie struct {
 // bridgeOpenJSON is the `bridge open --json` shape: the endpoint fields a consumer
 // needs, without the management capability openBridge persists client-side.
 type bridgeOpenJSON struct {
-	URL       string  `json:"url"`
-	Endpoint  string  `json:"endpoint"`
-	Browser   string  `json:"browser"`
-	Profile   string  `json:"profile"`
-	ExpiresIn float64 `json:"expires_in"`
+	ProtocolVersion uint64  `json:"protocol_version"`
+	URL             string  `json:"url"`
+	Endpoint        string  `json:"endpoint"`
+	Browser         string  `json:"browser"`
+	Profile         string  `json:"profile"`
+	ExpiresIn       float64 `json:"expires_in"`
 }
 
 // bridgeStatusResult is the frozen bridge_status reply; empty when the session
 // is gone.
 type bridgeStatusResult struct {
-	Endpoint  string  `json:"endpoint"`
-	Browser   string  `json:"browser"`
-	Profile   string  `json:"profile"`
-	ExpiresIn float64 `json:"expires_in"`
-	PID       int     `json:"pid"`
+	ProtocolVersion uint64  `json:"protocol_version"`
+	Endpoint        string  `json:"endpoint"`
+	Browser         string  `json:"browser"`
+	Profile         string  `json:"profile"`
+	ExpiresIn       float64 `json:"expires_in"`
+	PID             int     `json:"pid"`
 }
 
 // bridgeStopResult is the --json shape of a completed stop: the endpoint torn
 // down and the closed flag.
 type bridgeStopResult struct {
-	Endpoint string `json:"endpoint"`
-	Closed   bool   `json:"closed"`
+	ProtocolVersion uint64 `json:"protocol_version"`
+	Endpoint        string `json:"endpoint"`
+	Closed          bool   `json:"closed"`
+}
+
+type bridgeListJSON struct {
+	ProtocolVersion uint64               `json:"protocol_version"`
+	Sessions        []bridgeStatusResult `json:"sessions"`
 }
 
 // openBridge runs the tapped, consent-gated bridge_open behind both `bridge
@@ -101,9 +112,13 @@ var openBridge = func(ctx context.Context, host, browser, profile string, headed
 	if err := rpc.CallJSON(ctx, "bridge_open", params, &resp); err != nil {
 		return bridgeOpenResult{}, err
 	}
+	if resp.ProtocolVersion != cookie.ProtocolVersion {
+		return bridgeOpenResult{}, fmt.Errorf("bridge protocol version %d, want %d", resp.ProtocolVersion, cookie.ProtocolVersion)
+	}
 	if err := saveCap(key, resp.Capability); err != nil {
 		var closed struct {
-			Closed bool `json:"closed"`
+			ProtocolVersion uint64 `json:"protocol_version"`
+			Closed          bool   `json:"closed"`
 		}
 		_ = rpc.CallJSON(ctx, "bridge_close", map[string]any{"capability": resp.Capability}, &closed)
 		return bridgeOpenResult{}, err
@@ -119,10 +134,14 @@ var stopBridge = func(ctx context.Context, key string) error {
 		return fmt.Errorf("no saved bridge for %s", key)
 	}
 	var resp struct {
-		Closed bool `json:"closed"`
+		ProtocolVersion uint64 `json:"protocol_version"`
+		Closed          bool   `json:"closed"`
 	}
 	if err := rpc.CallJSON(ctx, "bridge_close", map[string]any{"capability": capability}, &resp); err != nil {
 		return err
+	}
+	if resp.ProtocolVersion != cookie.ProtocolVersion {
+		return fmt.Errorf("bridge protocol version %d, want %d", resp.ProtocolVersion, cookie.ProtocolVersion)
 	}
 	return removeCap(key)
 }
@@ -156,11 +175,12 @@ func newBridgeOpenCmd() *cobra.Command {
 			}
 			if asJSON {
 				return writeBridgeJSON(cmd.OutOrStdout(), bridgeOpenJSON{
-					URL:       resp.URL,
-					Endpoint:  resp.Endpoint,
-					Browser:   resp.Browser,
-					Profile:   resp.Profile,
-					ExpiresIn: resp.ExpiresIn,
+					ProtocolVersion: cookie.ProtocolVersion,
+					URL:             resp.URL,
+					Endpoint:        resp.Endpoint,
+					Browser:         resp.Browser,
+					Profile:         resp.Profile,
+					ExpiresIn:       resp.ExpiresIn,
 				})
 			}
 			printBridgeReady(cmd, resp)
@@ -192,6 +212,9 @@ func newBridgeLsCmd() *cobra.Command {
 				if err := rpc.CallJSON(cmd.Context(), "bridge_status", map[string]any{"capability": entry.capability}, &st); err != nil {
 					return err
 				}
+				if st.ProtocolVersion != cookie.ProtocolVersion {
+					return fmt.Errorf("bridge protocol version %d, want %d", st.ProtocolVersion, cookie.ProtocolVersion)
+				}
 				if st.Endpoint == "" {
 					_ = os.Remove(entry.path)
 					continue
@@ -199,7 +222,9 @@ func newBridgeLsCmd() *cobra.Command {
 				live = append(live, st)
 			}
 			if asJSON {
-				return writeBridgeJSON(cmd.OutOrStdout(), live)
+				return writeBridgeJSON(cmd.OutOrStdout(), bridgeListJSON{
+					ProtocolVersion: cookie.ProtocolVersion, Sessions: live,
+				})
 			}
 			for _, st := range live {
 				cmd.Printf("%s · expires in %s · pid %d\n", st.Endpoint, formatTTL(st.ExpiresIn), st.PID)
@@ -228,7 +253,9 @@ func newBridgeStopCmd() *cobra.Command {
 				return err
 			}
 			if asJSON {
-				return writeBridgeJSON(cmd.OutOrStdout(), bridgeStopResult{Endpoint: key, Closed: true})
+				return writeBridgeJSON(cmd.OutOrStdout(), bridgeStopResult{
+					ProtocolVersion: cookie.ProtocolVersion, Endpoint: key, Closed: true,
+				})
 			}
 			cmd.Printf("bridge closed · %s\n", key)
 			return nil
@@ -312,6 +339,11 @@ type capEntry struct {
 	capability string
 }
 
+type capState struct {
+	ProtocolVersion uint64 `json:"protocol_version"`
+	Capability      string `json:"capability"`
+}
+
 func capsDir() (string, error) {
 	dir, err := paths.Dir()
 	if err != nil {
@@ -339,8 +371,9 @@ func loadCap(key string) (string, bool) {
 	if err != nil {
 		return "", false
 	}
-	capability := strings.TrimSpace(string(raw))
-	if capability == "" {
+	capability, err := decodeCap(raw)
+	if err != nil {
+		_ = os.Remove(path)
 		return "", false
 	}
 	return capability, true
@@ -359,7 +392,11 @@ func saveCap(key, capability string) error {
 	if err != nil {
 		return err
 	}
-	if err := os.WriteFile(path, []byte(capability), 0o600); err != nil {
+	data, err := json.Marshal(capState{ProtocolVersion: cookie.ProtocolVersion, Capability: capability})
+	if err != nil {
+		return fmt.Errorf("encode bridge capability: %w", err)
+	}
+	if err := os.WriteFile(path, data, 0o600); err != nil {
 		return fmt.Errorf("save bridge capability: %w", err)
 	}
 	return nil
@@ -400,11 +437,29 @@ func listCaps() ([]capEntry, error) {
 		if err != nil {
 			continue
 		}
-		capability := strings.TrimSpace(string(raw))
-		if capability == "" {
+		capability, err := decodeCap(raw)
+		if err != nil {
+			_ = os.Remove(path)
 			continue
 		}
 		caps = append(caps, capEntry{path: path, capability: capability})
 	}
 	return caps, nil
+}
+
+func decodeCap(raw []byte) (string, error) {
+	var state capState
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&state); err != nil {
+		return "", err
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		return "", errors.New("bridge capability carries trailing JSON")
+	}
+	if state.ProtocolVersion != cookie.ProtocolVersion || strings.TrimSpace(state.Capability) == "" {
+		return "", fmt.Errorf("bridge capability protocol version %d, want %d",
+			state.ProtocolVersion, cookie.ProtocolVersion)
+	}
+	return state.Capability, nil
 }

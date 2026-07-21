@@ -3,6 +3,7 @@ package state
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -178,8 +179,15 @@ func TestForeignKeyPreserve(t *testing.T) {
 	if len(hosts) != 1 || hosts[0] != "you@desktop" {
 		t.Fatalf("hosts = %+v, want [you@desktop]", hosts)
 	}
-	if _, ok := raw["browsers"]; !ok {
-		t.Fatalf("cookiesync 'browsers' key missing")
+	var persisted stateJSON
+	if err := json.Unmarshal(raw[keyState], &persisted); err != nil {
+		t.Fatalf("parse cookiesync envelope: %v", err)
+	}
+	if persisted.SchemaVersion != SchemaVersion {
+		t.Fatalf("schema_version = %d, want %d", persisted.SchemaVersion, SchemaVersion)
+	}
+	if _, ok := persisted.Browsers[string(ep.ID())]; !ok {
+		t.Fatalf("cookiesync envelope missing browser")
 	}
 }
 
@@ -278,10 +286,9 @@ func TestDefaultSettingsSerialize(t *testing.T) {
 	}
 }
 
-// TestSettingsLoadToleratesRemovedOpTimeout proves a state.json written before the dead
-// op_timeout knob was deleted still loads: the leftover key is ignored, the surviving
-// knobs parse.
-func TestSettingsLoadToleratesRemovedOpTimeout(t *testing.T) {
+// TestStateRejectsPreEpochSourceTruth proves legacy state is never migrated or
+// partially interpreted by the v1 runtime.
+func TestStateRejectsPreEpochSourceTruth(t *testing.T) {
 	store, path := newTestStore(t, time.Unix(1_700_000_000, 0))
 	body := `{"settings":{"interval":"10m","idle_threshold":"4m","watch_debounce":"5s","op_timeout":"2m","auth_ttl":"7m"}}`
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
@@ -291,18 +298,26 @@ func TestSettingsLoadToleratesRemovedOpTimeout(t *testing.T) {
 		t.Fatalf("seed state file: %v", err)
 	}
 
-	st, err := store.Load(context.Background())
-	if err != nil {
-		t.Fatalf("Load with legacy op_timeout key: %v", err)
+	if _, err := store.Load(context.Background()); !errors.Is(err, ErrSchemaMismatch) {
+		t.Fatalf("Load legacy state = %v, want schema mismatch", err)
 	}
-	want := Settings{
-		Interval:      10 * time.Minute,
-		IdleThreshold: 4 * time.Minute,
-		WatchDebounce: 5 * time.Second,
-		AuthTTL:       7 * time.Minute,
-	}
-	if st.Settings != want {
-		t.Fatalf("settings = %+v, want %+v", st.Settings, want)
+}
+
+func TestStateRejectsWrongOrExtendedV1Schema(t *testing.T) {
+	for _, body := range []string{
+		`{"cookiesync":{"schema_version":2,"self_target":"","settings":{"interval":"15m","idle_threshold":"5m","watch_debounce":"3s","auth_ttl":"1h"},"consent_route_to":"","consent_route_hard":false,"browsers":{},"row_baselines":{}}}`,
+		`{"cookiesync":{"schema_version":1,"self_target":"","settings":{"interval":"15m","idle_threshold":"5m","watch_debounce":"3s","auth_ttl":"1h","op_timeout":"2m"},"consent_route_to":"","consent_route_hard":false,"browsers":{},"row_baselines":{}}}`,
+	} {
+		store, path := newTestStore(t, time.Unix(1_700_000_000, 0))
+		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := store.Load(context.Background()); !errors.Is(err, ErrSchemaMismatch) {
+			t.Fatalf("Load incompatible state = %v, want schema mismatch", err)
+		}
 	}
 }
 
@@ -350,8 +365,12 @@ func TestBaselinesRoundTrip(t *testing.T) {
 		t.Fatalf("browsers key clobbered by the baselines write")
 	}
 	raw := readStateFile(t, path)
-	if _, ok := raw["row_baselines"]; !ok {
-		t.Fatalf("row_baselines key missing from state.json")
+	var persisted stateJSON
+	if err := json.Unmarshal(raw[keyState], &persisted); err != nil {
+		t.Fatal(err)
+	}
+	if persisted.Baselines["me@laptop:arc:Default"] != want["me@laptop:arc:Default"] {
+		t.Fatalf("persisted row_baselines = %+v, want %+v", persisted.Baselines, want)
 	}
 }
 

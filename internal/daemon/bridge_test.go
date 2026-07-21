@@ -135,14 +135,15 @@ func TestBridgeOpenReattachClose(t *testing.T) {
 		t.Fatalf("re-attach extended the lease: expiry %v != %v", sess.expiry, expiry1)
 	}
 
-	// (3) a wrong capability leaks nothing: status is empty, and a fresh open
+	// (3) a wrong capability leaks nothing beyond the exact protocol version,
+	// and a fresh open
 	// without the capability taps again and opens a distinct session.
 	stRes, err := d.handleBridgeStatus(ctx, map[string]any{"capability": "not-a-real-capability"})
 	if err != nil {
 		t.Fatalf("bridge_status wrong cap: %v", err)
 	}
-	if got := stRes.(map[string]any); len(got) != 0 {
-		t.Fatalf("bridge_status for a wrong capability leaked %+v, want empty", got)
+	if got := stRes.(map[string]any); len(got) != 1 || got["protocol_version"] != cookie.ProtocolVersion {
+		t.Fatalf("bridge_status for a wrong capability = %+v, want exact version-only envelope", got)
 	}
 	res3, err := d.handleBridgeOpen(ctx, openParams)
 	if err != nil {
@@ -315,6 +316,7 @@ func TestReapOrphanBridgeIdentityCheck(t *testing.T) {
 		return c
 	}
 	writeRec := func(rec bridgeRecord) string {
+		rec.ProtocolVersion = cookie.ProtocolVersion
 		dir := t.TempDir()
 		raw, err := json.Marshal(rec)
 		if err != nil {
@@ -329,6 +331,30 @@ func TestReapOrphanBridgeIdentityCheck(t *testing.T) {
 	// (1) A stale identity must NOT kill the live pid, but must still remove the dir.
 	victim := spawn()
 	t.Cleanup(func() { _ = victim.Process.Kill() })
+	id, ok, err := probeProcess(ctx, victim.Process.Pid)
+	if err != nil || !ok {
+		t.Fatalf("probeProcess on a live child: ok=%v err=%v", ok, err)
+	}
+	oldDir := t.TempDir()
+	oldRaw, err := json.Marshal(map[string]any{
+		"kind": bridgeRecordLocal, "pid": victim.Process.Pid, "start": id.start, "comm": id.comm,
+		"endpoint": "chrome:Default", "data_dir": oldDir,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldPath := filepath.Join(oldDir, bridgeRecordFile)
+	if err := os.WriteFile(oldPath, oldRaw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	reapOrphanBridge(ctx, runner, oldPath)
+	if _, err := os.Stat(oldDir); !os.IsNotExist(err) {
+		t.Fatalf("pre-epoch record was not discarded, stat err = %v", err)
+	}
+	if syscall.Kill(victim.Process.Pid, 0) != nil {
+		t.Fatal("pre-epoch record killed a live process instead of being discarded")
+	}
+
 	path1 := writeRec(bridgeRecord{PID: victim.Process.Pid, Start: "Mon Jan 1 00:00:00 2000", Comm: "/not/our/binary"})
 	reapOrphanBridge(ctx, runner, path1)
 	if _, err := os.Stat(filepath.Dir(path1)); !os.IsNotExist(err) {
@@ -339,7 +365,7 @@ func TestReapOrphanBridgeIdentityCheck(t *testing.T) {
 	}
 
 	// (2) A matched identity group-kills the recorded process and removes the dir.
-	id, ok, err := probeProcess(ctx, victim.Process.Pid)
+	id, ok, err = probeProcess(ctx, victim.Process.Pid)
 	if err != nil || !ok {
 		t.Fatalf("probeProcess on a live child: ok=%v err=%v", ok, err)
 	}
@@ -392,7 +418,8 @@ func TestReapOrphanBridgeProxyRemoteCloses(t *testing.T) {
 	}
 	dir := t.TempDir()
 	raw, err := json.Marshal(bridgeRecord{
-		Kind: bridgeRecordProxy, PID: child.Process.Pid, Start: id.start, Comm: id.comm,
+		ProtocolVersion: cookie.ProtocolVersion,
+		Kind:            bridgeRecordProxy, PID: child.Process.Pid, Start: id.start, Comm: id.comm,
 		Endpoint: "you@desktop:chrome:Default", Host: "you@desktop", Capability: "cap-b-secret",
 	})
 	if err != nil {

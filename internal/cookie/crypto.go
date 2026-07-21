@@ -76,13 +76,9 @@ func domainHash(hostKey HostKey) []byte {
 	return sum[:]
 }
 
-// DecryptValue decrypts one Chrome cookie encrypted_value blob, returning its
-// plaintext. An empty blob decrypts to the empty string. It returns a *DecryptError
-// on any failure; a v20 blob unwraps to ErrV20.
+// DecryptValue decrypts one canonical Chrome v10 encrypted_value blob. It returns a
+// *DecryptError on any failure; a v20 blob unwraps to ErrV20.
 func DecryptValue(encrypted []byte, key AesKey, hostKey HostKey) (string, error) {
-	if len(encrypted) == 0 {
-		return "", nil
-	}
 	var ciphertext []byte
 	switch {
 	case bytes.HasPrefix(encrypted, []byte("v20")):
@@ -90,10 +86,7 @@ func DecryptValue(encrypted []byte, key AesKey, hostKey HostKey) (string, error)
 	case bytes.HasPrefix(encrypted, []byte("v10")):
 		ciphertext = encrypted[3:]
 	default:
-		if !utf8.Valid(encrypted) {
-			return "", &DecryptError{Msg: "unrecognized cookie encoding"}
-		}
-		return string(encrypted), nil
+		return "", &DecryptError{Msg: "unrecognized cookie encoding"}
 	}
 
 	if len(ciphertext) == 0 || len(ciphertext)%aes.BlockSize != 0 {

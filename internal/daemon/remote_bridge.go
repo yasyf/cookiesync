@@ -1,10 +1,12 @@
 package daemon
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/url"
 	"os"
@@ -13,6 +15,7 @@ import (
 	"time"
 
 	"github.com/yasyf/cookiesync/internal/bridge"
+	"github.com/yasyf/cookiesync/internal/cookie"
 	"github.com/yasyf/cookiesync/internal/engine"
 	"github.com/yasyf/cookiesync/internal/paths"
 	"github.com/yasyf/synckit/hostregistry"
@@ -52,14 +55,15 @@ type bridgeKeepalive interface {
 // the ws url (its token embedded, never on argv), the peer's loopback proxy port
 // the forward targets, and the peer-side capability the origin closes it by.
 type remoteBridgeReply struct {
-	URL        string     `json:"url"`
-	Endpoint   string     `json:"endpoint"`
-	Browser    string     `json:"browser"`
-	Profile    string     `json:"profile"`
-	Capability string     `json:"capability"`
-	ExpiresIn  float64    `json:"expires_in"`
-	ProxyPort  int        `json:"proxy_port"`
-	Seed       seedReport `json:"seed"`
+	ProtocolVersion uint64     `json:"protocol_version"`
+	URL             string     `json:"url"`
+	Endpoint        string     `json:"endpoint"`
+	Browser         string     `json:"browser"`
+	Profile         string     `json:"profile"`
+	Capability      string     `json:"capability"`
+	ExpiresIn       float64    `json:"expires_in"`
+	ProxyPort       int        `json:"proxy_port"`
+	Seed            seedReport `json:"seed"`
 }
 
 // proxyBridgeSession is a live cross-host bridge the origin fronts: the peer owns
@@ -110,13 +114,14 @@ func (s *proxyBridgeSession) Live() bool {
 // loopback url and this side's own capability, never the peer's.
 func (s *proxyBridgeSession) OpenResult() map[string]any {
 	return map[string]any{
-		"url":        s.wsURL,
-		"endpoint":   s.endpoint,
-		"browser":    s.browser,
-		"profile":    s.profile,
-		"capability": s.capA,
-		"expires_in": time.Until(s.expiry).Seconds(),
-		"proxy_port": s.proxyPort,
+		"protocol_version": cookie.ProtocolVersion,
+		"url":              s.wsURL,
+		"endpoint":         s.endpoint,
+		"browser":          s.browser,
+		"profile":          s.profile,
+		"capability":       s.capA,
+		"expires_in":       time.Until(s.expiry).Seconds(),
+		"proxy_port":       s.proxyPort,
 	}
 }
 
@@ -124,11 +129,12 @@ func (s *proxyBridgeSession) OpenResult() map[string]any {
 // pid, so it reports the forwarded loopback port in its place.
 func (s *proxyBridgeSession) StatusResult() map[string]any {
 	return map[string]any{
-		"endpoint":   s.endpoint,
-		"browser":    s.browser,
-		"profile":    s.profile,
-		"expires_in": time.Until(s.expiry).Seconds(),
-		"proxy_port": s.proxyPort,
+		"protocol_version": cookie.ProtocolVersion,
+		"endpoint":         s.endpoint,
+		"browser":          s.browser,
+		"profile":          s.profile,
+		"expires_in":       time.Until(s.expiry).Seconds(),
+		"proxy_port":       s.proxyPort,
 	}
 }
 
@@ -152,7 +158,7 @@ func (d *Daemon) handleBridgeKeepalive(ctx context.Context, params map[string]an
 	}
 	<-ctx.Done()
 	d.teardownBridge(capability)
-	return map[string]any{"closed": true}, nil
+	return map[string]any{"protocol_version": cookie.ProtocolVersion, "closed": true}, nil
 }
 
 // remoteBridgeOpen opens a bridge on a peer and fronts it locally: it shells the
@@ -325,8 +331,17 @@ func (d *Daemon) shellRemoteBridgeOpen(ctx context.Context, self, host, browser,
 		return remoteBridgeReply{}, fmt.Errorf("open bridge on %s: %w", host, err)
 	}
 	var reply remoteBridgeReply
-	if err := json.Unmarshal([]byte(out), &reply); err != nil {
+	decoder := json.NewDecoder(bytes.NewReader([]byte(out)))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&reply); err != nil {
 		return remoteBridgeReply{}, fmt.Errorf("parse bridge_open from %s: %w", host, err)
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		return remoteBridgeReply{}, fmt.Errorf("parse bridge_open from %s: trailing JSON", host)
+	}
+	if reply.ProtocolVersion != cookie.ProtocolVersion {
+		return remoteBridgeReply{}, fmt.Errorf("bridge_open from %s protocol version %d, want %d",
+			host, reply.ProtocolVersion, cookie.ProtocolVersion)
 	}
 	if reply.Capability == "" || reply.URL == "" || reply.ProxyPort == 0 {
 		// Return the parsed reply so the caller can close a peer bridge whose
