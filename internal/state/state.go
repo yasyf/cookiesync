@@ -19,18 +19,8 @@ const (
 	SchemaVersion = 1
 )
 
-var legacyStateKeys = [...]string{
-	"self_target",
-	"browsers",
-	"settings",
-	"consent_route_to",
-	"consent_route_hard",
-	"row_baselines",
-}
-
-// ErrSchemaMismatch means state.json contains cookie source state from another
-// fleet epoch. Source-of-truth fields require manual transfer into a fresh v1 file.
-var ErrSchemaMismatch = errors.New("cookiesync state schema mismatch; manually transfer self_target, browsers, settings, consent_route_to, and consent_route_hard into fresh schema_version 1 state")
+// ErrSchemaMismatch means the cookiesync envelope is not exact schema v1.
+var ErrSchemaMismatch = errors.New("cookiesync state schema mismatch; manually recreate cookiesync state in a fresh schema_version 1 envelope")
 
 // Baseline is one endpoint's last-known-good extracted cookie rowcount and its
 // mass-drop quarantine state, keyed by endpoint id in state.json. A collapse flips
@@ -279,15 +269,9 @@ func (s *Store) SetAuthTTL(ctx context.Context, ttl time.Duration) error {
 	})
 }
 
-// stateFromRaw decodes the exact v1 cookiesync envelope. A missing envelope is
-// valid only before any cookiesync-owned state exists; legacy top-level fields
-// require manual source-of-truth transfer rather than an in-process migration.
+// stateFromRaw decodes only the exact v1 cookiesync envelope. An absent envelope
+// is fresh state; every other top-level key belongs to another state owner.
 func stateFromRaw(raw map[string]json.RawMessage) (*State, error) {
-	for _, key := range legacyStateKeys {
-		if _, found := raw[key]; found {
-			return nil, fmt.Errorf("%w: legacy top-level field %q", ErrSchemaMismatch, key)
-		}
-	}
 	encoded, found := raw[keyState]
 	if !found {
 		return defaultState(), nil

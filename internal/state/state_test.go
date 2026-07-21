@@ -286,11 +286,9 @@ func TestDefaultSettingsSerialize(t *testing.T) {
 	}
 }
 
-// TestStateRejectsPreEpochSourceTruth proves legacy state is never migrated or
-// partially interpreted by the v1 runtime.
-func TestStateRejectsPreEpochSourceTruth(t *testing.T) {
+func TestStateIgnoresForeignTopLevelKeysWithoutEnvelope(t *testing.T) {
 	store, path := newTestStore(t, time.Unix(1_700_000_000, 0))
-	body := `{"settings":{"interval":"10m","idle_threshold":"4m","watch_debounce":"5s","op_timeout":"2m","auth_ttl":"7m"}}`
+	body := `{"another_owner":{"schema_version":99}}`
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		t.Fatalf("mkdir config dir: %v", err)
 	}
@@ -298,8 +296,12 @@ func TestStateRejectsPreEpochSourceTruth(t *testing.T) {
 		t.Fatalf("seed state file: %v", err)
 	}
 
-	if _, err := store.Load(context.Background()); !errors.Is(err, ErrSchemaMismatch) {
-		t.Fatalf("Load legacy state = %v, want schema mismatch", err)
+	got, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load foreign state: %v", err)
+	}
+	if got.Settings != DefaultSettings() || got.Browsers == nil || got.Baselines == nil {
+		t.Fatalf("Load foreign state = %+v, want fresh defaults", got)
 	}
 }
 
