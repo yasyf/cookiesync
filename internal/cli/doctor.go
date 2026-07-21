@@ -151,11 +151,11 @@ func checkSocket(ctx context.Context) check {
 	defer cancel()
 	client := syncservice.NewClient(syncservice.Socket(sock))
 	defer func() { _ = client.Close() }()
-	caps, err := client.Capabilities(probeCtx)
+	_, err = client.Capabilities(probeCtx)
 	if err != nil {
 		return check{label: "helper socket", detail: fmt.Sprintf("not serving the typed contract at %s; run 'synckitd install' to start the resident helper (cookiesync helper-serve): %v", sock, err)}
 	}
-	return check{label: "helper socket", ok: true, detail: fmt.Sprintf("%s (svc protocol v%d)", sock, caps.ProtocolVersion)}
+	return check{label: "helper socket", ok: true, detail: fmt.Sprintf("%s (typed svc contract)", sock)}
 }
 
 // keyCacheStatus is the slice of the auth_status reply the key-cache check reads: the
