@@ -27,11 +27,18 @@ package daemon
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sync"
 	"time"
+
+	dkdaemon "github.com/yasyf/daemonkit/daemon"
+	"github.com/yasyf/daemonkit/daemonrole"
+	"github.com/yasyf/daemonkit/drain"
+	"github.com/yasyf/daemonkit/wire"
 
 	"github.com/yasyf/cookiesync/internal/auth"
 	"github.com/yasyf/cookiesync/internal/bridge"
@@ -98,6 +105,7 @@ type Daemon struct {
 	bridgeLock     *os.File
 	bridgeStop     chan struct{}
 	bridgeStopOnce sync.Once
+	bridgeWG       sync.WaitGroup
 }
 
 // Build wires the production daemon: Touch ID consent, the per-boot
@@ -201,6 +209,11 @@ func New(consent cookie.Consent, c Cache, eng *engine.Engine, probe Probe, runne
 // releases and serializes the Touch ID sheet.
 func (d *Daemon) Dispatcher() *synckit.Dispatcher {
 	dispatcher := synckit.NewDispatcher()
+	d.register(dispatcher)
+	return dispatcher
+}
+
+func (d *Daemon) register(dispatcher *synckit.Dispatcher) {
 	// The typed sync contract synckitd drives over the resident socket, served
 	// here so a cross-host svc.sync reuses the already-primed SE key.
 	syncservice.RegisterConsumer(dispatcher, newSyncConsumer(d.engine, d.state, d.registry))
@@ -223,51 +236,204 @@ func (d *Daemon) Dispatcher() *synckit.Dispatcher {
 	dispatcher.Register("bridge_status", d.handleBridgeStatus)
 	dispatcher.Register("bridge_close", d.handleBridgeClose)
 	dispatcher.Register("bridge_keepalive", d.handleBridgeKeepalive)
-	return dispatcher
 }
 
-// Serve runs the resident helper until ctx is canceled: it opens the resident
-// collaborators (the SE wrapper among them), binds the RPC socket, arms the
-// SIGUSR1 goroutine-dump listener, and answers the method set. On shutdown it
-// drops the per-boot Enclave key and evicts the cache, so a leaked wrapped blob
-// is unrecoverable off-box.
-func Serve(ctx context.Context) error {
-	d, closer, err := Build(ctx)
-	if err != nil {
-		return err
-	}
-	defer func() {
-		shutdownCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
-		defer cancel()
-		d.closeAllBridges(shutdownCtx)
-		if err := closer(shutdownCtx); err != nil {
-			fmt.Fprintf(os.Stderr, "cookiesync: drop Enclave key on shutdown: %v\n", err)
-		}
-	}()
+const helperRoleID = "com.github.yasyf.synckit.helper.cookiesync"
 
-	dir, err := paths.Dir()
-	if err != nil {
-		return err
-	}
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return fmt.Errorf("create config dir %s: %w", dir, err)
-	}
-	// SIGUSR1 → goroutine dump, so the next wedge is inspectable without a
-	// restart; registers only SIGUSR1, leaving TERM/INT handling untouched.
-	if err := debug.DumpOnSIGUSR1(ctx, filepath.Join(dir, "debug")); err != nil {
-		return err
-	}
+// Serve runs the resident helper as one exact daemonkit generation. The
+// Secure Enclave key, bridge owner, dispatcher, and readiness are constructed
+// only after listener takeover has established exclusive ownership.
+func Serve(ctx context.Context, build string) error {
 	sock, err := paths.SockPath()
 	if err != nil {
 		return err
 	}
-	ln, err := synckit.Listen(ctx, sock)
+	rolePath, err := helperRolePath()
 	if err != nil {
 		return err
 	}
-	defer func() { _ = ln.Close() }()
+	runtime, err := newHelperRuntime(sock, rolePath, build, Build)
+	if err != nil {
+		return err
+	}
+	err = runtime.Run(ctx)
+	if ctx.Err() != nil && onlyError(err, ctx.Err()) {
+		return nil
+	}
+	return err
+}
 
-	return synckit.NewServer(d.Dispatcher()).Serve(ctx, ln)
+func helperRolePath() (string, error) {
+	rolePath, err := exec.LookPath(paths.ToolName)
+	if err != nil {
+		return "", fmt.Errorf("resolve cookiesync helper role alias: %w", err)
+	}
+	rolePath, err = filepath.Abs(rolePath)
+	if err != nil {
+		return "", fmt.Errorf("resolve absolute cookiesync helper role alias: %w", err)
+	}
+	return filepath.Clean(rolePath), nil
+}
+
+type helperBuilder func(context.Context) (*Daemon, func(context.Context) error, error)
+
+func newHelperRuntime(sock, rolePath, build string, builder helperBuilder) (*dkdaemon.Runtime, error) {
+	dispatcher := synckit.NewDispatcher()
+	rpcServer, err := runtimeRPCServer(dispatcher, rolePath, build)
+	if err != nil {
+		return nil, err
+	}
+	peer := &wire.LifecyclePeer{Config: wire.ClientConfig{
+		Dial: wire.UnixDialer(sock), Build: synckit.Build, LifecycleBuild: build, MaxFrame: synckit.MaxFrame,
+	}}
+	owner := newHelperOwner()
+	sessionServer := &helperSessionServer{Server: rpcServer.Wire, owner: owner}
+	runtime, err := dkdaemon.NewRuntime(dkdaemon.RuntimeConfig{
+		Socket: sock, Build: build, Protocol: int(wire.ProtocolVersion),
+		Peer: peer, Contract: dkdaemon.RequestDaemon, WaitMode: dkdaemon.PIDExit,
+		Admission: &drain.Intake{}, Server: sessionServer,
+		Workers: owner, State: runtimeState{}, Resources: helperResources{peer: peer, owner: owner},
+		Activate: func(activation dkdaemon.Activation) error {
+			dir, err := paths.Dir()
+			if err != nil {
+				return err
+			}
+			if err := os.MkdirAll(dir, 0o700); err != nil {
+				return fmt.Errorf("create config dir %s: %w", dir, err)
+			}
+			if err := debug.DumpOnSIGUSR1(activation.Lifetime, filepath.Join(dir, "debug")); err != nil {
+				return err
+			}
+			d, closer, err := builder(activation.Startup)
+			if err != nil {
+				return err
+			}
+			owner.set(d, closer)
+			d.register(dispatcher)
+			return nil
+		},
+	})
+	if err != nil {
+		_ = peer.Close()
+		return nil, err
+	}
+	rpcServer.Wire.RegisterLifecycle(runtime)
+	return runtime, nil
+}
+
+func runtimeRPCServer(dispatcher *synckit.Dispatcher, rolePath, build string) (*synckit.Server, error) {
+	role := daemonrole.Classifier{RoleID: helperRoleID, RolePath: rolePath}
+	if err := role.Validate(); err != nil {
+		return nil, fmt.Errorf("validate cookiesync helper role: %w", err)
+	}
+	server := synckit.NewServer(dispatcher)
+	server.Wire.LifecycleBuild = build
+	server.Wire.ReservedProtectedSessions = 1
+	server.Wire.ProtectedSessionClassifier = role
+	return server, nil
+}
+
+type runtimeState struct{}
+
+func (runtimeState) Close() error { return nil }
+
+type helperOwner struct {
+	mu        sync.Mutex
+	daemon    *Daemon
+	closer    func(context.Context) error
+	closeOnce sync.Once
+	done      chan struct{}
+}
+
+func newHelperOwner() *helperOwner { return &helperOwner{done: make(chan struct{})} }
+
+func (o *helperOwner) set(d *Daemon, closer func(context.Context) error) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.daemon = d
+	o.closer = closer
+}
+
+func (o *helperOwner) Close() {
+	o.closeOnce.Do(func() {
+		go func() {
+			o.mu.Lock()
+			d := o.daemon
+			o.mu.Unlock()
+			if d != nil {
+				d.closeAllBridges(context.Background())
+			}
+			close(o.done)
+		}()
+	})
+}
+
+func (o *helperOwner) Cancel() { o.Close() }
+
+func (o *helperOwner) Wait(ctx context.Context) error {
+	select {
+	case <-o.done:
+		return nil
+	case <-ctx.Done():
+		<-o.done
+		return ctx.Err()
+	}
+}
+
+func (o *helperOwner) closeResources() error {
+	o.mu.Lock()
+	closer := o.closer
+	o.closer = nil
+	o.mu.Unlock()
+	if closer == nil {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	return closer(ctx)
+}
+
+type helperResources struct {
+	peer  *wire.LifecyclePeer
+	owner *helperOwner
+}
+
+func (r helperResources) Close() error {
+	return errors.Join(r.peer.Close(), r.owner.closeResources())
+}
+
+type helperSessionServer struct {
+	*wire.Server
+	owner *helperOwner
+}
+
+func (s *helperSessionServer) CloseIntake() error {
+	err := s.Server.CloseIntake()
+	s.owner.Close()
+	return err
+}
+
+func onlyError(err, target error) bool {
+	if err == nil || target == nil {
+		return false
+	}
+	type multiUnwrapper interface{ Unwrap() []error }
+	if joined, ok := err.(multiUnwrapper); ok {
+		children := joined.Unwrap()
+		if len(children) == 0 {
+			return false
+		}
+		for _, child := range children {
+			if !onlyError(child, target) {
+				return false
+			}
+		}
+		return true
+	}
+	if unwrapped := errors.Unwrap(err); unwrapped != nil {
+		return onlyError(unwrapped, target)
+	}
+	return errors.Is(err, target)
 }
 
 // endpointID is an endpoint's stable identity, host:browser:profile — the cache

@@ -369,10 +369,14 @@ func (d *Daemon) openBridge(ctx context.Context, requestor, endpoint, browser, p
 		return nil, errBridgeShutdown // defer unwinds proc+server+dir
 	}
 	d.bridges[capability] = sess
+	d.bridgeWG.Add(1)
 	d.bridgeMu.Unlock()
 	success = true
 
-	go d.watchBridge(sessionCtx, capability, server, sess.expiry)
+	go func() {
+		defer d.bridgeWG.Done()
+		d.watchBridge(sessionCtx, capability, server, sess.expiry)
+	}()
 
 	result := sess.OpenResult()
 	result["seed"] = buildSeedReport(counts, seeded)
@@ -481,11 +485,11 @@ func (d *Daemon) handleBridgeClose(_ context.Context, params map[string]any) (an
 	}, nil
 }
 
-// closeAllBridges stops the reaper and tears down every live session on
-// shutdown. Setting bridgeShutdown under the lock before the snapshot closes the
-// race with a fresh open: an open that registers after this returns instead sees
-// the flag and unwinds itself, so no session outlives shutdown. Sessions are
-// snapshotted under the lock and closed outside it, since teardown re-locks.
+// closeAllBridges stops the reaper, tears down every live session, and joins
+// every bridge watcher before returning. Setting bridgeShutdown under the lock
+// closes the race with a fresh open: an open that registers later unwinds, so no
+// session outlives shutdown. Sessions are snapshotted under the lock and closed
+// outside it, since teardown re-locks.
 func (d *Daemon) closeAllBridges(_ context.Context) {
 	d.bridgeStopOnce.Do(func() { close(d.bridgeStop) })
 	d.bridgeMu.Lock()
@@ -506,6 +510,7 @@ func (d *Daemon) closeAllBridges(_ context.Context) {
 		}(capability)
 	}
 	wg.Wait()
+	d.bridgeWG.Wait()
 	if d.bridgeLock != nil {
 		_ = d.bridgeLock.Close() // releases the daemon-ownership flock
 		d.bridgeLock = nil
@@ -514,7 +519,17 @@ func (d *Daemon) closeAllBridges(_ context.Context) {
 
 // startBridgeReaper launches the expiry reaper; it runs until closeAllBridges.
 func (d *Daemon) startBridgeReaper() {
-	go d.reapBridges()
+	d.bridgeMu.Lock()
+	if d.bridgeShutdown {
+		d.bridgeMu.Unlock()
+		return
+	}
+	d.bridgeWG.Add(1)
+	d.bridgeMu.Unlock()
+	go func() {
+		defer d.bridgeWG.Done()
+		d.reapBridges()
+	}()
 }
 
 func (d *Daemon) reapBridges() {

@@ -10,6 +10,7 @@ import (
 	"syscall"
 
 	"github.com/spf13/cobra"
+	"github.com/yasyf/daemonkit/version"
 
 	"github.com/yasyf/cookiesync/internal/tui"
 )
@@ -23,11 +24,11 @@ func (e statusError) Error() string { return "" }
 
 // Execute builds and runs the cookiesync root command under a context canceled on
 // SIGINT/SIGTERM, exiting non-zero on error.
-func Execute(version string) {
+func Execute(stampedVersion string) {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	root := newRoot(version)
+	root := newRoot(version.Running(stampedVersion))
 	err := root.ExecuteContext(ctx)
 	if err == nil {
 		return
@@ -65,7 +66,7 @@ func newRoot(version string) *cobra.Command {
 		newRequestorCmd(),
 		newRPCCmd(),
 		newRPCServeCmd(),
-		newHelperServeCmd(),
+		newHelperServeCmd(version),
 		newInstallCmd(),
 		newUninstallCmd(),
 		newDoctorCmd(),

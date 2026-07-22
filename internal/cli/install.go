@@ -22,13 +22,13 @@ import (
 // the Cookies DB to land as one change.
 const watchDebounce = 3 * time.Second
 
-func newHelperServeCmd() *cobra.Command {
+func newHelperServeCmd(build string) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "helper-serve",
 		Short: "Run the resident cookiesync helper: serve the SE key cache and Touch ID consent over the RPC socket.",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			return daemon.Serve(cmd.Context())
+			return daemon.Serve(cmd.Context(), build)
 		},
 	}
 	return cmd

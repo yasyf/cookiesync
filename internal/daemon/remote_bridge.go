@@ -148,15 +148,17 @@ func (s *proxyBridgeSession) Teardown() {
 	remoteBridgeClose(context.Background(), s.runner, s.host, s.capB)
 }
 
-// handleBridgeKeepalive holds a peer-side bridge alive: it blocks until the
-// origin's keepalive CLI socket closes (synckit cancels the dispatch ctx on that
-// close), then reaps the bridge the capability keys.
+// handleBridgeKeepalive holds a peer-side bridge until the origin disconnects
+// or runtime drain closes the bridge generation, then reaps its capability.
 func (d *Daemon) handleBridgeKeepalive(ctx context.Context, params map[string]any) (any, error) {
 	capability, err := stringParam(params, "capability")
 	if err != nil {
 		return nil, err
 	}
-	<-ctx.Done()
+	select {
+	case <-ctx.Done():
+	case <-d.bridgeStop:
+	}
 	d.teardownBridge(capability)
 	return map[string]any{"protocol_version": cookie.ProtocolVersion, "closed": true}, nil
 }
@@ -301,10 +303,14 @@ func (d *Daemon) tryRemoteBridgeOpen(ctx context.Context, self, host, browser, p
 		return nil, false, errBridgeShutdown // the defer unwinds forward, keepalive, dir, and the peer bridge
 	}
 	d.bridges[capA] = sess
+	d.bridgeWG.Add(1)
 	d.bridgeMu.Unlock()
 	success = true
 
-	go d.watchProxyBridge(sessionCtx, sess)
+	go func() {
+		defer d.bridgeWG.Done()
+		d.watchProxyBridge(sessionCtx, sess)
+	}()
 
 	out := sess.OpenResult()
 	out["seed"] = reply.Seed
