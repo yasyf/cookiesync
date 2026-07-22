@@ -66,7 +66,7 @@ func TestBridgeRecoveryReapsLeaderlessGroupBeforeReceiptAcknowledgement(t *testi
 	releaseLeader := filepath.Join(t.TempDir(), "release")
 	descendantFile := filepath.Join(t.TempDir(), "descendant")
 	script := fmt.Sprintf(
-		"while [ ! -f %s ]; do sleep 0.01; done; (trap '' TERM; while :; do sleep 1; done) & echo $! > %s; exit 0",
+		"while [ ! -f %s ]; do sleep 0.01; done; (trap '' TERM; exec sleep 30) & echo $! > %s; exit 0",
 		releaseLeader, descendantFile,
 	)
 	command := exec.Command("/bin/sh", "-c", script) //nolint:gosec // test-owned exact shell fixture.
@@ -136,7 +136,11 @@ func TestBridgeRecoveryReapsLeaderlessGroupBeforeReceiptAcknowledgement(t *testi
 	if len(page.Receipts) != 1 || page.Receipts[0].Record != record {
 		t.Fatalf("receipt before product settlement = %+v", page.Receipts)
 	}
-	metadataPath := filepath.Join(next.sessionDir(sessionID), string(bridgeProcessTunnel)+bridgeProcessSuffix)
+	metadataName, err := bridgeRecoveryFileName(bridgeProcessTunnel, record)
+	if err != nil {
+		t.Fatal(err)
+	}
+	metadataPath := filepath.Join(next.sessionDir(sessionID), metadataName)
 	if _, err := os.Stat(metadataPath); err != nil {
 		t.Fatalf("product liability disappeared before receipt ack: %v", err)
 	}
@@ -228,6 +232,52 @@ func TestBridgeRecordedFailsClosedWhenSessionParentSyncFails(t *testing.T) {
 	}
 	if len(records) != 0 {
 		t.Fatalf("rejected record remains tracked: %+v", records)
+	}
+}
+
+func TestBridgeRecoveryKeepsOneSidecarPerProcessAttempt(t *testing.T) {
+	t.Setenv(paths.ConfigDirEnv, t.TempDir())
+	processes, err := newBridgeProcessesGeneration("/bin/sh", "attempt-sidecar-generation")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		processes.Close()
+		processes.Cancel()
+		_ = processes.Wait(context.Background())
+	})
+	const sessionID = "multi-attempt-session"
+	for range 2 {
+		process, err := processes.pool.Start(t.Context(), supervise.ProcessSpec{
+			RecoveryClass: proc.RecoveryTask,
+			Path:          "/bin/sleep",
+			Args:          []string{"30"},
+			Recorded: processes.recorded(
+				bridgeProcessTunnel, sessionID, "you@desktop:chrome:Default", "you@desktop", "cap-b-secret",
+			),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := process.Stop(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	matches, err := filepath.Glob(filepath.Join(
+		processes.sessionDir(sessionID), string(bridgeProcessTunnel)+"-*"+bridgeProcessSuffix,
+	))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(matches) != 2 {
+		t.Fatalf("sidecars after two process attempts = %v, want two exact liabilities", matches)
+	}
+	metadata, err := processes.loadMetadata()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(metadata) != 2 || metadata[0].Record == metadata[1].Record {
+		t.Fatalf("recovery metadata = %+v, want two distinct process records", metadata)
 	}
 }
 

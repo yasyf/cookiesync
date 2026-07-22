@@ -3,6 +3,7 @@ package daemon
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -191,7 +192,11 @@ func (p *bridgeProcesses) writeMetadata(ctx context.Context, metadata bridgeReco
 	if err != nil {
 		return fmt.Errorf("bridge: encode recovery metadata: %w", err)
 	}
-	final := filepath.Join(dir, string(metadata.Kind)+bridgeProcessSuffix)
+	name, err := bridgeRecoveryFileName(metadata.Kind, metadata.Record)
+	if err != nil {
+		return err
+	}
+	final := filepath.Join(dir, name)
 	tmp := final + ".tmp"
 	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600) //nolint:gosec // fixed file below the private session root.
 	if err != nil {
@@ -314,13 +319,26 @@ func (p *bridgeProcesses) loadMetadata() ([]bridgeRecoveryMetadata, error) {
 		if err := item.validate(); err != nil {
 			return nil, fmt.Errorf("bridge: validate recovery metadata %s: %w", path, err)
 		}
-		if want := filepath.Join(p.sessionDir(item.SessionID), string(item.Kind)+bridgeProcessSuffix); path != want {
+		name, err := bridgeRecoveryFileName(item.Kind, item.Record)
+		if err != nil {
+			return nil, err
+		}
+		if want := filepath.Join(p.sessionDir(item.SessionID), name); path != want {
 			return nil, fmt.Errorf("bridge: recovery metadata path %s does not match payload", path)
 		}
 		item.path = path
 		items = append(items, item)
 	}
 	return items, nil
+}
+
+func bridgeRecoveryFileName(kind bridgeProcessKind, record proc.Record) (string, error) {
+	raw, err := json.Marshal(record)
+	if err != nil {
+		return "", fmt.Errorf("bridge: encode recovery record identity: %w", err)
+	}
+	digest := sha256.Sum256(raw)
+	return fmt.Sprintf("%s-%x%s", kind, digest, bridgeProcessSuffix), nil
 }
 
 func (p *bridgeProcesses) settleProduct(ctx context.Context, runner engine.SSHRunner, item bridgeRecoveryMetadata) {

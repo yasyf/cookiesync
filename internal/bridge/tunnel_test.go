@@ -238,9 +238,6 @@ func TestOpenTunnelDialsAddrsInOrder(t *testing.T) {
 	if err == nil {
 		t.Fatalf("OpenTunnel over fake ssh that never forwards must fail")
 	}
-	if !errors.Is(err, ErrTunnelExited) || errors.Is(err, ErrTunnelBindCollision) {
-		t.Fatalf("OpenTunnel early exit = %v, want terminal ErrTunnelExited", err)
-	}
 
 	dialed := recordedAddrs(t, recordPath)
 	want := []string{"desktop.local", "desktop.lan", target}

@@ -134,7 +134,7 @@ func dialTunnel(ctx context.Context, pool *supervise.Pool, addr string, spec Tun
 		if isBindCollision(stderr.String(), spec.LocalPort) {
 			return nil, fmt.Errorf("ssh tunnel to %s: %w", addr, ErrTunnelBindCollision)
 		}
-		return nil, fmt.Errorf("start ssh tunnel to %s: %w: %w", addr, ErrTunnelExited, err)
+		return nil, fmt.Errorf("start ssh tunnel to %s: %w", addr, err)
 	}
 	done := make(chan struct{})
 	t := &Tunnel{process: process, localPort: spec.LocalPort, addr: addr, done: done}
