@@ -1,31 +1,22 @@
 package daemon
 
 import (
-	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net"
 	"os"
-	"os/exec"
-	"path/filepath"
 	"strconv"
-	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/yasyf/cookiesync/internal/auth"
 	"github.com/yasyf/cookiesync/internal/bridge"
 	"github.com/yasyf/cookiesync/internal/cookie"
-	"github.com/yasyf/cookiesync/internal/engine"
 	"github.com/yasyf/cookiesync/internal/mesh"
-	"github.com/yasyf/cookiesync/internal/paths"
 )
 
 const (
@@ -33,13 +24,6 @@ const (
 	bridgeReapInterval = 30 * time.Second
 	// bridgeSeedTimeout bounds the one-shot CDP seeding phase.
 	bridgeSeedTimeout = 90 * time.Second
-	// bridgeSubdir is the per-session workspace root under the config dir.
-	bridgeSubdir = "bridge"
-	// bridgeRecordFile is the orphan-sweep record inside a session dir.
-	bridgeRecordFile = "session.json"
-	// bridgeLockName is the daemon-ownership flock under bridgeSubdir; the sole
-	// live daemon holds it, so a successor's sweep never reaps a sibling's bridges.
-	bridgeLockName = "daemon.lock"
 )
 
 // errBridgeShutdown fails a fresh open that races closeAllBridges: rather than
@@ -64,52 +48,20 @@ type session interface {
 // identity, the capability that proves possession, the browser and WS relay,
 // and the detached cancel that unwinds it.
 type bridgeSession struct {
-	sessionID  string
-	token      string
-	capability string
-	endpoint   string
-	browser    string
-	profile    string
-	wsURL      string
-	proxyPort  int // loopback port an ssh -L forwards; 0 (absent) on a local open
-	expiry     time.Time
-	proc       *bridge.Proc
-	server     *bridge.Server
-	cancel     context.CancelFunc
-	dataDir    string
-}
-
-// bridgeRecordKind distinguishes the two crash-durable record shapes the orphan
-// sweep reaps: a local Chrome, or a proxy fronting a peer's bridge over ssh -L.
-type bridgeRecordKind string
-
-const (
-	bridgeRecordLocal bridgeRecordKind = "local"
-	bridgeRecordProxy bridgeRecordKind = "proxy"
-)
-
-// bridgeRecord is the on-disk record the orphan sweep reaps by: the process group
-// to kill (PID == pgid via Setpgid), the dir to remove, and the launch-time
-// identity (Start, Comm) the sweep re-matches so pid reuse is never killed. A
-// Proxy record also carries the peer Host and Capability the sweep remote-closes
-// B by, so an origin crash never strands B's logged-in Chrome until its TTL.
-type bridgeRecord struct {
-	ProtocolVersion uint64           `json:"protocol_version"`
-	Kind            bridgeRecordKind `json:"kind"`
-	PID             int              `json:"pid"`
-	Endpoint        string           `json:"endpoint"`
-	DataDir         string           `json:"data_dir"`
-	Start           string           `json:"start"`
-	Comm            string           `json:"comm"`
-	Host            string           `json:"host,omitempty"`
-	Capability      string           `json:"capability,omitempty"`
-}
-
-// procIdentity pins a live process by its launch time and executable, the pair
-// the orphan sweep re-checks so a recycled pid is never group-killed.
-type procIdentity struct {
-	start string
-	comm  string
+	sessionID    string
+	token        string
+	capability   string
+	endpoint     string
+	browser      string
+	profile      string
+	wsURL        string
+	proxyPort    int // loopback port an ssh -L forwards; 0 (absent) on a local open
+	expiry       time.Time
+	proc         *bridge.Proc
+	server       *bridge.Server
+	cancel       context.CancelFunc
+	dataDir      string
+	releaseSlots func()
 }
 
 // Capability is the secret that proves possession of this session.
@@ -171,6 +123,7 @@ func (s *bridgeSession) Teardown() {
 	s.cancel()
 	_ = s.server.Close()
 	_ = s.proc.Close()
+	s.releaseSlots()
 }
 
 // handleBridgeOpen launches a cookie-seeded CDP bridge and registers its
@@ -248,6 +201,19 @@ func (d *Daemon) reattachBridge(capability, endpoint string) (any, bool) {
 // launch, CDP seed, and WS relay. A deferred cleanup installed before launch
 // tears down a half-open browser on any failure.
 func (d *Daemon) openBridge(ctx context.Context, requestor, endpoint, browser, profile string, browserObj cookie.Browser, headed bool, origin, advertise string) (any, error) {
+	if d.processes == nil {
+		return nil, errors.New("bridge: managed process owner is unavailable")
+	}
+	if err := d.bridgeSlots.Acquire(ctx, 1); err != nil {
+		return nil, fmt.Errorf("bridge: reserve process slot: %w", err)
+	}
+	releaseSlots := func() { d.bridgeSlots.Release(1) }
+	keepSlots := false
+	defer func() {
+		if !keepSlots {
+			releaseSlots()
+		}
+	}()
 	st, err := d.state.Load(ctx)
 	if err != nil {
 		return nil, err
@@ -273,16 +239,12 @@ func (d *Daemon) openBridge(ctx context.Context, requestor, endpoint, browser, p
 		return nil, fmt.Errorf("resolve chrome: %w", err)
 	}
 
-	dir, err := paths.Dir()
-	if err != nil {
-		return nil, err
-	}
 	sessionID, err := mintID()
 	if err != nil {
 		return nil, err
 	}
-	dataDir := filepath.Join(dir, bridgeSubdir, sessionID)
-	if err := os.MkdirAll(dataDir, 0o700); err != nil {
+	dataDir, err := d.processes.prepareSessionDir(sessionID)
+	if err != nil {
 		return nil, fmt.Errorf("create bridge data dir: %w", err)
 	}
 
@@ -301,20 +263,19 @@ func (d *Daemon) openBridge(ctx context.Context, requestor, endpoint, browser, p
 			_ = server.Close()
 		}
 		if proc != nil {
-			_ = proc.Close() // group-kills chrome and removes dataDir
+			_ = proc.Close()
 			return
 		}
 		_ = os.RemoveAll(dataDir)
 	}()
 
-	proc, err = bridge.Launch(sessionCtx, bridge.LaunchSpec{HostBinary: hostBin, DataDir: dataDir, Headed: headed})
+	proc, err = bridge.Launch(sessionCtx, d.processes.pool, bridge.LaunchSpec{
+		HostBinary: hostBin, RolePath: d.processes.rolePath, DataDir: dataDir, Headed: headed,
+		RoleArgs: d.processes.roleArgs,
+		Recorded: d.processes.recorded(bridgeProcessChrome, sessionID, endpoint, "", ""),
+	})
 	if err != nil {
 		return nil, fmt.Errorf("launch bridge: %w", err)
-	}
-	// Record before any seeding so a crash mid-flow still leaves a sweepable,
-	// identity-verified record of a fully-launched (soon logged-in) Chrome.
-	if err := writeBridgeRecord(ctx, dataDir, proc.Pid(), endpoint); err != nil {
-		return nil, err
 	}
 	// Seeding is bounded on the RPC ctx, not the session's long-lived context.
 	seeded, err := d.seedBridge(ctx, proc, storage)
@@ -348,19 +309,20 @@ func (d *Daemon) openBridge(ctx context.Context, requestor, endpoint, browser, p
 	}
 
 	sess := &bridgeSession{
-		sessionID:  sessionID,
-		token:      token,
-		capability: capability,
-		endpoint:   endpoint,
-		browser:    browser,
-		profile:    profile,
-		wsURL:      server.URL(),
-		proxyPort:  proxyPort,
-		expiry:     time.Now().Add(ttl),
-		proc:       proc,
-		server:     server,
-		cancel:     cancel,
-		dataDir:    dataDir,
+		sessionID:    sessionID,
+		token:        token,
+		capability:   capability,
+		endpoint:     endpoint,
+		browser:      browser,
+		profile:      profile,
+		wsURL:        server.URL(),
+		proxyPort:    proxyPort,
+		expiry:       time.Now().Add(ttl),
+		proc:         proc,
+		server:       server,
+		cancel:       cancel,
+		dataDir:      dataDir,
+		releaseSlots: releaseSlots,
 	}
 
 	d.bridgeMu.Lock()
@@ -372,6 +334,7 @@ func (d *Daemon) openBridge(ctx context.Context, requestor, endpoint, browser, p
 	d.bridgeWG.Add(1)
 	d.bridgeMu.Unlock()
 	success = true
+	keepSlots = true
 
 	go func() {
 		defer d.bridgeWG.Done()
@@ -511,10 +474,6 @@ func (d *Daemon) closeAllBridges(_ context.Context) {
 	}
 	wg.Wait()
 	d.bridgeWG.Wait()
-	if d.bridgeLock != nil {
-		_ = d.bridgeLock.Close() // releases the daemon-ownership flock
-		d.bridgeLock = nil
-	}
 }
 
 // startBridgeReaper launches the expiry reaper; it runs until closeAllBridges.
@@ -560,103 +519,6 @@ func (d *Daemon) reapExpiredBridges() {
 	}
 }
 
-// sweepOrphanBridges reaps sessions a crashed daemon left running. Its caller
-// gates it behind the daemon-ownership flock, so no live sibling daemon owns
-// these records — every one is a genuine orphan.
-func (d *Daemon) sweepOrphanBridges(ctx context.Context) error {
-	dir, err := paths.Dir()
-	if err != nil {
-		return err
-	}
-	matches, err := filepath.Glob(filepath.Join(dir, bridgeSubdir, "*", bridgeRecordFile))
-	if err != nil {
-		return fmt.Errorf("scan orphan bridges: %w", err)
-	}
-	for _, path := range matches {
-		reapOrphanBridge(ctx, d.runner, path)
-	}
-	return nil
-}
-
-// reapOrphanBridge group-kills a recorded bridge's process group only when the
-// live pid still matches the launch-time identity — a recycled pid now belongs to
-// some unrelated process and must not be killed — best-effort remote-closes a
-// proxy record's peer bridge, then always removes the session dir.
-func reapOrphanBridge(ctx context.Context, runner engine.SSHRunner, recordPath string) {
-	sessionDir := filepath.Dir(recordPath)
-	raw, err := os.ReadFile(recordPath) //nolint:gosec // G304: recordPath is a glob match under our own 0700 config dir.
-	if err != nil {
-		_ = os.RemoveAll(sessionDir)
-		return
-	}
-	var rec bridgeRecord
-	decoder := json.NewDecoder(bytes.NewReader(raw))
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(&rec); err != nil || rec.ProtocolVersion != cookie.ProtocolVersion || rec.PID <= 0 {
-		_ = os.RemoveAll(sessionDir)
-		return
-	}
-	if err := decoder.Decode(&struct{}{}); err != io.EOF {
-		_ = os.RemoveAll(sessionDir)
-		return
-	}
-	if id, ok, err := probeProcess(ctx, rec.PID); err == nil && ok && id.start == rec.Start && id.comm == rec.Comm {
-		_ = syscall.Kill(-rec.PID, syscall.SIGKILL)
-	}
-	if rec.Kind == bridgeRecordProxy {
-		remoteBridgeClose(ctx, runner, rec.Host, rec.Capability)
-	}
-	_ = os.RemoveAll(sessionDir)
-}
-
-// probeProcess reads a pid's start time and executable via ps. A dead pid yields
-// ok=false with no error; lstart is the leading five whitespace fields
-// ("Mon Jul 14 10:23:45 2026"), comm the executable path (the remainder).
-func probeProcess(ctx context.Context, pid int) (procIdentity, bool, error) {
-	out, err := exec.CommandContext(ctx, "ps", "-o", "lstart=", "-o", "comm=", "-p", strconv.Itoa(pid)).Output() //nolint:gosec // G204: a fixed ps invocation with a numeric pid, no shell, no tainted input.
-	if err != nil {
-		var exit *exec.ExitError
-		if errors.As(err, &exit) {
-			return procIdentity{}, false, nil // ps exits non-zero for an absent pid
-		}
-		return procIdentity{}, false, fmt.Errorf("probe process %d: %w", pid, err)
-	}
-	fields := strings.Fields(string(out))
-	if len(fields) < 6 {
-		return procIdentity{}, false, fmt.Errorf("probe process %d: unexpected ps output %q", pid, out)
-	}
-	return procIdentity{start: strings.Join(fields[:5], " "), comm: strings.Join(fields[5:], " ")}, true, nil
-}
-
-// acquireBridgeOwnership takes the exclusive daemon-ownership flock so only the
-// sole live daemon sweeps orphans. The lock is advisory and auto-released when
-// this process dies (a SIGKILL'd owner frees it for its successor); its fd is
-// O_CLOEXEC (Go's default), so an exec'd Chrome never inherits it and keeps it
-// held past the daemon's death. A held lock (a live sibling) yields owned=false.
-func (d *Daemon) acquireBridgeOwnership() (bool, error) {
-	dir, err := paths.Dir()
-	if err != nil {
-		return false, err
-	}
-	lockDir := filepath.Join(dir, bridgeSubdir)
-	if err := os.MkdirAll(lockDir, 0o700); err != nil {
-		return false, fmt.Errorf("create bridge dir: %w", err)
-	}
-	f, err := os.OpenFile(filepath.Join(lockDir, bridgeLockName), os.O_CREATE|os.O_RDWR, 0o600) //nolint:gosec // G304: bridgeLockName is a fixed name under our own 0700 config dir.
-	if err != nil {
-		return false, fmt.Errorf("open bridge ownership lock: %w", err)
-	}
-	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
-		_ = f.Close()
-		if errors.Is(err, syscall.EWOULDBLOCK) {
-			return false, nil
-		}
-		return false, fmt.Errorf("lock bridge ownership: %w", err)
-	}
-	d.bridgeLock = f
-	return true, nil
-}
-
 // resolveBridgeProfile validates profile against the browser's real profiles,
 // rejecting anything not present — which also blocks path traversal.
 func resolveBridgeProfile(browser cookie.Browser, profile string) (string, error) {
@@ -670,51 +532,6 @@ func resolveBridgeProfile(browser cookie.Browser, profile string) (string, error
 		}
 	}
 	return "", fmt.Errorf("unknown profile %q for browser %s", profile, browser.Name)
-}
-
-// writeBridgeRecord persists the crash-durability record, capturing the freshly
-// launched pid's identity so the sweep can distinguish it from a recycled pid.
-func writeBridgeRecord(ctx context.Context, dataDir string, pid int, endpoint string) error {
-	return writeRecord(ctx, dataDir, bridgeRecord{Kind: bridgeRecordLocal, PID: pid, Endpoint: endpoint, DataDir: dataDir})
-}
-
-// writeProxyBridgeRecord persists a cross-host bridge's forward: the ssh child pid
-// plus the peer host and capability the sweep remote-closes B by.
-func writeProxyBridgeRecord(ctx context.Context, dataDir string, pid int, endpoint, host, capability string) error {
-	return writeRecord(ctx, dataDir, bridgeRecord{
-		Kind: bridgeRecordProxy, PID: pid, Endpoint: endpoint, DataDir: dataDir, Host: host, Capability: capability,
-	})
-}
-
-// writeRecord probes the live pid for its launch-time identity and persists the
-// crash-durable record the orphan sweep reaps by.
-func writeRecord(ctx context.Context, dataDir string, rec bridgeRecord) error {
-	// Bound the ps probe so a wedged ps can't stretch the spawn→record window.
-	pctx, cancel := context.WithTimeout(ctx, 2*time.Second)
-	defer cancel()
-	id, ok, err := probeProcess(pctx, rec.PID)
-	if err != nil {
-		return fmt.Errorf("probe bridge process: %w", err)
-	}
-	if !ok {
-		return fmt.Errorf("bridge process %d exited before it could be recorded", rec.PID)
-	}
-	rec.ProtocolVersion, rec.Start, rec.Comm = cookie.ProtocolVersion, id.start, id.comm
-	raw, err := json.Marshal(rec)
-	if err != nil {
-		return fmt.Errorf("marshal bridge record: %w", err)
-	}
-	// Write-then-rename so a crash (or a re-dial overwrite) never leaves a partial
-	// record the sweep discards while its process leaks.
-	final := filepath.Join(dataDir, bridgeRecordFile)
-	tmp := final + ".tmp"
-	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
-		return fmt.Errorf("write bridge record: %w", err)
-	}
-	if err := os.Rename(tmp, final); err != nil {
-		return fmt.Errorf("commit bridge record: %w", err)
-	}
-	return nil
 }
 
 // mintSecret returns a 24-byte base64url secret for a token or capability.

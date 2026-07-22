@@ -36,7 +36,7 @@ func TestBridgeSeedAndServe(t *testing.T) {
 	defer cancel()
 
 	dataDir := t.TempDir()
-	proc, err := Launch(ctx, LaunchSpec{HostBinary: bin, DataDir: dataDir, Headed: false})
+	proc, err := launchTestChrome(ctx, t, bin, dataDir, false)
 	if err != nil {
 		t.Fatalf("Launch: %v", err)
 	}
@@ -189,7 +189,7 @@ func TestBridgeSeedCookieOnlySolePage(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
-	proc, err := Launch(ctx, LaunchSpec{HostBinary: bin, DataDir: t.TempDir(), Headed: false})
+	proc, err := launchTestChrome(ctx, t, bin, t.TempDir(), false)
 	if err != nil {
 		t.Fatalf("Launch: %v", err)
 	}

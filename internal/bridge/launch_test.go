@@ -20,7 +20,7 @@ func TestLaunch(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	proc, err := Launch(ctx, LaunchSpec{HostBinary: bin, DataDir: t.TempDir(), Headed: false})
+	proc, err := launchTestChrome(ctx, t, bin, t.TempDir(), false)
 	if err != nil {
 		t.Fatalf("Launch: %v", err)
 	}

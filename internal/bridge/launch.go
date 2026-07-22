@@ -12,12 +12,15 @@ import (
 	"crypto/rand"
 	"errors"
 	"fmt"
+	"net"
 	"os"
-	"os/exec"
+	"strconv"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"time"
+
+	"github.com/yasyf/daemonkit/proc"
+	"github.com/yasyf/daemonkit/supervise"
 )
 
 const chromeHostBinary = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
@@ -29,8 +32,11 @@ const maxStderrBytes = 64 << 10
 // LaunchSpec configures a throwaway debuggable Chrome instance.
 type LaunchSpec struct {
 	HostBinary string // resolved Google Chrome executable path
+	RolePath   string // stable cookiesync role path hosting the fd adapter
+	RoleArgs   []string
 	DataDir    string // private 0700 throwaway --user-data-dir (caller-owned)
 	Headed     bool   // default true for fidelity; false => --headless=new
+	Recorded   func(context.Context, proc.Record) error
 }
 
 // Proc is a running Chrome child whose SOLE CDP transport is the inherited
@@ -38,10 +44,8 @@ type LaunchSpec struct {
 // both seeding (Conn) and the later WS relay (Server) multiplex over this one
 // pipe.
 type Proc struct {
-	cmd    *exec.Cmd
-	cancel context.CancelFunc
-	wpipe  *os.File // parent write end -> child fd 3 (CDP requests)
-	rpipe  *os.File // parent read end  <- child fd 4 (CDP responses/events)
+	process   *supervise.SessionProcess
+	transport net.Conn
 
 	dataDir     string
 	browserUUID string
@@ -61,89 +65,39 @@ type Proc struct {
 
 // Launch starts Chrome with --remote-debugging-pipe on an isolated
 // user-data-dir and completes the pipe handshake.
-func Launch(ctx context.Context, spec LaunchSpec) (*Proc, error) {
-	cmdRead, cmdWrite, err := os.Pipe()
-	if err != nil {
-		return nil, fmt.Errorf("cdp command pipe: %w", err)
-	}
-	evtRead, evtWrite, err := os.Pipe()
-	if err != nil {
-		_ = cmdRead.Close()
-		_ = cmdWrite.Close()
-		return nil, fmt.Errorf("cdp event pipe: %w", err)
-	}
-
-	runCtx, cancel := context.WithCancel(ctx)
-
-	args := []string{
-		"--remote-debugging-pipe",
-		"--user-data-dir=" + spec.DataDir,
-		"--no-first-run",
-		"--no-default-browser-check",
-		"--no-startup-window",
-		"--disable-background-networking",
-		"--disable-sync",
-		"--disable-component-update",
-	}
-	if !spec.Headed {
-		args = append(args, "--headless=new")
-	}
-
-	cmd := exec.CommandContext(runCtx, spec.HostBinary, args...) //nolint:gosec // G204: HostBinary is a fixed local path resolved by ResolveHostBinary, not untrusted input.
-	// ExtraFiles[0] becomes child fd 3 (Chrome reads CDP requests there);
-	// ExtraFiles[1] becomes child fd 4 (Chrome writes responses/events there).
-	cmd.ExtraFiles = []*os.File{cmdRead, evtWrite}
+func Launch(ctx context.Context, pool *supervise.Pool, spec LaunchSpec) (*Proc, error) {
 	stderr := &lockedBuffer{}
-	cmd.Stderr = stderr
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	cmd.Cancel = func() error {
-		err := syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
-		if errors.Is(err, syscall.ESRCH) {
-			return os.ErrProcessDone
-		}
-		return err
-	}
-	cmd.WaitDelay = 5 * time.Second
-
-	if err := cmd.Start(); err != nil {
-		cancel()
-		_ = cmdRead.Close()
-		_ = cmdWrite.Close()
-		_ = evtRead.Close()
-		_ = evtWrite.Close()
-		return nil, fmt.Errorf("start chrome: %w", err)
-	}
-	// The child holds fd 3/fd 4 now; the parent keeps only its own ends.
-	_ = cmdRead.Close()
-	_ = evtWrite.Close()
-
 	uuid, err := newBrowserUUID()
 	if err != nil {
-		cancel()
-		_ = cmd.Wait()
-		_ = cmdWrite.Close()
-		_ = evtRead.Close()
 		return nil, err
 	}
-
 	p := &Proc{
-		cmd:         cmd,
-		cancel:      cancel,
-		wpipe:       cmdWrite,
-		rpipe:       evtRead,
 		dataDir:     spec.DataDir,
 		browserUUID: uuid,
 		pending:     make(map[int64]chan cdpMessage),
 		stderr:      stderr,
 	}
-	go p.readLoop()
-
-	hctx, hcancel := context.WithTimeout(ctx, 30*time.Second)
-	defer hcancel()
-	if _, err := (&Conn{proc: p}).Call(hctx, "", "Browser.getVersion", nil); err != nil {
-		_ = p.Close()
-		return nil, fmt.Errorf("cdp handshake (chrome stderr: %q): %w", stderr.String(), err)
+	session, err := pool.StartSession(ctx, supervise.SessionProcessSpec{
+		RecoveryClass: proc.RecoveryTask,
+		Path:          spec.RolePath,
+		Args: append(append([]string{}, spec.RoleArgs...),
+			"_bridge-chrome-child", spec.HostBinary, spec.DataDir, strconv.FormatBool(spec.Headed)),
+		Stderr:           stderr,
+		Recorded:         spec.Recorded,
+		ReadinessTimeout: 30 * time.Second,
+		Ready: func(readyCtx context.Context, _ proc.Record, conn net.Conn) error {
+			p.transport = conn
+			go p.readLoop()
+			if _, err := (&Conn{proc: p}).Call(readyCtx, "", "Browser.getVersion", nil); err != nil {
+				return fmt.Errorf("cdp handshake (chrome stderr: %q): %w", stderr.String(), err)
+			}
+			return nil
+		},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("start chrome session: %w", err)
 	}
+	p.process = session
 	return p, nil
 }
 
@@ -153,20 +107,15 @@ func (p *Proc) BrowserUUID() string {
 	return p.browserUUID
 }
 
-// Pid returns the Chrome child's process id, for the daemon's orphan sweep.
+// Pid returns the exact daemonkit-managed Chrome process id.
 func (p *Proc) Pid() int {
-	return p.cmd.Process.Pid
+	return p.process.Record().PID
 }
 
-// Close group-SIGKILLs the Chrome process tree and removes the data dir. It is
-// idempotent.
+// Close settles the managed Chrome process and removes the data dir.
 func (p *Proc) Close() error {
 	p.closeOnce.Do(func() {
-		p.cancel()
-		_ = p.cmd.Wait() // the group was killed; the resulting wait error is expected
-		_ = p.wpipe.Close()
-		_ = p.rpipe.Close()
-		p.closeErr = os.RemoveAll(p.dataDir)
+		p.closeErr = errors.Join(p.process.Stop(context.Background()), os.RemoveAll(p.dataDir))
 	})
 	return p.closeErr
 }

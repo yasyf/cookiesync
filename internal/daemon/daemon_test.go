@@ -179,7 +179,7 @@ func TestBuildNoEnclaveStaysFatal(t *testing.T) {
 	t.Setenv(authkit.HelperEnvVar, binary)
 	fakeMesh(t, "me@laptop")
 
-	d, closer, err := Build(context.Background())
+	d, closer, err := buildDaemon(context.Background())
 	if err == nil || !strings.Contains(err.Error(), "cache-newkey exited 2") || !strings.Contains(err.Error(), "OSStatus -34018") {
 		t.Fatalf("Build = %v, want the fatal exit-2 error carrying the helper stderr", err)
 	}

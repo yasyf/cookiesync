@@ -40,3 +40,26 @@ func TestConfigDirOverrideReachesStateConfig(t *testing.T) {
 		t.Fatalf("Config.Dir() with override unset = %q, want XDG path %q", fallback, want)
 	}
 }
+
+func TestBridgeRecoveryPathsAreExactUnderConfig(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "cookiesync")
+	t.Setenv(ConfigDirEnv, root)
+
+	recovery, err := BridgeRecoveryRoot()
+	if err != nil {
+		t.Fatalf("BridgeRecoveryRoot: %v", err)
+	}
+	store, err := BridgeProcessStorePath()
+	if err != nil {
+		t.Fatalf("BridgeProcessStorePath: %v", err)
+	}
+	sessions, err := BridgeSessionsRoot()
+	if err != nil {
+		t.Fatalf("BridgeSessionsRoot: %v", err)
+	}
+	if recovery != filepath.Join(root, "bridge") ||
+		store != filepath.Join(root, "bridge", "processes.db") ||
+		sessions != filepath.Join(root, "bridge", "sessions") {
+		t.Fatalf("bridge paths = recovery %q store %q sessions %q", recovery, store, sessions)
+	}
+}

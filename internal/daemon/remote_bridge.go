@@ -10,14 +10,12 @@ import (
 	"net"
 	"net/url"
 	"os"
-	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/yasyf/cookiesync/internal/bridge"
 	"github.com/yasyf/cookiesync/internal/cookie"
 	"github.com/yasyf/cookiesync/internal/engine"
-	"github.com/yasyf/cookiesync/internal/paths"
 	"github.com/yasyf/synckit/hostregistry"
 	synckit "github.com/yasyf/synckit/rpc"
 )
@@ -71,21 +69,22 @@ type remoteBridgeReply struct {
 // ssh -L forward, the keepalive supervisor, and the peer capability it tears the
 // bridge down by. It holds no local Chrome or relay.
 type proxyBridgeSession struct {
-	sessionID string
-	capA      string
-	capB      string
-	host      string
-	endpoint  string
-	browser   string
-	profile   string
-	wsURL     string
-	proxyPort int
-	expiry    time.Time
-	tunnel    bridgeTunnel
-	keepalive bridgeKeepalive
-	cancel    context.CancelFunc
-	dataDir   string
-	runner    engine.SSHRunner
+	sessionID    string
+	capA         string
+	capB         string
+	host         string
+	endpoint     string
+	browser      string
+	profile      string
+	wsURL        string
+	proxyPort    int
+	expiry       time.Time
+	tunnel       bridgeTunnel
+	keepalive    bridgeKeepalive
+	cancel       context.CancelFunc
+	dataDir      string
+	runner       engine.SSHRunner
+	releaseSlots func()
 }
 
 // Capability is the origin-minted secret that proves possession of this proxy.
@@ -138,7 +137,7 @@ func (s *proxyBridgeSession) StatusResult() map[string]any {
 	}
 }
 
-// Teardown group-kills the forward and keepalive, removes the crash record, and
+// Teardown settles the forward and keepalive, removes derived state, and
 // best-effort closes the peer's bridge.
 func (s *proxyBridgeSession) Teardown() {
 	s.cancel()
@@ -146,6 +145,7 @@ func (s *proxyBridgeSession) Teardown() {
 	_ = s.keepalive.Close()
 	_ = os.RemoveAll(s.dataDir)
 	remoteBridgeClose(context.Background(), s.runner, s.host, s.capB)
+	s.releaseSlots()
 }
 
 // handleBridgeKeepalive holds a peer-side bridge until the origin disconnects
@@ -169,10 +169,24 @@ func (d *Daemon) handleBridgeKeepalive(ctx context.Context, params map[string]an
 // to the peer's loopback, proves it up, and registers a proxy session. A lost
 // port-bind race re-opens on a fresh port, bounded by remoteBridgeOpenAttempts.
 func (d *Daemon) remoteBridgeOpen(ctx context.Context, self, host, browser, profile string, headed bool) (any, error) {
+	if d.processes == nil {
+		return nil, errors.New("bridge: managed process owner is unavailable")
+	}
+	if err := d.bridgeSlots.Acquire(ctx, 2); err != nil {
+		return nil, fmt.Errorf("bridge: reserve proxy process slots: %w", err)
+	}
+	releaseSlots := func() { d.bridgeSlots.Release(2) }
+	keepSlots := false
+	defer func() {
+		if !keepSlots {
+			releaseSlots()
+		}
+	}()
 	var lastErr error
 	for attempt := 0; attempt < remoteBridgeOpenAttempts; attempt++ {
-		result, retry, err := d.tryRemoteBridgeOpen(ctx, self, host, browser, profile, headed)
+		result, retry, err := d.tryRemoteBridgeOpen(ctx, self, host, browser, profile, headed, releaseSlots)
 		if err == nil {
+			keepSlots = true
 			return result, nil
 		}
 		lastErr = err
@@ -186,7 +200,7 @@ func (d *Daemon) remoteBridgeOpen(ctx context.Context, self, host, browser, prof
 // tryRemoteBridgeOpen runs one cross-host open attempt. retry reports a
 // port-collision the caller re-opens around; any other failure is terminal. Every
 // failure past the peer open best-effort closes the peer's bridge before returning.
-func (d *Daemon) tryRemoteBridgeOpen(ctx context.Context, self, host, browser, profile string, headed bool) (result any, retry bool, err error) {
+func (d *Daemon) tryRemoteBridgeOpen(ctx context.Context, self, host, browser, profile string, headed bool, releaseSlots func()) (result any, retry bool, err error) {
 	// Reserve a loopback port and hold it until the peer's bridge is open, so
 	// nothing else grabs it between the advertise and the forward binding it.
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -243,34 +257,28 @@ func (d *Daemon) tryRemoteBridgeOpen(ctx context.Context, self, host, browser, p
 		remoteBridgeClose(ctx, d.runner, host, reply.Capability)
 	}()
 
-	// The workspace exists before the forward so onSpawn records the ssh child
-	// before prove-up, leaving no unrecorded-tunnel crash window.
-	dir, err := paths.Dir()
-	if err != nil {
-		return nil, false, err
-	}
+	// The workspace exists before daemonkit records and releases the forward.
 	sessionID, err := mintID()
 	if err != nil {
 		return nil, false, err
 	}
-	dataDir = filepath.Join(dir, bridgeSubdir, sessionID)
-	if err := os.MkdirAll(dataDir, 0o700); err != nil {
+	dataDir, err = d.processes.prepareSessionDir(sessionID)
+	if err != nil {
 		return nil, false, fmt.Errorf("create proxy bridge dir: %w", err)
-	}
-	// onSpawn carries the peer host + capability the orphan sweep remote-closes B by.
-	onSpawn := func(pid int) error {
-		return writeProxyBridgeRecord(ctx, dataDir, pid, reply.Endpoint, host, reply.Capability)
 	}
 	tunnel, err = d.openTunnel(sessionCtx, bridge.TunnelSpec{
 		Host: host, LocalPort: port, RemotePort: reply.ProxyPort, Token: token, WantWSURL: reply.URL,
-	}, onSpawn)
+	}, d.processes.recorded(bridgeProcessTunnel, sessionID, reply.Endpoint, host, reply.Capability))
 	if err != nil {
 		// Only a local-bind collision re-opens; every other ssh exit is terminal,
 		// never re-tapping the peer's consent.
 		return nil, errors.Is(err, bridge.ErrTunnelBindCollision), fmt.Errorf("forward to %s bridge: %w", host, err)
 	}
 
-	keepalive, err = d.openKeepalive(sessionCtx, tunnel.HostAddr(), reply.Capability)
+	keepalive, err = d.openKeepalive(
+		sessionCtx, tunnel.HostAddr(), reply.Capability,
+		d.processes.recorded(bridgeProcessKeepalive, sessionID, reply.Endpoint, "", ""),
+	)
 	if err != nil {
 		return nil, false, fmt.Errorf("supervise %s bridge: %w", host, err)
 	}
@@ -280,21 +288,22 @@ func (d *Daemon) tryRemoteBridgeOpen(ctx context.Context, self, host, browser, p
 		return nil, false, err
 	}
 	sess := &proxyBridgeSession{
-		sessionID: sessionID,
-		capA:      capA,
-		capB:      reply.Capability,
-		host:      host,
-		endpoint:  reply.Endpoint,
-		browser:   reply.Browser,
-		profile:   reply.Profile,
-		wsURL:     reply.URL,
-		proxyPort: port,
-		expiry:    replyAt.Add(secondsToDuration(reply.ExpiresIn)),
-		tunnel:    tunnel,
-		keepalive: keepalive,
-		cancel:    cancel,
-		dataDir:   dataDir,
-		runner:    d.runner,
+		sessionID:    sessionID,
+		capA:         capA,
+		capB:         reply.Capability,
+		host:         host,
+		endpoint:     reply.Endpoint,
+		browser:      reply.Browser,
+		profile:      reply.Profile,
+		wsURL:        reply.URL,
+		proxyPort:    port,
+		expiry:       replyAt.Add(secondsToDuration(reply.ExpiresIn)),
+		tunnel:       tunnel,
+		keepalive:    keepalive,
+		cancel:       cancel,
+		dataDir:      dataDir,
+		runner:       d.runner,
+		releaseSlots: releaseSlots,
 	}
 
 	d.bridgeMu.Lock()

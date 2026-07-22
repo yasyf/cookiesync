@@ -5,7 +5,11 @@
 // agree on the config-dir convention.
 package paths
 
-import "github.com/yasyf/synckit/hostregistry"
+import (
+	"path/filepath"
+
+	"github.com/yasyf/synckit/hostregistry"
+)
 
 // ToolName is cookiesync's CLI/config identity: it selects ~/.config/cookiesync
 // and is the single source for the hostregistry Config the path helpers drive.
@@ -30,4 +34,31 @@ func Dir() (string, error) {
 // (~/.config/cookiesync/rpc.sock).
 func SockPath() (string, error) {
 	return Config.SockPath()
+}
+
+// BridgeRecoveryRoot returns the v1 bridge process-liability root.
+func BridgeRecoveryRoot() (string, error) {
+	dir, err := Dir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, "bridge"), nil
+}
+
+// BridgeProcessStorePath returns the daemonkit process and receipt ledger.
+func BridgeProcessStorePath() (string, error) {
+	root, err := BridgeRecoveryRoot()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(root, "processes.db"), nil
+}
+
+// BridgeSessionsRoot returns the root for derived bridge session state.
+func BridgeSessionsRoot() (string, error) {
+	root, err := BridgeRecoveryRoot()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(root, "sessions"), nil
 }

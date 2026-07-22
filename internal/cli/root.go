@@ -67,6 +67,7 @@ func newRoot(version string) *cobra.Command {
 		newRPCCmd(),
 		newRPCServeCmd(),
 		newHelperServeCmd(version),
+		newBridgeChromeChildCmd(),
 		newInstallCmd(),
 		newUninstallCmd(),
 		newDoctorCmd(),

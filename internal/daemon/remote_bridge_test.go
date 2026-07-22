@@ -3,7 +3,6 @@ package daemon
 import (
 	"context"
 	"errors"
-	"os"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -11,18 +10,17 @@ import (
 
 	"github.com/yasyf/cookiesync/internal/bridge"
 	"github.com/yasyf/cookiesync/internal/cookie"
+	"github.com/yasyf/daemonkit/proc"
 )
 
 // fakeTunnel stands in for a proven-up ssh -L forward behind the openTunnel seam.
 type fakeTunnel struct {
 	addr   string
-	pid    int
 	done   chan struct{}
 	closed atomic.Bool
 }
 
 func (t *fakeTunnel) HostAddr() string      { return t.addr }
-func (t *fakeTunnel) Pid() int              { return t.pid }
 func (t *fakeTunnel) Done() <-chan struct{} { return t.done }
 func (t *fakeTunnel) Close() error          { t.closed.Store(true); return nil }
 
@@ -63,20 +61,15 @@ func newProxyDaemon(t *testing.T, runner *recordingRunner) (*Daemon, *bridge.Tun
 	st := stateWith("me@laptop", "")
 	consent := &fakeConsent{key: cookie.DeriveKey(cookie.SafeStorageKey("peanuts"))}
 	d := New(consent, newFakeCache(), nil, staticProbe(liveSession(currentUser(t))), runner, fixedState{st: st}, fixedState{st: st})
+	d.processes = testBridgeProcesses(t)
 
 	var gotSpec bridge.TunnelSpec
 	var gotKeepaliveAddr string
-	d.openTunnel = func(_ context.Context, spec bridge.TunnelSpec, onSpawn func(int) error) (bridgeTunnel, error) {
+	d.openTunnel = func(_ context.Context, spec bridge.TunnelSpec, _ func(context.Context, proc.Record) error) (bridgeTunnel, error) {
 		gotSpec = spec
-		// os.Getpid keeps the record's ps probe on a live pid; onSpawn writes the
-		// crash-durable record before prove-up, exactly as the real OpenTunnel does.
-		pid := os.Getpid()
-		if err := onSpawn(pid); err != nil {
-			return nil, err
-		}
-		return &fakeTunnel{addr: "desktop.local", pid: pid, done: make(chan struct{})}, nil
+		return &fakeTunnel{addr: "desktop.local", done: make(chan struct{})}, nil
 	}
-	d.openKeepalive = func(_ context.Context, addr, _ string) (bridgeKeepalive, error) {
+	d.openKeepalive = func(_ context.Context, addr, _ string, _ func(context.Context, proc.Record) error) (bridgeKeepalive, error) {
 		gotKeepaliveAddr = addr
 		return &fakeKeepalive{done: make(chan struct{})}, nil
 	}
@@ -177,19 +170,20 @@ func TestRemoteBridgeReattachPrecedesDispatch(t *testing.T) {
 	t.Cleanup(func() { d.closeAllBridges(context.Background()) })
 
 	sess := &proxyBridgeSession{
-		capA:      "cap-a-live",
-		capB:      "cap-b-secret",
-		host:      "you@desktop",
-		endpoint:  "you@desktop:chrome:Default",
-		browser:   "chrome",
-		profile:   "Default",
-		wsURL:     "ws://127.0.0.1:5555/tok-b/devtools/browser/uuid-b",
-		proxyPort: 5555,
-		expiry:    time.Now().Add(time.Minute),
-		tunnel:    &fakeTunnel{done: make(chan struct{})},
-		keepalive: &fakeKeepalive{done: make(chan struct{})},
-		cancel:    func() {},
-		runner:    runner,
+		capA:         "cap-a-live",
+		capB:         "cap-b-secret",
+		host:         "you@desktop",
+		endpoint:     "you@desktop:chrome:Default",
+		browser:      "chrome",
+		profile:      "Default",
+		wsURL:        "ws://127.0.0.1:5555/tok-b/devtools/browser/uuid-b",
+		proxyPort:    5555,
+		expiry:       time.Now().Add(time.Minute),
+		tunnel:       &fakeTunnel{done: make(chan struct{})},
+		keepalive:    &fakeKeepalive{done: make(chan struct{})},
+		cancel:       func() {},
+		runner:       runner,
+		releaseSlots: func() {},
 	}
 	d.bridges["cap-a-live"] = sess
 
@@ -219,17 +213,18 @@ func TestHandleBridgeKeepaliveReapsOnSocketClose(t *testing.T) {
 
 	tunnel := &fakeTunnel{done: make(chan struct{})}
 	sess := &proxyBridgeSession{
-		capA:      "cap-a",
-		capB:      "cap-b-secret",
-		host:      "you@desktop",
-		endpoint:  "you@desktop:chrome:Default",
-		browser:   "chrome",
-		profile:   "Default",
-		expiry:    time.Now().Add(time.Minute),
-		tunnel:    tunnel,
-		keepalive: &fakeKeepalive{done: make(chan struct{})},
-		cancel:    func() {},
-		runner:    runner,
+		capA:         "cap-a",
+		capB:         "cap-b-secret",
+		host:         "you@desktop",
+		endpoint:     "you@desktop:chrome:Default",
+		browser:      "chrome",
+		profile:      "Default",
+		expiry:       time.Now().Add(time.Minute),
+		tunnel:       tunnel,
+		keepalive:    &fakeKeepalive{done: make(chan struct{})},
+		cancel:       func() {},
+		runner:       runner,
+		releaseSlots: func() {},
 	}
 	d.bridges["cap-a"] = sess
 
@@ -287,7 +282,7 @@ func TestRemoteBridgeOpenRetriesOnlyOnForwardExit(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			runner := &recordingRunner{byMethod: map[string]string{"bridge_open": cannedBridgeOpenReply}}
 			d, _, _ := newProxyDaemon(t, runner)
-			d.openTunnel = func(context.Context, bridge.TunnelSpec, func(int) error) (bridgeTunnel, error) {
+			d.openTunnel = func(context.Context, bridge.TunnelSpec, func(context.Context, proc.Record) error) (bridgeTunnel, error) {
 				return nil, tc.tunnelErr
 			}
 

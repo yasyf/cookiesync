@@ -107,7 +107,7 @@ func (c *Conn) Close() error {
 // pipe errors, then fails every pending call. Once the relay sink is set it
 // forwards every raw frame there verbatim and stops correlating ids.
 func (p *Proc) readLoop() {
-	br := bufio.NewReader(p.rpipe)
+	br := bufio.NewReader(p.transport)
 	for {
 		raw, err := br.ReadBytes(0)
 		if err != nil {
@@ -173,7 +173,7 @@ func (p *Proc) closedErr() error {
 func (p *Proc) write(b []byte) error {
 	p.writeMu.Lock()
 	defer p.writeMu.Unlock()
-	if _, err := p.wpipe.Write(b); err != nil {
+	if _, err := p.transport.Write(b); err != nil {
 		return fmt.Errorf("cdp pipe write: %w", err)
 	}
 	return nil

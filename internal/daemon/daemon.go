@@ -38,7 +38,9 @@ import (
 	dkdaemon "github.com/yasyf/daemonkit/daemon"
 	"github.com/yasyf/daemonkit/daemonrole"
 	"github.com/yasyf/daemonkit/drain"
+	"github.com/yasyf/daemonkit/proc"
 	"github.com/yasyf/daemonkit/wire"
+	"golang.org/x/sync/semaphore"
 
 	"github.com/yasyf/cookiesync/internal/auth"
 	"github.com/yasyf/cookiesync/internal/bridge"
@@ -78,7 +80,7 @@ type Probe = auth.Probe
 type SessionSnapshot = presence.SessionSnapshot
 
 // Daemon holds every collaborator behind an injected seam so the dispatcher
-// runs in unit tests against fakes. In production it is built by Build with the
+// runs in unit tests against fakes. In production it is built by buildDaemon with the
 // real consent gate, the Enclave-backed cache (owned by the auth broker), the
 // sync engine, the presence probes, and the ssh runner.
 type Daemon struct {
@@ -96,47 +98,33 @@ type Daemon struct {
 
 	// openTunnel and openKeepalive are the cross-host bridge seams: the ssh -L
 	// forward and the keepalive supervisor, defaulted in New and faked in tests.
-	openTunnel    func(context.Context, bridge.TunnelSpec, func(pid int) error) (bridgeTunnel, error)
-	openKeepalive func(context.Context, string, string) (bridgeKeepalive, error)
+	openTunnel    func(context.Context, bridge.TunnelSpec, func(context.Context, proc.Record) error) (bridgeTunnel, error)
+	openKeepalive func(context.Context, string, string, func(context.Context, proc.Record) error) (bridgeKeepalive, error)
+	processes     *bridgeProcesses
+	bridgeSlots   *semaphore.Weighted
 
 	bridgeMu       sync.Mutex
 	bridges        map[string]session
 	bridgeShutdown bool
-	bridgeLock     *os.File
 	bridgeStop     chan struct{}
 	bridgeStopOnce sync.Once
 	bridgeWG       sync.WaitGroup
 }
 
-// Build wires the production daemon: Touch ID consent, the per-boot
+// buildDaemon wires the production daemon: Touch ID consent, the per-boot
 // Enclave-backed key cache (opened here, owned by the broker), the sync engine,
 // the presence probes, and the ssh runner. The returned closer is the cache's
 // Close — it evicts every entry and drops the Enclave key; Serve calls it, but
 // a caller that builds without serving must too.
-func Build(ctx context.Context) (*Daemon, func(context.Context) error, error) {
+func buildDaemon(ctx context.Context) (*Daemon, func(context.Context) error, error) {
 	d, keyCache, err := build(ctx)
 	if err != nil {
 		return nil, nil, err
 	}
-	// Own the bridge lock before the destructive sweep so a second daemon can't
-	// reap a live sibling's bridges; a crashed owner's flock is auto-released.
-	owned, err := d.acquireBridgeOwnership()
-	if err != nil {
-		_ = keyCache.Close(ctx)
-		return nil, nil, err
-	}
-	// Reap any bridge a crashed daemon left running, then arm the expiry reaper.
-	if owned {
-		if err := d.sweepOrphanBridges(ctx); err != nil {
-			_ = keyCache.Close(ctx)
-			return nil, nil, err
-		}
-	}
-	d.startBridgeReaper()
 	return d, keyCache.Close, nil
 }
 
-// build is Build with the key cache exposed, so lifecycle tests drive the real
+// build is buildDaemon with the key cache exposed, so lifecycle tests drive the real
 // cache the daemon was wired over.
 func build(ctx context.Context) (*Daemon, *cache.KeyCache, error) {
 	store := state.New(paths.Config)
@@ -163,37 +151,39 @@ func build(ctx context.Context) (*Daemon, *cache.KeyCache, error) {
 	return d, keyCache, nil
 }
 
-// New builds a daemon over injected collaborators, for tests and for Build. The
-// auth broker is constructed here over the same seams; Build pins its
+// New builds a daemon over injected collaborators, for tests and for buildDaemon. The
+// auth broker is constructed here over the same seams; buildDaemon pins its
 // KeybagProbe to the ioreg-only read, and tests pin the broker's exported
 // fields directly.
 func New(consent cookie.Consent, c Cache, eng *engine.Engine, probe Probe, runner engine.SSHRunner, st StateLoader, reg RegistryLoader) *Daemon {
-	return &Daemon{
-		broker:     auth.NewBroker(consent, c, probe, runner, st),
-		engine:     eng,
-		probe:      probe,
-		runner:     runner,
-		state:      st,
-		registry:   reg,
-		bridges:    map[string]session{},
-		bridgeStop: make(chan struct{}),
-		seedSource: cookie.SeedState,
-		hostBinary: bridge.ResolveHostBinary,
-		openTunnel: func(ctx context.Context, spec bridge.TunnelSpec, onSpawn func(pid int) error) (bridgeTunnel, error) {
-			t, err := bridge.OpenTunnel(ctx, spec, onSpawn)
-			if err != nil {
-				return nil, err
-			}
-			return t, nil
-		},
-		openKeepalive: func(ctx context.Context, addr, capability string) (bridgeKeepalive, error) {
-			k, err := bridge.OpenKeepalive(ctx, addr, capability)
-			if err != nil {
-				return nil, err
-			}
-			return k, nil
-		},
+	d := &Daemon{
+		broker:      auth.NewBroker(consent, c, probe, runner, st),
+		engine:      eng,
+		probe:       probe,
+		runner:      runner,
+		state:       st,
+		registry:    reg,
+		bridges:     map[string]session{},
+		bridgeSlots: semaphore.NewWeighted(bridgeProcessCapacity),
+		bridgeStop:  make(chan struct{}),
+		seedSource:  cookie.SeedState,
+		hostBinary:  bridge.ResolveHostBinary,
 	}
+	d.openTunnel = func(ctx context.Context, spec bridge.TunnelSpec, recorded func(context.Context, proc.Record) error) (bridgeTunnel, error) {
+		t, err := bridge.OpenTunnel(ctx, d.processes.pool, spec, recorded)
+		if err != nil {
+			return nil, err
+		}
+		return t, nil
+	}
+	d.openKeepalive = func(ctx context.Context, addr, capability string, recorded func(context.Context, proc.Record) error) (bridgeKeepalive, error) {
+		k, err := bridge.OpenKeepalive(ctx, d.processes.pool, addr, capability, recorded)
+		if err != nil {
+			return nil, err
+		}
+		return k, nil
+	}
+	return d
 }
 
 // Dispatcher builds the synckit Dispatcher with every peer and local method
@@ -252,7 +242,7 @@ func Serve(ctx context.Context, build string) error {
 	if err != nil {
 		return err
 	}
-	runtime, err := newHelperRuntime(sock, rolePath, build, Build)
+	runtime, err := newHelperRuntime(ctx, sock, rolePath, build, buildDaemon)
 	if err != nil {
 		return err
 	}
@@ -277,7 +267,10 @@ func helperRolePath() (string, error) {
 
 type helperBuilder func(context.Context) (*Daemon, func(context.Context) error, error)
 
-func newHelperRuntime(sock, rolePath, build string, builder helperBuilder) (*dkdaemon.Runtime, error) {
+func newHelperRuntime(ctx context.Context, sock, rolePath, build string, builder helperBuilder) (*dkdaemon.Runtime, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	dispatcher := synckit.NewDispatcher()
 	rpcServer, err := runtimeRPCServer(dispatcher, rolePath, build)
 	if err != nil {
@@ -287,12 +280,18 @@ func newHelperRuntime(sock, rolePath, build string, builder helperBuilder) (*dkd
 		Dial: wire.UnixDialer(sock), Build: synckit.Build, LifecycleBuild: build, MaxFrame: synckit.MaxFrame,
 	}}
 	owner := newHelperOwner()
+	processes, err := newBridgeProcesses(rolePath)
+	if err != nil {
+		_ = peer.Close()
+		return nil, err
+	}
+	workers := helperWorkers{owner: owner, processes: processes}
 	sessionServer := &helperSessionServer{Server: rpcServer.Wire, owner: owner}
 	runtime, err := dkdaemon.NewRuntime(dkdaemon.RuntimeConfig{
 		Socket: sock, Build: build, Protocol: int(wire.ProtocolVersion),
 		Peer: peer, Contract: dkdaemon.RequestDaemon, WaitMode: dkdaemon.PIDExit,
 		Admission: &drain.Intake{}, Server: sessionServer,
-		Workers: owner, State: runtimeState{}, Resources: helperResources{peer: peer, owner: owner},
+		Workers: workers, State: runtimeState{}, Resources: helperResources{peer: peer, owner: owner},
 		Activate: func(activation dkdaemon.Activation) error {
 			dir, err := paths.Dir()
 			if err != nil {
@@ -301,6 +300,9 @@ func newHelperRuntime(sock, rolePath, build string, builder helperBuilder) (*dkd
 			if err := os.MkdirAll(dir, 0o700); err != nil {
 				return fmt.Errorf("create config dir %s: %w", dir, err)
 			}
+			if err := processes.reap(activation.Startup); err != nil {
+				return err
+			}
 			if err := debug.DumpOnSIGUSR1(activation.Lifetime, filepath.Join(dir, "debug")); err != nil {
 				return err
 			}
@@ -308,6 +310,13 @@ func newHelperRuntime(sock, rolePath, build string, builder helperBuilder) (*dkd
 			if err != nil {
 				return err
 			}
+			d.processes = processes
+			if err := processes.settleRecovery(activation.Startup, d.runner); err != nil {
+				closeCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+				defer cancel()
+				return errors.Join(err, closer(closeCtx))
+			}
+			d.startBridgeReaper()
 			owner.set(d, closer)
 			d.register(dispatcher)
 			return nil
@@ -319,6 +328,25 @@ func newHelperRuntime(sock, rolePath, build string, builder helperBuilder) (*dkd
 	}
 	rpcServer.Wire.RegisterLifecycle(runtime)
 	return runtime, nil
+}
+
+type helperWorkers struct {
+	owner     *helperOwner
+	processes *bridgeProcesses
+}
+
+func (w helperWorkers) Close() {
+	w.owner.Close()
+	w.processes.Close()
+}
+
+func (w helperWorkers) Cancel() {
+	w.owner.Cancel()
+	w.processes.Cancel()
+}
+
+func (w helperWorkers) Wait(ctx context.Context) error {
+	return errors.Join(w.owner.Wait(ctx), w.processes.Wait(ctx))
 }
 
 func runtimeRPCServer(dispatcher *synckit.Dispatcher, rolePath, build string) (*synckit.Server, error) {

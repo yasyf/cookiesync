@@ -8,13 +8,12 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
-	"os"
-	"os/exec"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
+	"github.com/yasyf/daemonkit/proc"
+	"github.com/yasyf/daemonkit/supervise"
 	"github.com/yasyf/synckit/hostregistry"
 )
 
@@ -75,35 +74,32 @@ type TunnelSpec struct {
 	WantWSURL  string // the webSocketDebuggerUrl the proven-up GET must observe
 }
 
-// Tunnel is a detached `ssh -N -L` local forward that owns its ssh child with
-// the same process-group-SIGKILL discipline as Launch, so teardown never leaks
-// an ssh helper. It is proven up before OpenTunnel returns it.
+// Tunnel is a detached, daemonkit-managed `ssh -N -L` local forward. It is
+// proven up before OpenTunnel returns it.
 type Tunnel struct {
-	cmd       *exec.Cmd
-	cancel    context.CancelFunc
+	process   *supervise.Process
 	localPort int
 	addr      string
 	done      chan struct{}
 	closeOnce sync.Once
+	closeErr  error
 }
 
 // OpenTunnel spawns a proven-up ssh -L forward to spec.Host, dialing the ordered
 // candidates hostregistry.DialAddrs resolves — LAN/.local first, the FQDN last —
 // and advancing to the next on a dead candidate (ssh's ExitOnForwardFailure
-// exits promptly, failing the proven-up probe). onSpawn is invoked with the ssh
-// child's pid the instant it starts, before the prove-up wait, so the caller can
-// record a crash-durable pointer to the live forward before it is registered. The
-// child runs under ctx, so a caller that cancels ctx group-kills the forward. A
+// exits promptly, failing the proven-up probe). recorded commits product recovery
+// metadata while daemonkit's execution gate is still closed. A
 // local-bind collision short-circuits the candidate walk, since every addr shares
 // the same local port — the caller re-allocates and re-opens on that alone.
-func OpenTunnel(ctx context.Context, spec TunnelSpec, onSpawn func(pid int) error) (*Tunnel, error) {
+func OpenTunnel(ctx context.Context, pool *supervise.Pool, spec TunnelSpec, recorded func(context.Context, proc.Record) error) (*Tunnel, error) {
 	addrs, err := hostregistry.DialAddrs(spec.Host)
 	if err != nil {
 		return nil, err
 	}
 	var lastErr error
 	for _, addr := range addrs {
-		t, err := dialTunnel(ctx, addr, spec, onSpawn)
+		t, err := dialTunnel(ctx, pool, addr, spec, recorded)
 		if err == nil {
 			return t, nil
 		}
@@ -115,43 +111,37 @@ func OpenTunnel(ctx context.Context, spec TunnelSpec, onSpawn func(pid int) erro
 	return nil, fmt.Errorf("open ssh tunnel to %s: %w", spec.Host, lastErr)
 }
 
-// dialTunnel spawns one ssh forward to addr, records it via onSpawn, then proves
-// it up, tearing the child down on any failure so a failed attempt leaks nothing.
-func dialTunnel(ctx context.Context, addr string, spec TunnelSpec, onSpawn func(pid int) error) (*Tunnel, error) {
-	runCtx, cancel := context.WithCancel(ctx)
+// dialTunnel starts one recorded ssh forward to addr and proves it up.
+func dialTunnel(ctx context.Context, pool *supervise.Pool, addr string, spec TunnelSpec, recorded func(context.Context, proc.Record) error) (*Tunnel, error) {
 	var stderr bytes.Buffer
-	cmd := exec.CommandContext(runCtx, sshBin, tunnelArgv(addr, spec.LocalPort, spec.RemotePort)...) //nolint:gosec // G204: sshBin is a fixed binary; addr/ports come from trusted local mesh state, not untrusted input.
-	cmd.Stderr = &stderr
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	cmd.Cancel = func() error {
-		err := syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
-		if errors.Is(err, syscall.ESRCH) {
-			return os.ErrProcessDone
+	probeURL := fmt.Sprintf("http://127.0.0.1:%d/%s/json/version", spec.LocalPort, spec.Token)
+	proveTimeout, probeInterval := tunnelProveTimeout, tunnelProbeInterval
+	process, err := pool.Start(ctx, supervise.ProcessSpec{
+		RecoveryClass:    proc.RecoveryTask,
+		Path:             sshBin,
+		Args:             tunnelArgv(addr, spec.LocalPort, spec.RemotePort),
+		Stderr:           &stderr,
+		Recorded:         recorded,
+		ReadinessTimeout: proveTimeout,
+		Ready: func(readyCtx context.Context, _ proc.Record) error {
+			return proveTunnelUpPolicy(
+				readyCtx, nil, &stderr, spec.LocalPort, probeURL, spec.WantWSURL,
+				proveTimeout, probeInterval,
+			)
+		},
+	})
+	if err != nil {
+		if isBindCollision(stderr.String(), spec.LocalPort) {
+			return nil, fmt.Errorf("ssh tunnel to %s: %w", addr, ErrTunnelBindCollision)
 		}
-		return err
-	}
-	cmd.WaitDelay = 5 * time.Second
-	if err := cmd.Start(); err != nil {
-		cancel()
-		return nil, fmt.Errorf("start ssh tunnel to %s: %w", addr, err)
+		return nil, fmt.Errorf("start ssh tunnel to %s: %w: %w", addr, ErrTunnelExited, err)
 	}
 	done := make(chan struct{})
+	t := &Tunnel{process: process, localPort: spec.LocalPort, addr: addr, done: done}
 	go func() {
-		_ = cmd.Wait()
+		_ = process.Wait(context.Background())
 		close(done)
 	}()
-	t := &Tunnel{cmd: cmd, cancel: cancel, localPort: spec.LocalPort, addr: addr, done: done}
-	// Record the live child before proving it up, so an A-side crash during the
-	// prove-up window still leaves the orphan sweep a pid to reap.
-	if err := onSpawn(cmd.Process.Pid); err != nil {
-		_ = t.Close()
-		return nil, fmt.Errorf("record ssh tunnel to %s: %w", addr, err)
-	}
-	probeURL := fmt.Sprintf("http://127.0.0.1:%d/%s/json/version", spec.LocalPort, spec.Token)
-	if err := proveTunnelUp(ctx, done, &stderr, spec.LocalPort, probeURL, spec.WantWSURL); err != nil {
-		_ = t.Close()
-		return nil, err
-	}
 	return t, nil
 }
 
@@ -177,7 +167,21 @@ func tunnelArgv(addr string, localPort, remotePort int) []string {
 // around, or a terminal exit it must not re-tap. Diagnostics redact the token the
 // probe/ws urls carry, so it never reaches a log.
 func proveTunnelUp(ctx context.Context, done <-chan struct{}, stderr *bytes.Buffer, localPort int, probeURL, wantWSURL string) error {
-	deadline := time.Now().Add(tunnelProveTimeout)
+	return proveTunnelUpPolicy(
+		ctx, done, stderr, localPort, probeURL, wantWSURL,
+		tunnelProveTimeout, tunnelProbeInterval,
+	)
+}
+
+func proveTunnelUpPolicy(
+	ctx context.Context,
+	done <-chan struct{},
+	stderr *bytes.Buffer,
+	localPort int,
+	probeURL, wantWSURL string,
+	proveTimeout, probeInterval time.Duration,
+) error {
+	deadline := time.Now().Add(proveTimeout)
 	for {
 		select {
 		case <-done:
@@ -186,7 +190,7 @@ func proveTunnelUp(ctx context.Context, done <-chan struct{}, stderr *bytes.Buff
 			return ctx.Err()
 		default:
 		}
-		got, err := probeVersion(ctx, probeURL)
+		got, err := probeVersion(ctx, probeURL, probeInterval)
 		if err == nil && got == wantWSURL {
 			return nil
 		}
@@ -199,7 +203,7 @@ func proveTunnelUp(ctx context.Context, done <-chan struct{}, stderr *bytes.Buff
 			return fmt.Errorf("prove ssh tunnel %s: webSocketDebuggerUrl mismatch", redactToken(probeURL))
 		}
 		select {
-		case <-time.After(tunnelProbeInterval):
+		case <-time.After(probeInterval):
 		case <-done:
 			return classifyTunnelExit(stderr, localPort)
 		case <-ctx.Done():
@@ -277,8 +281,8 @@ func redactToken(rawURL string) string {
 
 // probeVersion GETs the token-gated /json/version and returns its
 // webSocketDebuggerUrl, bounded by one probe interval.
-func probeVersion(ctx context.Context, probeURL string) (string, error) {
-	reqCtx, cancel := context.WithTimeout(ctx, tunnelProbeInterval)
+func probeVersion(ctx context.Context, probeURL string, probeInterval time.Duration) (string, error) {
+	reqCtx, cancel := context.WithTimeout(ctx, probeInterval)
 	defer cancel()
 	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, probeURL, nil)
 	if err != nil {
@@ -321,18 +325,12 @@ func (t *Tunnel) HostAddr() string {
 	return t.addr
 }
 
-// Pid is the ssh forward child's pid (its process-group id via Setpgid), the id
-// the origin's crash-durable record group-kills on an orphan sweep.
-func (t *Tunnel) Pid() int {
-	return t.cmd.Process.Pid
-}
-
-// Close group-SIGKILLs the ssh forward and waits for it to reap. It is
-// idempotent.
+// Close stops and reaps the exact managed ssh forward. It is idempotent.
 func (t *Tunnel) Close() error {
 	t.closeOnce.Do(func() {
-		t.cancel()
-		<-t.done
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		t.closeErr = t.process.Stop(ctx)
 	})
-	return nil
+	return t.closeErr
 }

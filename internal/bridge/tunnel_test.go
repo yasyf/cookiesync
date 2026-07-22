@@ -231,11 +231,15 @@ func TestOpenTunnelDialsAddrsInOrder(t *testing.T) {
 
 	// Every fake ssh exits 0 without forwarding, so no candidate proves up and
 	// OpenTunnel exhausts the ordered list.
-	_, err := OpenTunnel(context.Background(), TunnelSpec{
+	ctx := t.Context()
+	_, err := OpenTunnel(ctx, testProcessPool(ctx, t), TunnelSpec{
 		Host: target, LocalPort: 41000, RemotePort: 42000, Token: "tok", WantWSURL: "ws://never",
-	}, func(int) error { return nil })
+	}, nil)
 	if err == nil {
 		t.Fatalf("OpenTunnel over fake ssh that never forwards must fail")
+	}
+	if !errors.Is(err, ErrTunnelExited) || errors.Is(err, ErrTunnelBindCollision) {
+		t.Fatalf("OpenTunnel early exit = %v, want terminal ErrTunnelExited", err)
 	}
 
 	dialed := recordedAddrs(t, recordPath)
