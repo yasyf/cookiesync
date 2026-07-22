@@ -11,7 +11,7 @@ require (
 	github.com/spf13/cobra v1.10.2
 	github.com/syndtr/goleveldb v1.0.0
 	github.com/yasyf/daemonkit v0.3.2
-	github.com/yasyf/synckit v0.24.0
+	github.com/yasyf/synckit v0.25.2
 	golang.org/x/crypto v0.48.0
 	golang.org/x/sync v0.20.0
 	golang.org/x/term v0.45.0
