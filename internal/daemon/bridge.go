@@ -263,7 +263,7 @@ func (d *Daemon) openBridge(ctx context.Context, requestor, endpoint, browser, p
 			_ = server.Close()
 		}
 		if proc != nil {
-			_ = proc.Close()
+			_ = proc.CloseContext(context.WithoutCancel(ctx))
 			return
 		}
 		_ = os.RemoveAll(dataDir)

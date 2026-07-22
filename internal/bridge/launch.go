@@ -114,8 +114,13 @@ func (p *Proc) Pid() int {
 
 // Close settles the managed Chrome process and removes the data dir.
 func (p *Proc) Close() error {
+	return p.CloseContext(context.Background())
+}
+
+// CloseContext settles the managed Chrome process within ctx and removes the data dir.
+func (p *Proc) CloseContext(ctx context.Context) error {
 	p.closeOnce.Do(func() {
-		p.closeErr = errors.Join(p.process.Stop(context.Background()), os.RemoveAll(p.dataDir))
+		p.closeErr = errors.Join(p.process.Stop(ctx), os.RemoveAll(p.dataDir))
 	})
 	return p.closeErr
 }

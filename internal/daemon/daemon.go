@@ -242,7 +242,7 @@ func Serve(ctx context.Context, build string) error {
 	if err != nil {
 		return err
 	}
-	runtime, err := newHelperRuntime(ctx, sock, rolePath, build, buildDaemon)
+	runtime, err := newHelperRuntime(sock, rolePath, build, buildDaemon) //nolint:contextcheck // Runtime.Run owns ctx; construction has no request-scoped work.
 	if err != nil {
 		return err
 	}
@@ -267,10 +267,7 @@ func helperRolePath() (string, error) {
 
 type helperBuilder func(context.Context) (*Daemon, func(context.Context) error, error)
 
-func newHelperRuntime(ctx context.Context, sock, rolePath, build string, builder helperBuilder) (*dkdaemon.Runtime, error) {
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
+func newHelperRuntime(sock, rolePath, build string, builder helperBuilder) (*dkdaemon.Runtime, error) {
 	dispatcher := synckit.NewDispatcher()
 	rpcServer, err := runtimeRPCServer(dispatcher, rolePath, build)
 	if err != nil {

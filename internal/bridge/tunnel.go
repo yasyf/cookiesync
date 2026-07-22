@@ -139,7 +139,7 @@ func dialTunnel(ctx context.Context, pool *supervise.Pool, addr string, spec Tun
 	done := make(chan struct{})
 	t := &Tunnel{process: process, localPort: spec.LocalPort, addr: addr, done: done}
 	go func() {
-		_ = process.Wait(context.Background())
+		_ = process.Wait(context.WithoutCancel(ctx))
 		close(done)
 	}()
 	return t, nil

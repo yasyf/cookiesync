@@ -97,7 +97,7 @@ func TestHelperRuntimeActivatesAfterOwnershipAndClosesGeneration(t *testing.T) {
 	}
 
 	const build = "v9.8.7-test"
-	runtime, err := newHelperRuntime(t.Context(), sock, executable, build, builder)
+	runtime, err := newHelperRuntime(sock, executable, build, builder)
 	if err != nil {
 		t.Fatalf("newHelperRuntime: %v", err)
 	}
@@ -183,7 +183,7 @@ func TestHelperRuntimeSettlesBridgeRecoveryBeforeReadiness(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = os.RemoveAll(socketDir) })
-	runtime, err := newHelperRuntime(t.Context(), filepath.Join(socketDir, "rpc.sock"), executable, "v9.8.8-test", builder)
+	runtime, err := newHelperRuntime(filepath.Join(socketDir, "rpc.sock"), executable, "v9.8.8-test", builder)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -280,7 +280,7 @@ func TestHelperRuntimeReapsBridgeProcessesBeforeBuilderFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = os.RemoveAll(socketDir) })
-	runtime, err := newHelperRuntime(t.Context(), filepath.Join(socketDir, "rpc.sock"), executable, "v9.8.9-test", builder)
+	runtime, err := newHelperRuntime(filepath.Join(socketDir, "rpc.sock"), executable, "v9.8.9-test", builder)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -54,7 +54,7 @@ func OpenKeepalive(ctx context.Context, pool *supervise.Pool, addr, capability s
 	}
 	done := make(chan struct{})
 	go func() {
-		_ = session.Wait(context.Background())
+		_ = session.Wait(context.WithoutCancel(ctx))
 		close(done)
 	}()
 	return &Keepalive{process: session, done: done}, nil
