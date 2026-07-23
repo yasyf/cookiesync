@@ -8,12 +8,15 @@ import (
 	"github.com/yasyf/cookiesync/internal/mesh"
 	"github.com/yasyf/cookiesync/internal/state"
 	"github.com/yasyf/synckit/converge"
+	"github.com/yasyf/synckit/syncservice"
 )
 
 // newFetcher builds the pull-only peer-registry fetcher a converge pass reads peers
 // through. Production dials each peer's rpc-serve bridge over ssh-stdio; it is a package
 // var so a test substitutes a fake fetcher and drives the merge without spawning ssh.
-var newFetcher = func() converge.Fetcher[state.EndpointMeta] { return NewSSHFetcher() }
+var newFetcher = func(runner syncservice.TransportRunner) converge.Fetcher[state.EndpointMeta] {
+	return NewSSHFetcher(runner)
+}
 
 // Store is the slice of the state store the orchestration needs: the convergent
 // registry read/write paths the Driver consumes, the rowcount ledger the mass-drop
@@ -106,7 +109,11 @@ func (e *Engine) run(ctx context.Context, origin string) ([]Result, error) {
 		LockFor:     e.ApplyLock,
 	}
 	driver := NewDriver(e.store, self, deps)
-	items, err := converge.Reconcile(ctx, e.store.WithLock, driver, newFetcher(), e.status, peers, origin)
+	var items []converge.ItemResult
+	err = syncservice.WithTransportRunner(ctx, func(runner syncservice.TransportRunner) error {
+		items, err = converge.Reconcile(ctx, e.store.WithLock, driver, newFetcher(runner), e.status, peers, origin)
+		return err
+	})
 	if err != nil {
 		return nil, err
 	}

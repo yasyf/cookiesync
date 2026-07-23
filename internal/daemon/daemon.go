@@ -36,10 +36,8 @@ import (
 	"time"
 
 	dkdaemon "github.com/yasyf/daemonkit/daemon"
-	"github.com/yasyf/daemonkit/daemonrole"
-	"github.com/yasyf/daemonkit/drain"
 	"github.com/yasyf/daemonkit/proc"
-	"github.com/yasyf/daemonkit/wire"
+	"github.com/yasyf/daemonkit/supervise"
 	"golang.org/x/sync/semaphore"
 
 	"github.com/yasyf/cookiesync/internal/auth"
@@ -52,6 +50,7 @@ import (
 	"github.com/yasyf/cookiesync/internal/paths"
 	"github.com/yasyf/cookiesync/internal/state"
 	"github.com/yasyf/synckit/debug"
+	"github.com/yasyf/synckit/helperruntime"
 	"github.com/yasyf/synckit/presence"
 	synckit "github.com/yasyf/synckit/rpc"
 	"github.com/yasyf/synckit/syncservice"
@@ -116,17 +115,17 @@ type Daemon struct {
 // the presence probes, and the ssh runner. The returned closer is the cache's
 // Close — it evicts every entry and drops the Enclave key; Serve calls it, but
 // a caller that builds without serving must too.
-func buildDaemon(ctx context.Context) (*Daemon, func(context.Context) error, error) {
-	d, keyCache, err := build(ctx)
+func buildDaemon(ctx context.Context, pool *supervise.Pool) (*Daemon, func(context.Context) error, error) {
+	d, keyCache, err := build(ctx, pool)
 	if err != nil {
 		return nil, nil, err
 	}
 	return d, keyCache.Close, nil
 }
 
-// build is buildDaemon with the key cache exposed, so lifecycle tests drive the real
+// build is buildDaemon with the key cache exposed, so generation tests drive the real
 // cache the daemon was wired over.
-func build(ctx context.Context) (*Daemon, *cache.KeyCache, error) {
+func build(ctx context.Context, pool *supervise.Pool) (*Daemon, *cache.KeyCache, error) {
 	store := state.New(paths.Config)
 	// Load once here to fail fast on a malformed state file; handlers re-read it live.
 	if _, err := store.Load(ctx); err != nil {
@@ -137,7 +136,7 @@ func build(ctx context.Context) (*Daemon, *cache.KeyCache, error) {
 	if err != nil {
 		return nil, nil, err
 	}
-	runner := engine.NewExecSSHRunner()
+	runner := engine.NewExecSSHRunner(pool)
 
 	// synckitd owns the watch loop and reconcile tick; the engine records
 	// applied digests through a standalone recorder.
@@ -228,8 +227,6 @@ func (d *Daemon) register(dispatcher *synckit.Dispatcher) {
 	dispatcher.Register("bridge_keepalive", d.handleBridgeKeepalive)
 }
 
-const helperRoleID = "com.github.yasyf.synckit.helper.cookiesync"
-
 // Serve runs the resident helper as one exact daemonkit generation. The
 // Secure Enclave key, bridge owner, dispatcher, and readiness are constructed
 // only after listener takeover has established exclusive ownership.
@@ -265,30 +262,25 @@ func helperRolePath() (string, error) {
 	return filepath.Clean(rolePath), nil
 }
 
-type helperBuilder func(context.Context) (*Daemon, func(context.Context) error, error)
+type helperBuilder func(context.Context, *supervise.Pool) (*Daemon, func(context.Context) error, error)
 
 func newHelperRuntime(sock, rolePath, build string, builder helperBuilder) (*dkdaemon.Runtime, error) {
 	dispatcher := synckit.NewDispatcher()
-	rpcServer, err := runtimeRPCServer(dispatcher, rolePath, build)
-	if err != nil {
-		return nil, err
-	}
-	peer := &wire.LifecyclePeer{Config: wire.ClientConfig{
-		Dial: wire.UnixDialer(sock), Build: synckit.Build, LifecycleBuild: build, MaxFrame: synckit.MaxFrame,
-	}}
+	rpcServer := runtimeRPCServer(dispatcher)
 	owner := newHelperOwner()
 	processes, err := newBridgeProcesses(rolePath)
 	if err != nil {
-		_ = peer.Close()
 		return nil, err
 	}
 	workers := helperWorkers{owner: owner, processes: processes}
-	sessionServer := &helperSessionServer{Server: rpcServer.Wire, owner: owner}
-	runtime, err := dkdaemon.NewRuntime(dkdaemon.RuntimeConfig{
-		Socket: sock, Build: build, Protocol: int(wire.ProtocolVersion),
-		Peer: peer, Contract: dkdaemon.RequestDaemon, WaitMode: dkdaemon.PIDExit,
-		Admission: &drain.Intake{}, Server: sessionServer,
-		Workers: workers, State: runtimeState{}, Resources: helperResources{peer: peer, owner: owner},
+	runtime, err := helperruntime.New(helperruntime.Config{
+		App:    helperruntime.App{Name: paths.ToolName, RuntimeBuild: build},
+		Socket: sock, Server: rpcServer,
+		Workers: workers, State: runtimeState{}, Resources: helperResources{owner: owner},
+		Drain: func() error {
+			owner.Close()
+			return nil
+		},
 		Activate: func(activation dkdaemon.Activation) error {
 			dir, err := paths.Dir()
 			if err != nil {
@@ -303,7 +295,7 @@ func newHelperRuntime(sock, rolePath, build string, builder helperBuilder) (*dkd
 			if err := debug.DumpOnSIGUSR1(activation.Lifetime, filepath.Join(dir, "debug")); err != nil {
 				return err
 			}
-			d, closer, err := builder(activation.Startup)
+			d, closer, err := builder(activation.Startup, processes.pool)
 			if err != nil {
 				return err
 			}
@@ -320,10 +312,11 @@ func newHelperRuntime(sock, rolePath, build string, builder helperBuilder) (*dkd
 		},
 	})
 	if err != nil {
-		_ = peer.Close()
+		processes.Close()
+		processes.Cancel()
+		_ = processes.Wait(context.Background())
 		return nil, err
 	}
-	rpcServer.Wire.RegisterLifecycle(runtime)
 	return runtime, nil
 }
 
@@ -346,16 +339,8 @@ func (w helperWorkers) Wait(ctx context.Context) error {
 	return errors.Join(w.owner.Wait(ctx), w.processes.Wait(ctx))
 }
 
-func runtimeRPCServer(dispatcher *synckit.Dispatcher, rolePath, build string) (*synckit.Server, error) {
-	role := daemonrole.Classifier{RoleID: helperRoleID, RolePath: rolePath}
-	if err := role.Validate(); err != nil {
-		return nil, fmt.Errorf("validate cookiesync helper role: %w", err)
-	}
-	server := synckit.NewServer(dispatcher)
-	server.Wire.LifecycleBuild = build
-	server.Wire.ReservedProtectedSessions = 1
-	server.Wire.ProtectedSessionClassifier = role
-	return server, nil
+func runtimeRPCServer(dispatcher *synckit.Dispatcher) *synckit.Server {
+	return synckit.NewServer(dispatcher)
 }
 
 type runtimeState struct{}
@@ -419,23 +404,11 @@ func (o *helperOwner) closeResources() error {
 }
 
 type helperResources struct {
-	peer  *wire.LifecyclePeer
 	owner *helperOwner
 }
 
 func (r helperResources) Close() error {
-	return errors.Join(r.peer.Close(), r.owner.closeResources())
-}
-
-type helperSessionServer struct {
-	*wire.Server
-	owner *helperOwner
-}
-
-func (s *helperSessionServer) CloseIntake() error {
-	err := s.Server.CloseIntake()
-	s.owner.Close()
-	return err
+	return r.owner.closeResources()
 }
 
 func onlyError(err, target error) bool {

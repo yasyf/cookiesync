@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/yasyf/cookiesync/internal/cookie"
+	"github.com/yasyf/daemonkit/supervise"
 	"github.com/yasyf/synckit/hostregistry"
 	"github.com/yasyf/synckit/rpc"
 )
@@ -32,15 +33,17 @@ type SSHRunner interface {
 	Run(ctx context.Context, target, remoteCmd string, stdin []byte) (string, error)
 }
 
-type hostRegistrySSHRunner struct{}
-
-// NewExecSSHRunner returns the production SSHRunner backed by hostregistry.ExecSSH.
-func NewExecSSHRunner() SSHRunner {
-	return hostRegistrySSHRunner{}
+type hostRegistrySSHRunner struct {
+	runner supervise.TaskRunner
 }
 
-func (hostRegistrySSHRunner) Run(ctx context.Context, target, remoteCmd string, stdin []byte) (string, error) {
-	return hostregistry.ExecSSH(ctx, target, remoteCmd, stdin)
+// NewExecSSHRunner returns the production SSHRunner backed by hostregistry.ExecSSH.
+func NewExecSSHRunner(runner supervise.TaskRunner) SSHRunner {
+	return hostRegistrySSHRunner{runner: runner}
+}
+
+func (r hostRegistrySSHRunner) Run(ctx context.Context, target, remoteCmd string, stdin []byte) (string, error) {
+	return hostregistry.ExecSSH(ctx, r.runner, target, remoteCmd, stdin)
 }
 
 // SSHBackend is a peer host's cookie store, reached by driving its daemon over ssh.

@@ -28,7 +28,7 @@ func Call(ctx context.Context, method string, params map[string]any) (any, error
 	if params == nil {
 		params = map[string]any{}
 	}
-	client := synckit.NewClient(synckit.ClientConfig{Dial: wire.UnixDialer(sock), Build: synckit.Build})
+	client := synckit.NewClient(synckit.ClientConfig{Dial: wire.UnixDialer(sock), WireBuild: synckit.WireBuild})
 	defer func() { _ = client.Close() }()
 	resp, err := client.Call(ctx, &synckit.Request{Method: method, Params: params})
 	if err != nil {

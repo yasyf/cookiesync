@@ -6,15 +6,16 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
 
 	dkdaemon "github.com/yasyf/daemonkit/daemon"
-	"github.com/yasyf/daemonkit/daemonrole"
 	"github.com/yasyf/daemonkit/drain"
 	"github.com/yasyf/daemonkit/proc"
+	"github.com/yasyf/daemonkit/supervise"
 	"github.com/yasyf/daemonkit/wire"
 	"golang.org/x/sync/semaphore"
 
@@ -22,28 +23,13 @@ import (
 	synckit "github.com/yasyf/synckit/rpc"
 )
 
-func TestRuntimeRPCServerProtectsLifecycleCapacity(t *testing.T) {
-	executable, err := os.Executable()
-	if err != nil {
-		t.Fatalf("os.Executable: %v", err)
+func TestRuntimeRPCServerUsesExactSuiteIdentity(t *testing.T) {
+	server := runtimeRPCServer(synckit.NewDispatcher())
+	if server.Wire.WireBuild != synckit.WireBuild {
+		t.Fatalf("wire build = %q, want %q", server.Wire.WireBuild, synckit.WireBuild)
 	}
-	const build = "v9.8.7-test"
-	server, err := runtimeRPCServer(synckit.NewDispatcher(), executable, build)
-	if err != nil {
-		t.Fatalf("runtimeRPCServer: %v", err)
-	}
-	if server.Wire.Build != synckit.Build || server.Wire.LifecycleBuild != build {
-		t.Fatalf("server builds = business %q lifecycle %q", server.Wire.Build, server.Wire.LifecycleBuild)
-	}
-	if server.Wire.ReservedProtectedSessions != 1 {
-		t.Fatalf("reserved protected sessions = %d, want 1", server.Wire.ReservedProtectedSessions)
-	}
-	role, ok := server.Wire.ProtectedSessionClassifier.(daemonrole.Classifier)
-	if !ok {
-		t.Fatalf("protected classifier = %T, want daemonrole.Classifier", server.Wire.ProtectedSessionClassifier)
-	}
-	if role.RoleID != helperRoleID || role.RolePath != executable {
-		t.Fatalf("helper role = %+v", role)
+	if !strings.HasPrefix(synckit.WireBuild, "com.yasyf.synckit.rpc/") || !strings.HasSuffix(synckit.WireBuild, "/v1") {
+		t.Fatalf("wire build = %q, want fingerprinted v1 suite", synckit.WireBuild)
 	}
 }
 
@@ -67,6 +53,16 @@ func TestHelperRolePathResolvesStableAlias(t *testing.T) {
 	}
 }
 
+func prepareHelperRuntime(t *testing.T, executable string) {
+	t.Helper()
+	dir := t.TempDir()
+	if err := os.Symlink(executable, filepath.Join(dir, "synckitd")); err != nil {
+		t.Fatalf("Symlink synckitd: %v", err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+}
+
 func TestHelperRuntimeActivatesAfterOwnershipAndClosesGeneration(t *testing.T) {
 	t.Setenv(paths.ConfigDirEnv, t.TempDir())
 	socketDir, err := os.MkdirTemp("/tmp", "cookiesync-runtime-")
@@ -79,12 +75,13 @@ func TestHelperRuntimeActivatesAfterOwnershipAndClosesGeneration(t *testing.T) {
 	if err != nil {
 		t.Fatalf("os.Executable: %v", err)
 	}
+	prepareHelperRuntime(t, executable)
 
 	var builds atomic.Int32
 	var closes atomic.Int32
 	activated := make(chan struct{})
 	d := &Daemon{bridges: map[string]session{}, bridgeStop: make(chan struct{})}
-	builder := func(context.Context) (*Daemon, func(context.Context) error, error) {
+	builder := func(context.Context, *supervise.Pool) (*Daemon, func(context.Context) error, error) {
 		if _, err := os.Stat(sock); err != nil {
 			return nil, nil, errors.New("builder ran before listener ownership")
 		}
@@ -122,9 +119,23 @@ func TestHelperRuntimeActivatesAfterOwnershipAndClosesGeneration(t *testing.T) {
 		cancel()
 		t.Fatalf("Health: %v", err)
 	}
-	if health.Build != build || health.Protocol != int(wire.ProtocolVersion) || health.State != dkdaemon.StateHealthy {
+	if health.RuntimeBuild != build || health.RuntimeProtocol != int(synckit.Version) ||
+		health.ProcessGeneration == "" || health.State != dkdaemon.StateHealthy || !health.Ready {
 		cancel()
 		t.Fatalf("health = %+v", health)
+	}
+	client := synckit.NewClient(synckit.ClientConfig{Dial: wire.UnixDialer(sock), WireBuild: synckit.WireBuild})
+	defer func() { _ = client.Close() }()
+	observed, err := client.RuntimeHealth(readyCtx)
+	if err != nil {
+		cancel()
+		t.Fatalf("RuntimeHealth: %v", err)
+	}
+	if observed.RuntimeBuild != build || observed.RuntimeProtocol != int(synckit.Version) ||
+		observed.ProcessGeneration != health.ProcessGeneration || observed.PID != health.PID ||
+		observed.State != string(dkdaemon.StateHealthy) || !observed.Ready {
+		cancel()
+		t.Fatalf("observed health = %+v, runtime health = %+v", observed, health)
 	}
 
 	cancel()
@@ -144,12 +155,85 @@ func TestHelperRuntimeActivatesAfterOwnershipAndClosesGeneration(t *testing.T) {
 	}
 }
 
+func TestHelperRuntimeDrainsKeepaliveBeforeAdmissionSettlement(t *testing.T) {
+	t.Setenv(paths.ConfigDirEnv, t.TempDir())
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	prepareHelperRuntime(t, executable)
+	socketDir, err := os.MkdirTemp("/tmp", "cookiesync-drain-runtime-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(socketDir) })
+	sock := filepath.Join(socketDir, "rpc.sock")
+	d := &Daemon{bridges: map[string]session{}, bridgeStop: make(chan struct{})}
+	builder := func(context.Context, *supervise.Pool) (*Daemon, func(context.Context) error, error) {
+		return d, func(context.Context) error { return nil }, nil
+	}
+	runtime, err := newHelperRuntime(sock, executable, "v9.8.7-drain-test", builder)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- runtime.Run(ctx) }()
+	readyCtx, readyCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer readyCancel()
+	if err := runtime.WaitReady(readyCtx); err != nil {
+		cancel()
+		t.Fatalf("WaitReady: %v", err)
+	}
+	client := synckit.NewClient(synckit.ClientConfig{Dial: wire.UnixDialer(sock), WireBuild: synckit.WireBuild})
+	defer func() { _ = client.Close() }()
+	type callResult struct {
+		response *synckit.Response
+		err      error
+	}
+	callDone := make(chan callResult, 1)
+	go func() {
+		response, callErr := client.Call(context.Background(), &synckit.Request{
+			Method: "bridge_keepalive", Params: map[string]any{"capability": "cap-a"},
+		})
+		callDone <- callResult{response: response, err: callErr}
+	}()
+	select {
+	case result := <-callDone:
+		cancel()
+		t.Fatalf("keepalive returned before runtime drain: response=%+v err=%v", result.response, result.err)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("runtime.Run: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("runtime admission settlement waited on the live keepalive")
+	}
+	select {
+	case result := <-callDone:
+		if result.err != nil || result.response == nil || !result.response.OK {
+			t.Fatalf("drained keepalive response=%+v err=%v", result.response, result.err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("drained keepalive did not return")
+	}
+	if !d.bridgeShutdown {
+		t.Fatal("runtime drain did not close the bridge generation")
+	}
+}
+
 func TestHelperRuntimeSettlesBridgeRecoveryBeforeReadiness(t *testing.T) {
 	t.Setenv(paths.ConfigDirEnv, t.TempDir())
 	executable, err := os.Executable()
 	if err != nil {
 		t.Fatal(err)
 	}
+	prepareHelperRuntime(t, executable)
 	old, err := newBridgeProcessesGeneration(executable, "prior-runtime-generation")
 	if err != nil {
 		t.Fatal(err)
@@ -175,7 +259,7 @@ func TestHelperRuntimeSettlesBridgeRecoveryBeforeReadiness(t *testing.T) {
 		runner: runner, bridges: map[string]session{}, bridgeStop: make(chan struct{}),
 		bridgeSlots: semaphore.NewWeighted(bridgeProcessCapacity),
 	}
-	builder := func(context.Context) (*Daemon, func(context.Context) error, error) {
+	builder := func(context.Context, *supervise.Pool) (*Daemon, func(context.Context) error, error) {
 		return d, func(context.Context) error { return nil }, nil
 	}
 	socketDir, err := os.MkdirTemp("/tmp", "cookiesync-recovery-runtime-")
@@ -232,6 +316,7 @@ func TestHelperRuntimeReapsBridgeProcessesBeforeBuilderFailure(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	prepareHelperRuntime(t, executable)
 	old, err := newBridgeProcessesGeneration(executable, "builder-failure-prior-generation")
 	if err != nil {
 		t.Fatal(err)
@@ -259,7 +344,7 @@ func TestHelperRuntimeReapsBridgeProcessesBeforeBuilderFailure(t *testing.T) {
 
 	var reapedBeforeBuilder atomic.Bool
 	errBuilder := errors.New("test builder failure")
-	builder := func(ctx context.Context) (*Daemon, func(context.Context) error, error) {
+	builder := func(ctx context.Context, _ *supervise.Pool) (*Daemon, func(context.Context) error, error) {
 		waited := make(chan struct{})
 		go func() {
 			_ = command.Wait()
@@ -304,7 +389,6 @@ func TestHelperSessionDrainReleasesKeepaliveAdmission(t *testing.T) {
 	d := &Daemon{bridges: map[string]session{}, bridgeStop: make(chan struct{})}
 	owner := newHelperOwner()
 	owner.set(d, nil)
-	server := &helperSessionServer{Server: &wire.Server{}, owner: owner}
 	intake := &drain.Intake{}
 	release, err := intake.Admit()
 	if err != nil {
@@ -323,9 +407,7 @@ func TestHelperSessionDrainReleasesKeepaliveAdmission(t *testing.T) {
 	}
 
 	intake.Close()
-	if err := server.CloseIntake(); err != nil {
-		t.Fatalf("CloseIntake: %v", err)
-	}
+	owner.Close()
 	settleCtx, settleCancel := context.WithTimeout(context.Background(), time.Second)
 	defer settleCancel()
 	if err := intake.Settle(settleCtx); err != nil {

@@ -52,9 +52,9 @@ type registryEnvelope struct {
 
 // NewSSHFetcher builds the peer-registry fetcher that dials each peer's rpc-serve bridge
 // over ssh-stdio.
-func NewSSHFetcher() SSHFetcher {
+func NewSSHFetcher(runner syncservice.TransportRunner) SSHFetcher {
 	return newSSHFetcher(func(peer string) stateGetter {
-		return syncservice.NewClient(syncservice.SSHStdio(peer, registryServeCmd))
+		return syncservice.NewClient(runner.SSHStdio(peer, registryServeCmd))
 	})
 }
 

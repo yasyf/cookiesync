@@ -45,7 +45,7 @@ func TestPeerSIDRequestorOverSocket(t *testing.T) {
 		<-done
 	})
 
-	client := synckit.NewClient(synckit.ClientConfig{Dial: wire.UnixDialer(sock), Build: synckit.Build})
+	client := synckit.NewClient(synckit.ClientConfig{Dial: wire.UnixDialer(sock), WireBuild: synckit.WireBuild})
 	defer func() { _ = client.Close() }()
 	resp, err := client.Call(context.Background(), &synckit.Request{
 		Method: "prime_auth", Params: map[string]any{"browser": "chrome"},

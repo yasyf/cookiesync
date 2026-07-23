@@ -8,6 +8,7 @@ import (
 	"github.com/yasyf/cookiesync/internal/state"
 	"github.com/yasyf/synckit/converge"
 	"github.com/yasyf/synckit/cregistry"
+	"github.com/yasyf/synckit/syncservice"
 )
 
 // fixedRunner serves a canned reply for any ssh call, recording every command so a test
@@ -41,7 +42,7 @@ func (f *recordingFetcher) Fetch(_ context.Context, peer string) (cregistry.Regi
 func withFetcher(t *testing.T, f converge.Fetcher[state.EndpointMeta]) {
 	t.Helper()
 	prev := newFetcher
-	newFetcher = func() converge.Fetcher[state.EndpointMeta] { return f }
+	newFetcher = func(syncservice.TransportRunner) converge.Fetcher[state.EndpointMeta] { return f }
 	t.Cleanup(func() { newFetcher = prev })
 }
 
