@@ -22,6 +22,9 @@ func newTestStore(t *testing.T, now time.Time) (*Store, string) {
 	cfg := hostregistry.Config{Name: "cookiesync"}
 	dir := testutil.IsolateHostConfig(t, cfg)
 	store := NewWithClock(cfg, func() time.Time { return now })
+	if err := store.Initialize(context.Background()); err != nil {
+		t.Fatalf("Initialize: %v", err)
+	}
 	return store, filepath.Join(dir, "state.json")
 }
 
@@ -146,15 +149,13 @@ func TestConsentRouteHardRoundTrip(t *testing.T) {
 	}
 }
 
-// TestForeignKeyPreserve proves a write through the cookiesync store leaves the host
-// registry's own keys (self, hosts) untouched, since both share the one state.json.
-func TestForeignKeyPreserve(t *testing.T) {
+func TestExactEnvelopeOwnersDoNotClobberEachOther(t *testing.T) {
 	ctx := context.Background()
 	now := time.Unix(1_700_000_000, 0)
 	store, path := newTestStore(t, now)
 
 	// Seed a host-registry slice into the same file first.
-	cfg := hostregistry.Config{Name: "cookiesync"}
+	cfg := store.cfg
 	if _, err := cfg.Update(ctx, func(g *hostregistry.Registry) error {
 		g.Self = "me@laptop"
 		g.UpsertHost("you@desktop")
@@ -169,26 +170,26 @@ func TestForeignKeyPreserve(t *testing.T) {
 	}
 
 	raw := readStateFile(t, path)
-	if _, ok := raw["hosts"]; !ok {
-		t.Fatalf("host registry 'hosts' key clobbered by cookiesync write")
+	var host hostRegistryStateForTest
+	if err := json.Unmarshal(raw["host_registry"], &host); err != nil {
+		t.Fatalf("parse host_registry: %v", err)
 	}
-	var hosts []string
-	if err := json.Unmarshal(raw["hosts"], &hosts); err != nil {
-		t.Fatalf("parse hosts: %v", err)
-	}
-	if len(hosts) != 1 || hosts[0] != "you@desktop" {
-		t.Fatalf("hosts = %+v, want [you@desktop]", hosts)
+	if host.Self != "me@laptop" || len(host.Hosts) != 1 || host.Hosts[0] != "you@desktop" {
+		t.Fatalf("host_registry = %+v", host)
 	}
 	var persisted stateJSON
-	if err := json.Unmarshal(raw[keyState], &persisted); err != nil {
+	if err := json.Unmarshal(raw[stateNamespace], &persisted); err != nil {
 		t.Fatalf("parse cookiesync envelope: %v", err)
-	}
-	if persisted.SchemaVersion != SchemaVersion {
-		t.Fatalf("schema_version = %d, want %d", persisted.SchemaVersion, SchemaVersion)
 	}
 	if _, ok := persisted.Browsers[string(ep.ID())]; !ok {
 		t.Fatalf("cookiesync envelope missing browser")
 	}
+}
+
+type hostRegistryStateForTest struct {
+	Self  string              `json:"self"`
+	Hosts []string            `json:"hosts"`
+	Addrs map[string][]string `json:"addrs"`
 }
 
 // TestSaveRegistryUnlockedNoSelfDeadlock proves the *Unlocked save path can be called
@@ -286,7 +287,7 @@ func TestDefaultSettingsSerialize(t *testing.T) {
 	}
 }
 
-func TestStateIgnoresForeignTopLevelKeysWithoutEnvelope(t *testing.T) {
+func TestStateRejectsForeignTopLevelKeysWithoutEnvelope(t *testing.T) {
 	store, path := newTestStore(t, time.Unix(1_700_000_000, 0))
 	body := `{"another_owner":{"schema_version":99}}`
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
@@ -296,29 +297,39 @@ func TestStateIgnoresForeignTopLevelKeysWithoutEnvelope(t *testing.T) {
 		t.Fatalf("seed state file: %v", err)
 	}
 
-	got, err := store.Load(context.Background())
-	if err != nil {
-		t.Fatalf("Load foreign state: %v", err)
-	}
-	if got.Settings != DefaultSettings() || got.Browsers == nil || got.Baselines == nil {
-		t.Fatalf("Load foreign state = %+v, want fresh defaults", got)
+	if _, err := store.Load(context.Background()); !errors.Is(err, hostregistry.ErrStateSchema) {
+		t.Fatalf("Load foreign state = %v, want ErrStateSchema", err)
 	}
 }
 
 func TestStateRejectsWrongOrExtendedV1Schema(t *testing.T) {
-	for _, body := range []string{
-		`{"cookiesync":{"schema_version":2,"self_target":"","settings":{"interval":"15m","idle_threshold":"5m","watch_debounce":"3s","auth_ttl":"1h"},"consent_route_to":"","consent_route_hard":false,"browsers":{},"row_baselines":{}}}`,
-		`{"cookiesync":{"schema_version":1,"self_target":"","settings":{"interval":"15m","idle_threshold":"5m","watch_debounce":"3s","auth_ttl":"1h","op_timeout":"2m"},"consent_route_to":"","consent_route_hard":false,"browsers":{},"row_baselines":{}}}`,
+	for _, mutate := range []func(map[string]json.RawMessage){
+		func(raw map[string]json.RawMessage) {
+			var schema map[string]any
+			_ = json.Unmarshal(raw["schema"], &schema)
+			schema["version"] = 2
+			raw["schema"], _ = json.Marshal(schema)
+		},
+		func(raw map[string]json.RawMessage) {
+			var product map[string]any
+			_ = json.Unmarshal(raw[stateNamespace], &product)
+			product["extra"] = true
+			raw[stateNamespace], _ = json.Marshal(product)
+		},
+		func(raw map[string]json.RawMessage) { raw["foreign"] = json.RawMessage(`{}`) },
 	} {
 		store, path := newTestStore(t, time.Unix(1_700_000_000, 0))
-		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		raw := readStateFile(t, path)
+		mutate(raw)
+		body, err := json.Marshal(raw)
+		if err != nil {
 			t.Fatal(err)
 		}
-		if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		if err := os.WriteFile(path, body, 0o600); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := store.Load(context.Background()); !errors.Is(err, ErrSchemaMismatch) {
-			t.Fatalf("Load incompatible state = %v, want schema mismatch", err)
+		if _, err := store.Load(context.Background()); !errors.Is(err, hostregistry.ErrStateSchema) {
+			t.Fatalf("Load incompatible state = %v, want ErrStateSchema", err)
 		}
 	}
 }
@@ -368,7 +379,7 @@ func TestBaselinesRoundTrip(t *testing.T) {
 	}
 	raw := readStateFile(t, path)
 	var persisted stateJSON
-	if err := json.Unmarshal(raw[keyState], &persisted); err != nil {
+	if err := json.Unmarshal(raw[stateNamespace], &persisted); err != nil {
 		t.Fatal(err)
 	}
 	if persisted.Baselines["me@laptop:arc:Default"] != want["me@laptop:arc:Default"] {

@@ -2,10 +2,9 @@ package mesh
 
 import (
 	"context"
-	"encoding/json"
-	"os"
-	"path/filepath"
 	"testing"
+
+	"github.com/yasyf/synckit/hostregistry"
 )
 
 // writeMesh seeds the shared synckit host registry under a temp XDG_CONFIG_HOME so
@@ -18,19 +17,11 @@ func writeMesh(t *testing.T, self string, hosts ...string) {
 	}
 	cfg := t.TempDir()
 	t.Setenv("XDG_CONFIG_HOME", cfg)
-	dir := filepath.Join(cfg, "synckit")
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		t.Fatalf("mkdir synckit: %v", err)
+	if err := hostregistry.Mesh.InitializeState(context.Background()); err != nil {
+		t.Fatal(err)
 	}
-	payload, err := json.Marshal(struct {
-		Self  string   `json:"self"`
-		Hosts []string `json:"hosts"`
-	}{self, hosts})
-	if err != nil {
-		t.Fatalf("marshal mesh: %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(dir, "state.json"), payload, 0o600); err != nil {
-		t.Fatalf("write mesh state: %v", err)
+	if _, err := hostregistry.Mesh.Update(context.Background(), func(g *hostregistry.Registry) error { g.Self = self; g.Hosts = hosts; return nil }); err != nil {
+		t.Fatal(err)
 	}
 }
 

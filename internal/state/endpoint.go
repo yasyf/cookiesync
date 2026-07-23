@@ -1,9 +1,7 @@
-// Package state loads and persists cookiesync's slice of the shared state.json: the
-// self target, the cadence settings, the optional consent route, and the tracked
-// browser endpoints as a convergent registry. It layers on the shared
-// github.com/yasyf/synckit/hostregistry primitives — the same cross-process flock and
-// the foreign-key-preserving raw writer — so cookiesync and the host registry share
-// one file without clobbering each other's keys.
+// Package state loads and persists cookiesync's exact product payload: the self
+// target, cadence settings, optional consent route, and tracked browser endpoints
+// as a convergent registry. It layers on the shared
+// github.com/yasyf/synckit/hostregistry exact-envelope and cross-process flock.
 //
 // The browser endpoints are a [cregistry.Registry] (a LWW-Element-Set CRDT) keyed by
 // each endpoint's stable id "host:browser:profile", which is what lets an add or

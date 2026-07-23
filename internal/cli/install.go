@@ -11,6 +11,7 @@ import (
 
 	"github.com/yasyf/cookiesync/internal/daemon"
 	"github.com/yasyf/cookiesync/internal/paths"
+	"github.com/yasyf/cookiesync/internal/state"
 	"github.com/yasyf/synckit/codec"
 	"github.com/yasyf/synckit/hostregistry"
 	"github.com/yasyf/synckit/manifest"
@@ -112,6 +113,9 @@ func manifestPath() (string, error) {
 // surfaced here (run doctor to recheck) but does not block the manifest. Convergence is
 // driven by synckitd, which the user installs separately.
 func runInstall(cmd *cobra.Command, _ []string) error {
+	if err := state.New(paths.Config).Initialize(cmd.Context()); err != nil {
+		return fmt.Errorf("initialize cookie-sync state: %w", err)
+	}
 	noteHelper(cmd)
 	m, err := cookiesyncManifest()
 	if err != nil {

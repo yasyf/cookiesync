@@ -1,12 +1,10 @@
 package state
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"os"
 	"time"
 
 	"github.com/yasyf/synckit/cregistry"
@@ -14,13 +12,10 @@ import (
 )
 
 const (
-	keyState = "cookiesync"
-	// SchemaVersion is the only cookiesync state epoch this binary accepts.
-	SchemaVersion = 1
+	stateIdentity    = "cookie-sync-state-v1"
+	stateNamespace   = "cookie_sync"
+	stateDeclaration = "schema:{identity:string,version:uint64,fingerprint:string};host_registry:{self:string,hosts:array<string>,addrs:map<string,array<string>>};cookie_sync:{self_target:string,settings:{interval:duration,idle_threshold:duration,watch_debounce:duration,auth_ttl:duration},consent_route_to:string,consent_route_hard:bool,browsers:map<string,{added_at:int64,removed_at:int64,value:{host:string,browser:string,profile:string}}>,row_baselines:map<string,{rows:int,quarantined:bool,quarantined_rows:int}>}"
 )
-
-// ErrSchemaMismatch means the cookiesync envelope is not exact schema v1.
-var ErrSchemaMismatch = errors.New("cookiesync state schema mismatch; manually recreate cookiesync state in a fresh schema_version 1 envelope")
 
 // Baseline is one endpoint's last-known-good extracted cookie rowcount and its
 // mass-drop quarantine state, keyed by endpoint id in state.json. A collapse flips
@@ -44,7 +39,6 @@ type State struct {
 }
 
 type stateJSON struct {
-	SchemaVersion    uint64                           `json:"schema_version"`
 	SelfTarget       string                           `json:"self_target"`
 	Settings         settingsJSON                     `json:"settings"`
 	ConsentRouteTo   string                           `json:"consent_route_to"`
@@ -64,11 +58,10 @@ func (s *State) Endpoints() []Endpoint {
 	return out
 }
 
-// Store is cookiesync's handle on the shared state.json: it owns the cookiesync keys
-// and shares the host registry's cross-process flock and foreign-key-preserving raw
-// writer, so cookiesync and the host registry never clobber each other's slice of the
-// file. now is injectable so the registry's add/remove stamps are deterministic in
-// tests.
+// Store is cookiesync's handle on the exact state.json envelope. It owns the
+// cookie_sync payload and shares the host registry's cross-process flock, so
+// mutations cannot clobber the declared host_registry payload. now is injectable
+// so registry stamps are deterministic in tests.
 type Store struct {
 	cfg hostregistry.Config
 	now func() time.Time
@@ -76,13 +69,23 @@ type Store struct {
 
 // New builds a Store over cfg, stamping registry mutations with the wall clock.
 func New(cfg hostregistry.Config) *Store {
-	return &Store{cfg: cfg, now: time.Now}
+	return &Store{cfg: cfg.WithStateContract(stateContract()), now: time.Now}
 }
 
 // NewWithClock builds a Store over cfg with an injected clock, for tests.
 func NewWithClock(cfg hostregistry.Config, now func() time.Time) *Store {
-	return &Store{cfg: cfg, now: now}
+	return &Store{cfg: cfg.WithStateContract(stateContract()), now: now}
 }
+
+func stateContract() hostregistry.StateContract {
+	return hostregistry.StateContract{
+		Identity: stateIdentity, Fingerprint: hostregistry.SchemaFingerprint(stateIdentity, stateDeclaration),
+		ProductNamespace: stateNamespace, InitialProduct: mustEncodeState(defaultState()), ValidateProduct: validateProduct,
+	}
+}
+
+// Initialize creates a fresh complete v1 envelope when none exists.
+func (s *Store) Initialize(ctx context.Context) error { return s.cfg.InitializeState(ctx) }
 
 // WithLock runs fn while holding the shared reconcile flock — the same lock every
 // cross-package writer of state.json acquires. A whole multi-step pass (such as a
@@ -92,47 +95,20 @@ func (s *Store) WithLock(ctx context.Context, fn func() error) error {
 	return s.cfg.WithLock(ctx, fn)
 }
 
-// readRaw reads state.json as raw JSON keys, returning an empty map when the file does
-// not yet exist. It is a pure read — no lock, no write-back — so a read never churns
-// the file or its key order.
-func (s *Store) readRaw() (map[string]json.RawMessage, error) {
-	path, err := s.cfg.Path()
-	if err != nil {
-		return nil, err
-	}
-	data, err := os.ReadFile(path) //nolint:gosec // G304: path is the tool's own state.json under the fixed config dir, not user-supplied.
-	if errors.Is(err, os.ErrNotExist) {
-		return map[string]json.RawMessage{}, nil
-	}
-	if err != nil {
-		return nil, fmt.Errorf("read state %s: %w", path, err)
-	}
-	var raw map[string]json.RawMessage
-	if err := json.Unmarshal(data, &raw); err != nil {
-		return nil, fmt.Errorf("parse state %s: %w", path, err)
-	}
-	return raw, nil
-}
-
-// Load reads the full cookiesync state, returning defaults for any key the file does
-// not yet carry. It is a pure read.
+// Load reads the full exact schema v1 cookie-sync state.
 func (s *Store) Load(_ context.Context) (*State, error) {
-	raw, err := s.readRaw()
+	raw, err := s.cfg.LoadProduct()
 	if err != nil {
 		return nil, err
 	}
-	return stateFromRaw(raw)
+	return stateFromProduct(raw)
 }
 
 // LoadRegistry reads the convergent endpoint registry — including tombstones — out of
 // state.json. It is the [converge.Driver] read side; a pure read that never acquires
 // the flock, since the converge orchestration wraps the whole pass in WithLock.
-func (s *Store) LoadRegistry(_ context.Context) (cregistry.Registry[EndpointMeta], error) {
-	raw, err := s.readRaw()
-	if err != nil {
-		return nil, err
-	}
-	st, err := stateFromRaw(raw)
+func (s *Store) LoadRegistry(ctx context.Context) (cregistry.Registry[EndpointMeta], error) {
+	st, err := s.Load(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -145,25 +121,21 @@ func (s *Store) LoadRegistry(_ context.Context) (cregistry.Registry[EndpointMeta
 // (non-reentrant) flock around the whole pass, so re-acquiring it here would
 // self-deadlock. Use SaveRegistry for the standalone, lock-acquiring write.
 func (s *Store) SaveRegistryUnlocked(_ context.Context, reg cregistry.Registry[EndpointMeta]) error {
-	return s.cfg.UpdateRawUnlocked(func(raw map[string]json.RawMessage) error {
-		st, err := stateFromRaw(raw)
+	return s.cfg.UpdateProductUnlocked(func(raw json.RawMessage) (json.RawMessage, error) {
+		st, err := stateFromProduct(raw)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		st.Browsers = reg
-		return putState(raw, st)
+		return encodeState(st)
 	})
 }
 
 // Baselines reads the per-endpoint rowcount ledger out of state.json. A pure read that
 // never acquires the flock (the converge pass consulting it already holds it); an
 // absent key yields an empty, non-nil map.
-func (s *Store) Baselines(_ context.Context) (map[string]Baseline, error) {
-	raw, err := s.readRaw()
-	if err != nil {
-		return nil, err
-	}
-	st, err := stateFromRaw(raw)
+func (s *Store) Baselines(ctx context.Context) (map[string]Baseline, error) {
+	st, err := s.Load(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -174,13 +146,13 @@ func (s *Store) Baselines(_ context.Context) (map[string]Baseline, error) {
 // state.json, preserving every other key, WITHOUT acquiring the flock — the converge
 // pass writing it already holds the (non-reentrant) lock.
 func (s *Store) SaveBaselinesUnlocked(_ context.Context, baselines map[string]Baseline) error {
-	return s.cfg.UpdateRawUnlocked(func(raw map[string]json.RawMessage) error {
-		st, err := stateFromRaw(raw)
+	return s.cfg.UpdateProductUnlocked(func(raw json.RawMessage) (json.RawMessage, error) {
+		st, err := stateFromProduct(raw)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		st.Baselines = baselines
-		return putState(raw, st)
+		return encodeState(st)
 	})
 }
 
@@ -188,13 +160,13 @@ func (s *Store) SaveBaselinesUnlocked(_ context.Context, baselines map[string]Ba
 // standalone callers; the converge pass uses SaveRegistryUnlocked because it already
 // holds the lock.
 func (s *Store) SaveRegistry(ctx context.Context, reg cregistry.Registry[EndpointMeta]) error {
-	return s.cfg.UpdateRaw(ctx, func(raw map[string]json.RawMessage) error {
-		st, err := stateFromRaw(raw)
+	return s.cfg.UpdateProduct(ctx, func(raw json.RawMessage) (json.RawMessage, error) {
+		st, err := stateFromProduct(raw)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		st.Browsers = reg
-		return putState(raw, st)
+		return encodeState(st)
 	})
 }
 
@@ -204,14 +176,14 @@ func (s *Store) SaveRegistry(ctx context.Context, reg cregistry.Registry[Endpoin
 // stamp is strictly later than its tombstone.
 func (s *Store) AddBrowser(ctx context.Context, selfTarget string, endpoint Endpoint) error {
 	at := cregistry.UnixMicros(s.now())
-	return s.cfg.UpdateRaw(ctx, func(raw map[string]json.RawMessage) error {
-		st, err := stateFromRaw(raw)
+	return s.cfg.UpdateProduct(ctx, func(raw json.RawMessage) (json.RawMessage, error) {
+		st, err := stateFromProduct(raw)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		st.Browsers.Add(string(endpoint.ID()), endpoint.Meta(), at)
 		st.SelfTarget = selfTarget
-		return putState(raw, st)
+		return encodeState(st)
 	})
 }
 
@@ -220,77 +192,66 @@ func (s *Store) AddBrowser(ctx context.Context, selfTarget string, endpoint Endp
 // never saw it.
 func (s *Store) RemoveBrowser(ctx context.Context, endpoint Endpoint) error {
 	at := cregistry.UnixMicros(s.now())
-	return s.cfg.UpdateRaw(ctx, func(raw map[string]json.RawMessage) error {
-		st, err := stateFromRaw(raw)
+	return s.cfg.UpdateProduct(ctx, func(raw json.RawMessage) (json.RawMessage, error) {
+		st, err := stateFromProduct(raw)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		st.Browsers.Remove(string(endpoint.ID()), at)
-		return putState(raw, st)
+		return encodeState(st)
 	})
 }
 
 // SetConsentRoute records target as the host the consent gate routes user-presence
 // checks to first.
 func (s *Store) SetConsentRoute(ctx context.Context, target string) error {
-	return s.cfg.UpdateRaw(ctx, func(raw map[string]json.RawMessage) error {
-		st, err := stateFromRaw(raw)
+	return s.cfg.UpdateProduct(ctx, func(raw json.RawMessage) (json.RawMessage, error) {
+		st, err := stateFromProduct(raw)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		st.ConsentRouteTo = target
-		return putState(raw, st)
+		return encodeState(st)
 	})
 }
 
 // SetConsentRouteHard records whether the consent gate must route to the configured
 // target even when this host looks locally attended.
 func (s *Store) SetConsentRouteHard(ctx context.Context, hard bool) error {
-	return s.cfg.UpdateRaw(ctx, func(raw map[string]json.RawMessage) error {
-		st, err := stateFromRaw(raw)
+	return s.cfg.UpdateProduct(ctx, func(raw json.RawMessage) (json.RawMessage, error) {
+		st, err := stateFromProduct(raw)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		st.ConsentRouteHard = hard
-		return putState(raw, st)
+		return encodeState(st)
 	})
 }
 
 // SetAuthTTL overrides the cached-key TTL setting, leaving the other cadence knobs
 // untouched.
 func (s *Store) SetAuthTTL(ctx context.Context, ttl time.Duration) error {
-	return s.cfg.UpdateRaw(ctx, func(raw map[string]json.RawMessage) error {
-		st, err := stateFromRaw(raw)
+	return s.cfg.UpdateProduct(ctx, func(raw json.RawMessage) (json.RawMessage, error) {
+		st, err := stateFromProduct(raw)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		st.Settings.AuthTTL = ttl
-		return putState(raw, st)
+		return encodeState(st)
 	})
 }
 
-// stateFromRaw decodes only the exact v1 cookiesync envelope. An absent envelope
-// is fresh state; every other top-level key belongs to another state owner.
-func stateFromRaw(raw map[string]json.RawMessage) (*State, error) {
-	encoded, found := raw[keyState]
-	if !found {
-		return defaultState(), nil
-	}
+func stateFromProduct(encoded json.RawMessage) (*State, error) {
 	var persisted stateJSON
-	decoder := json.NewDecoder(bytes.NewReader(encoded))
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(&persisted); err != nil {
-		return nil, fmt.Errorf("%w: decode v1 envelope: %w", ErrSchemaMismatch, err)
-	}
-	if persisted.SchemaVersion != SchemaVersion {
-		return nil, fmt.Errorf("%w: state=%d binary=%d", ErrSchemaMismatch, persisted.SchemaVersion, SchemaVersion)
+	if err := hostregistry.DecodeExactJSON(encoded, &persisted); err != nil {
+		return nil, fmt.Errorf("decode cookie_sync: %w", err)
 	}
 	if persisted.Browsers == nil || persisted.Baselines == nil {
-		return nil, fmt.Errorf("%w: v1 browsers and row_baselines must be objects", ErrSchemaMismatch)
+		return nil, errors.New("cookie_sync browsers and row_baselines must be objects")
 	}
 	settings, err := settingsFromJSON(persisted.Settings)
 	if err != nil {
-		return nil, fmt.Errorf("%w: parse settings: %w", ErrSchemaMismatch, err)
+		return nil, fmt.Errorf("parse cookie_sync settings: %w", err)
 	}
 	return &State{
 		SelfTarget: persisted.SelfTarget, Settings: settings,
@@ -306,18 +267,27 @@ func defaultState() *State {
 	}
 }
 
-func putState(raw map[string]json.RawMessage, st *State) error {
+func encodeState(st *State) (json.RawMessage, error) {
 	if st.Browsers == nil || st.Baselines == nil {
-		return errors.New("encode cookiesync state: browsers and baselines must be non-nil")
+		return nil, errors.New("encode cookie-sync state: browsers and baselines must be non-nil")
 	}
 	encoded, err := json.Marshal(stateJSON{
-		SchemaVersion: SchemaVersion, SelfTarget: st.SelfTarget, Settings: st.Settings.toJSON(),
+		SelfTarget: st.SelfTarget, Settings: st.Settings.toJSON(),
 		ConsentRouteTo: st.ConsentRouteTo, ConsentRouteHard: st.ConsentRouteHard,
 		Browsers: st.Browsers, Baselines: st.Baselines,
 	})
 	if err != nil {
-		return fmt.Errorf("encode cookiesync state: %w", err)
+		return nil, fmt.Errorf("encode cookie-sync state: %w", err)
 	}
-	raw[keyState] = encoded
-	return nil
+	return encoded, nil
+}
+
+func validateProduct(raw json.RawMessage) error { _, err := stateFromProduct(raw); return err }
+
+func mustEncodeState(st *State) json.RawMessage {
+	raw, err := encodeState(st)
+	if err != nil {
+		panic(err)
+	}
+	return raw
 }

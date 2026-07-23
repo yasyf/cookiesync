@@ -8,6 +8,10 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/yasyf/cookiesync/internal/paths"
+	"github.com/yasyf/cookiesync/internal/state"
+	"github.com/yasyf/synckit/hostregistry"
 )
 
 // seedRegistry seeds the shared synckit host registry with this self target and peers,
@@ -24,19 +28,14 @@ func seedRegistry(t *testing.T, self string, hosts ...string) {
 		xdg = t.TempDir()
 		t.Setenv("XDG_CONFIG_HOME", xdg)
 	}
-	dir := filepath.Join(xdg, "synckit")
-	if err := os.MkdirAll(dir, 0o700); err != nil { //nolint:gosec // G703: dir is under this test's own XDG_CONFIG_HOME temp root, not user-supplied.
-		t.Fatalf("mkdir synckit: %v", err)
+	if err := hostregistry.Mesh.InitializeState(context.Background()); err != nil {
+		t.Fatal(err)
 	}
-	payload, err := json.Marshal(struct {
-		Self  string   `json:"self"`
-		Hosts []string `json:"hosts"`
-	}{self, hosts})
-	if err != nil {
-		t.Fatalf("marshal registry: %v", err)
+	if _, err := hostregistry.Mesh.Update(context.Background(), func(g *hostregistry.Registry) error { g.Self = self; g.Hosts = hosts; return nil }); err != nil {
+		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(dir, "state.json"), payload, 0o600); err != nil { //nolint:gosec // G703: path is under this test's own XDG_CONFIG_HOME temp root, not user-supplied.
-		t.Fatalf("write mesh state: %v", err)
+	if err := state.New(paths.Config).Initialize(context.Background()); err != nil {
+		t.Fatal(err)
 	}
 }
 

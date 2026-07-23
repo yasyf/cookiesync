@@ -16,6 +16,7 @@ import (
 
 	"github.com/yasyf/daemonkit/proc"
 	"github.com/yasyf/daemonkit/supervise"
+	"github.com/yasyf/synckit/hostregistry"
 )
 
 // TestTunnelArgv proves the ssh argument vector replicates hostregistry's dial
@@ -305,16 +306,13 @@ func seedDialAddrs(t *testing.T, target string, addrs []string) {
 	t.Helper()
 	xdg := t.TempDir()
 	t.Setenv("XDG_CONFIG_HOME", xdg)
-	dir := filepath.Join(xdg, "synckit")
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		t.Fatalf("mkdir synckit: %v", err)
+	if err := hostregistry.Mesh.InitializeState(context.Background()); err != nil {
+		t.Fatal(err)
 	}
-	payload, err := json.Marshal(map[string]any{"addrs": map[string][]string{target: addrs}})
-	if err != nil {
-		t.Fatalf("marshal addrs: %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(dir, "state.json"), payload, 0o600); err != nil {
-		t.Fatalf("write state: %v", err)
+	for _, addr := range addrs {
+		if err := hostregistry.Mesh.AddAddr(context.Background(), target, addr); err != nil {
+			t.Fatal(err)
+		}
 	}
 }
 
