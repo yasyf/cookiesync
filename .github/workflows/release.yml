@@ -22,25 +22,6 @@ jobs:
       - name: Verify the tag is on main
         uses: yasyf/homebrew-tap/.github/actions/verify-tag-on-main@19c3d5013032ad9c88f9a8f1170d1f366c19b8d9
 
-      - name: Refuse to mutate a public release
-        env:
-          GH_TOKEN: ${{ github.token }}
-          TAG: ${{ github.ref_name }}
-        run: |
-          set -euo pipefail
-          state="$RUNNER_TEMP/releases.json"
-          gh api --paginate --slurp \
-            "repos/${GITHUB_REPOSITORY}/releases?per_page=100" > "$state"
-          count="$(jq --arg tag "$TAG" '[.[][] | select(.tag_name == $tag)] | length' "$state")"
-          if [ "$count" -gt 1 ]; then
-            echo "::error::found $count releases for $TAG; refusing an ambiguous mutation"
-            exit 1
-          elif [ "$count" -eq 1 ] && \
-            [ "$(jq -r --arg tag "$TAG" '.[][] | select(.tag_name == $tag) | .draft' "$state")" != true ]; then
-            echo "::error::release $TAG is already public; refusing to mutate it"
-            exit 1
-          fi
-
       - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
@@ -195,13 +176,11 @@ jobs:
           substitutions: |
             __SHA_APP__=${{ steps.app.outputs.sha256 }}
 
-      - name: Stage and verify the complete draft release
-        id: stage
+      - name: Record the exact release asset manifest
+        id: manifest
         env:
-          GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.ref_name }}
           APP_ZIP: ${{ steps.app.outputs.zip }}
-          TEAM_ID: ${{ steps.developer-id.outputs.team-id }}
         run: |
           set -euo pipefail
           app_sidecar="${APP_ZIP}.sha256"
@@ -213,78 +192,38 @@ jobs:
             "$app_sidecar"
           )
           for asset in "${assets[@]}"; do test -f "$asset"; done
+          manifest="$RUNNER_TEMP/cookiesync-release-assets"
+          printf '%s\n' "${assets[@]}" > "$manifest"
+          test "$(wc -l < "$manifest" | tr -d ' ')" = 5
 
-          releases="$RUNNER_TEMP/stage-releases.json"
-          gh api --paginate --slurp \
-            "repos/${GITHUB_REPOSITORY}/releases?per_page=100" > "$releases"
-          count="$(jq --arg tag "$TAG" '[.[][] | select(.tag_name == $tag)] | length' "$releases")"
-          if [ "$count" -gt 1 ]; then
-            echo "::error::found $count releases for $TAG; refusing an ambiguous mutation"
-            exit 1
-          elif [ "$count" -eq 0 ]; then
-            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" \
-              --draft --generate-notes --verify-tag
-            gh api --paginate --slurp \
-              "repos/${GITHUB_REPOSITORY}/releases?per_page=100" > "$releases"
-            count="$(jq --arg tag "$TAG" '[.[][] | select(.tag_name == $tag)] | length' "$releases")"
-          fi
-          test "$count" -eq 1 || {
-            echo "::error::expected exactly one release for $TAG after draft creation, found $count"
-            exit 1
-          }
-          state="$(jq -c --arg tag "$TAG" '.[][] | select(.tag_name == $tag)' "$releases")"
-          test "$(jq -r .draft <<< "$state")" = true || {
-            echo "::error::release $TAG is public; refusing to mutate it"
-            exit 1
-          }
-          release_id="$(jq -r .id <<< "$state")"
-          test "$release_id" != null
-          echo "release-id=$release_id" >> "$GITHUB_OUTPUT"
+          core="${TAG%%+*}"
+          prerelease=false
+          if [[ "$core" == *-* ]]; then prerelease=true; fi
+          {
+            echo "path=$manifest"
+            echo "prerelease=$prerelease"
+          } >> "$GITHUB_OUTPUT"
 
-          state="$(gh api "repos/${GITHUB_REPOSITORY}/releases/${release_id}")"
-          test "$(jq -r .draft <<< "$state")" = true
-          test "$(jq -r .tag_name <<< "$state")" = "$TAG"
-          while read -r asset_id; do
-            test -z "$asset_id" || gh api --method DELETE \
-              "repos/${GITHUB_REPOSITORY}/releases/assets/${asset_id}"
-          done < <(gh api --paginate \
-            "repos/${GITHUB_REPOSITORY}/releases/${release_id}/assets?per_page=100" \
-            --jq '.[].id')
-          for asset in "${assets[@]}"; do
-            name="$(basename "$asset")"
-            gh api --method POST \
-              --header 'Content-Type: application/octet-stream' \
-              --input "$asset" \
-              -f "name=$name" \
-              "https://uploads.github.com/repos/${GITHUB_REPOSITORY}/releases/${release_id}/assets" > /dev/null
-          done
+      - name: Stage and verify the complete draft release
+        id: stage
+        uses: yasyf/homebrew-tap/.github/actions/stage-draft-release@e4c3108e693681df1a3c666bae80e890bc44cf3e
+        with:
+          token: ${{ github.token }}
+          tag: ${{ github.ref_name }}
+          manifest: ${{ steps.manifest.outputs.path }}
+          title: ${{ github.ref_name }}
+          prerelease: ${{ steps.manifest.outputs.prerelease }}
 
-          expected="$RUNNER_TEMP/expected-release-assets"
-          actual="$RUNNER_TEMP/actual-release-assets"
-          printf '%s\n' \
-            checksums.txt \
-            cookiesync_darwin_amd64.tar.gz \
-            cookiesync_darwin_arm64.tar.gz \
-            "$(basename "$APP_ZIP")" \
-            "$(basename "$app_sidecar")" | sort > "$expected"
-          gh api --paginate "repos/${GITHUB_REPOSITORY}/releases/${release_id}/assets?per_page=100" \
-            --jq '.[].name' | sort > "$actual"
-          diff -u "$expected" "$actual"
-
-          downloaded="$RUNNER_TEMP/downloaded-release"
-          rm -rf "$downloaded"
-          mkdir -p "$downloaded"
-          gh api --paginate "repos/${GITHUB_REPOSITORY}/releases/${release_id}/assets?per_page=100" \
-            --jq '.[] | [.id, .name] | @tsv' |
-            while IFS=$'\t' read -r asset_id name; do
-              gh api --header 'Accept: application/octet-stream' \
-                "repos/${GITHUB_REPOSITORY}/releases/assets/${asset_id}" > "$downloaded/$name"
-            done
-          find "$downloaded" -mindepth 1 -maxdepth 1 -type f -exec basename {} \; | sort > "$actual"
-          diff -u "$expected" "$actual"
-          for asset in "${assets[@]}"; do
-            cmp "$asset" "$downloaded/$(basename "$asset")"
-          done
+      - name: Verify signatures and checksums from the exact staged release
+        env:
+          TAG: ${{ github.ref_name }}
+          APP_ZIP: ${{ steps.app.outputs.zip }}
+          TEAM_ID: ${{ steps.developer-id.outputs.team-id }}
+          DOWNLOAD_DIR: ${{ steps.stage.outputs['download-dir'] }}
+        run: |
+          set -euo pipefail
+          downloaded="$DOWNLOAD_DIR"
+          app_sidecar="${APP_ZIP}.sha256"
           (
             cd "$downloaded"
             shasum -a 256 -c checksums.txt
@@ -320,44 +259,18 @@ jobs:
           "$app/Contents/MacOS/cookiesync" --version | grep -Fq "${TAG#v}"
 
       - name: Publish the verified release
-        env:
-          GH_TOKEN: ${{ github.token }}
-          TAG: ${{ github.ref_name }}
-          RELEASE_ID: ${{ steps.stage.outputs.release-id }}
-        run: |
-          set -euo pipefail
-          prerelease=false
-          if [[ "$TAG" == *-* ]]; then prerelease=true; fi
-          state="$(gh api "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}")"
-          test "$(jq -r .tag_name <<< "$state")" = "$TAG"
-          test "$(jq -r .draft <<< "$state")" = true || {
-            echo "::error::release $TAG became public before final verification"
-            exit 1
-          }
-          gh api --method PATCH \
-            "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}" \
-            -F draft=false -F prerelease="$prerelease" > /dev/null
-          state="$(gh api "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}")"
-          test "$(jq -r .tag_name <<< "$state")" = "$TAG"
-          test "$(jq -r .draft <<< "$state")" = false
-          test "$(jq -r .prerelease <<< "$state")" = "$prerelease"
-
-          expected="$RUNNER_TEMP/published-release-assets"
-          actual="$RUNNER_TEMP/actual-published-release-assets"
-          printf '%s\n' \
-            checksums.txt \
-            cookiesync_darwin_amd64.tar.gz \
-            cookiesync_darwin_arm64.tar.gz \
-            "CookieSync-${TAG}-darwin.zip" \
-            "CookieSync-${TAG}-darwin.zip.sha256" | sort > "$expected"
-          gh api --paginate \
-            "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}/assets?per_page=100" \
-            --jq '.[].name' | sort > "$actual"
-          diff -u "$expected" "$actual"
+        uses: yasyf/homebrew-tap/.github/actions/publish-draft-release@54e3e194bda69896894a82c17fcdb2822beefab5
+        with:
+          token: ${{ github.token }}
+          release-id: ${{ steps.stage.outputs['release-id'] }}
+          tag: ${{ github.ref_name }}
+          manifest: ${{ steps.manifest.outputs.path }}
+          prerelease: ${{ steps.manifest.outputs.prerelease }}
+          make-latest: ${{ steps.manifest.outputs.prerelease == 'false' }}
 
       - name: Publish the cask to the tap
-        if: ${{ !contains(github.ref_name, '-') }}
-        uses: yasyf/homebrew-tap/.github/actions/publish@19c3d5013032ad9c88f9a8f1170d1f366c19b8d9
+        if: ${{ steps.manifest.outputs.prerelease == 'false' }}
+        uses: yasyf/homebrew-tap/.github/actions/publish@9ca67392d45d66b6ae01e262383c8f3138d56f5e
         with:
           token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
           dir: tap-staging

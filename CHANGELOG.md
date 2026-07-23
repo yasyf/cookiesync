@@ -6,6 +6,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.25.0] - 2026-07-23
+
+### Fixed
+- Bind draft staging and publication to one exact release ID, including recovery
+  from a lost draft-create response, while preserving the exact five signed,
+  notarized, checksum-verified CLI and CookieSync.app assets.
+
 ## [0.24.0] - 2026-07-23
 
 ### Changed
