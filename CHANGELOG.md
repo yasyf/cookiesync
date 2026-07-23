@@ -6,10 +6,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.23.0] - 2026-07-23
+## [0.24.0] - 2026-07-23
 
 ### Changed
 - Pin daemonkit v0.10.0 for the released fleet runtime.
+- Verify downloaded bare Mach-O assets with codesign and exact Team ID; reserve
+  Gatekeeper app assessment for the signed CookieSync.app bundle.
 
 ## [0.22.0] - 2026-07-23
 
@@ -340,8 +342,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `synckitd install` now owns the agents. The host mesh is read from the shared
   `~/.config/synckit`.
 
-[Unreleased]: https://github.com/yasyf/cookiesync/compare/v0.23.0...HEAD
-[0.23.0]: https://github.com/yasyf/cookiesync/compare/v0.22.0...v0.23.0
+[Unreleased]: https://github.com/yasyf/cookiesync/compare/v0.24.0...HEAD
+[0.24.0]: https://github.com/yasyf/cookiesync/compare/v0.23.0...v0.24.0
 [0.22.0]: https://github.com/yasyf/cookiesync/compare/v0.21.0...v0.22.0
 [0.16.0]: https://github.com/yasyf/cookiesync/releases/tag/v0.16.0
 [0.15.0]: https://github.com/yasyf/cookiesync/releases/tag/v0.15.0

@@ -299,7 +299,6 @@ jobs:
           for binary in "$cli_smoke/amd64/cookiesync" "$cli_smoke/arm64/cookiesync"; do
             codesign --verify --strict --verbose=2 "$binary"
             codesign -dvvv "$binary" 2>&1 | grep -Fq "TeamIdentifier=$TEAM_ID"
-            spctl --assess --type execute --verbose=4 "$binary"
           done
           case "$(uname -m)" in
             arm64) native=arm64 ;;
