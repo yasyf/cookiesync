@@ -12,44 +12,70 @@ permissions:
   contents: write
 
 jobs:
-  # Shared pipeline: verify-tag-on-main and goreleaser `release --clean` (with retries;
-  # .goreleaser.yaml sets release.replace_existing_artifacts so a retry after a partial
-  # publish is idempotent). It builds + signs + notarizes the CLI binaries and creates
-  # the GitHub release; the cookiesync cask is pushed by app-build, not here (the
-  # homebrew_casks block was removed — see .goreleaser.yaml). The default quill/ubuntu
-  # path fits: the CLI is pure Go, and .goreleaser.yaml's notarize block reads the same
-  # MACOS_* env names the reusable workflow exports.
   release:
-    uses: yasyf/homebrew-tap/.github/workflows/release-go.yml@8f422c652d836c40f9cc5a9d893d4120b26bc681
-    secrets: inherit
-
-  # Wrap the cookiesync CLI in a signed, notarized, stapled CookieSync.app and ship it
-  # as the cookiesync cask (a bundle-inner `binary` symlink). tccd keys a bare Mach-O's
-  # grant by resolved path (client_type=1), so each versioned-Cellar upgrade re-prompts;
-  # a bundle is keyed by CFBundleIdentifier (client_type=0) and the grant survives. The
-  # wrap-daemon-bundle action does the codesign + notarize + staple; this job builds the
-  # universal binary, zips + attaches the .app, and renders + publishes the hand-managed
-  # cask (goreleaser's homebrew_casks can only serve a bare-binary archive — see
-  # .goreleaser.yaml). cookiesync's TCC classes (AppBundles + Automation) are not
-  # entitlement-backed, so no entitlements or provisioning profile are needed.
-  #
-  # Depends on release so the v* release already exists before the attach step:
-  # goreleaser owns release creation, and this job only ADDS the .app asset and pushes
-  # the cask.
-  app-build:
-    needs: [release]
     runs-on: macos-15
-    permissions:
-      contents: write
     steps:
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Verify the tag is on main
+        uses: yasyf/homebrew-tap/.github/actions/verify-tag-on-main@19c3d5013032ad9c88f9a8f1170d1f366c19b8d9
+
+      - name: Refuse to mutate a public release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          state="$RUNNER_TEMP/releases.json"
+          gh api --paginate --slurp \
+            "repos/${GITHUB_REPOSITORY}/releases?per_page=100" > "$state"
+          count="$(jq --arg tag "$TAG" '[.[][] | select(.tag_name == $tag)] | length' "$state")"
+          if [ "$count" -gt 1 ]; then
+            echo "::error::found $count releases for $TAG; refusing an ambiguous mutation"
+            exit 1
+          elif [ "$count" -eq 1 ] && \
+            [ "$(jq -r --arg tag "$TAG" '.[][] | select(.tag_name == $tag) | .draft' "$state")" != true ]; then
+            echo "::error::release $TAG is already public; refusing to mutate it"
+            exit 1
+          fi
 
       - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
           cache: true
 
+      - name: Verify source
+        run: |
+          set -euo pipefail
+          go mod verify
+          go vet ./...
+          go test -race ./...
+          CGO_ENABLED=0 go build ./...
+
+      - name: Require every release credential
+        env:
+          MACOS_SIGN_P12: ${{ secrets.MACOS_SIGN_P12 }}
+          MACOS_SIGN_PASSWORD: ${{ secrets.MACOS_SIGN_PASSWORD }}
+          MACOS_NOTARY_KEY: ${{ secrets.MACOS_NOTARY_KEY }}
+          MACOS_NOTARY_KEY_ID: ${{ secrets.MACOS_NOTARY_KEY_ID }}
+          MACOS_NOTARY_ISSUER_ID: ${{ secrets.MACOS_NOTARY_ISSUER_ID }}
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          set -euo pipefail
+          for name in \
+            MACOS_SIGN_P12 \
+            MACOS_SIGN_PASSWORD \
+            MACOS_NOTARY_KEY \
+            MACOS_NOTARY_KEY_ID \
+            MACOS_NOTARY_ISSUER_ID \
+            HOMEBREW_TAP_TOKEN; do
+            test -n "${!name}" || { echo "::error::required secret $name is empty"; exit 1; }
+          done
+
       - name: Import Developer ID certificate
+        id: developer-id
         uses: yasyf/homebrew-tap/.github/actions/import-developer-id@19c3d5013032ad9c88f9a8f1170d1f366c19b8d9
         with:
           p12: ${{ secrets.MACOS_SIGN_P12 }}
@@ -58,29 +84,68 @@ jobs:
           notary-key-id: ${{ secrets.MACOS_NOTARY_KEY_ID }}
           notary-issuer-id: ${{ secrets.MACOS_NOTARY_ISSUER_ID }}
 
-      - name: Build the universal cookiesync binary (pure Go, arm64 + amd64 via lipo)
+      - name: Verify Developer ID import
+        env:
+          SIGNED: ${{ steps.developer-id.outputs.signed }}
+          IDENTITY: ${{ steps.developer-id.outputs.identity }}
+          TEAM_ID: ${{ steps.developer-id.outputs.team-id }}
+        run: |
+          set -euo pipefail
+          test "$SIGNED" = true
+          test -n "$IDENTITY"
+          test -n "$TEAM_ID"
+          case "$IDENTITY" in
+            *"($TEAM_ID)") ;;
+            *) echo "::error::Developer ID identity '$IDENTITY' does not match Team ID '$TEAM_ID'"; exit 1 ;;
+          esac
+
+      - name: Install goreleaser
+        uses: goreleaser/goreleaser-action@v7
+        with:
+          version: "~> v2"
+          install-only: true
+
+      - name: Build, sign, and notarize CLI assets without publishing
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          MACOS_SIGN_P12: ${{ secrets.MACOS_SIGN_P12 }}
+          MACOS_SIGN_PASSWORD: ${{ secrets.MACOS_SIGN_PASSWORD }}
+          MACOS_NOTARY_KEY: ${{ secrets.MACOS_NOTARY_KEY }}
+          MACOS_NOTARY_KEY_ID: ${{ secrets.MACOS_NOTARY_KEY_ID }}
+          MACOS_NOTARY_ISSUER_ID: ${{ secrets.MACOS_NOTARY_ISSUER_ID }}
+        run: |
+          set -euo pipefail
+          attempt=1
+          while :; do
+            if goreleaser release --clean --skip=publish; then
+              break
+            fi
+            if [ "$attempt" -ge 3 ]; then
+              echo "::error::goreleaser build failed after 3 attempts"
+              exit 1
+            fi
+            echo "::warning::goreleaser build failed (attempt $attempt/3); retrying in $((attempt * 60))s"
+            sleep "$((attempt * 60))"
+            attempt=$((attempt + 1))
+          done
+
+      - name: Build the universal cookiesync binary
         id: build
         run: |
           set -euo pipefail
-          # goreleaser strips the leading v for {{ .Version }}; match it so the stamped
-          # version, the bundle version, and the cask __VERSION__ all agree.
-          VERSION="${GITHUB_REF_NAME#v}"
-          mkdir -p dist
-          # Mirror .goreleaser.yaml's build: pure Go (modernc.org/sqlite), same ldflags.
-          LDFLAGS="-s -w -X main.version=${VERSION}"
-          CGO_ENABLED=0 GOARCH=arm64 go build -ldflags "$LDFLAGS" -o dist/cookiesync-arm64 .
-          CGO_ENABLED=0 GOARCH=amd64 go build -ldflags "$LDFLAGS" -o dist/cookiesync-amd64 .
+          version="${GITHUB_REF_NAME#v}"
+          ldflags="-s -w -X main.version=${version}"
+          CGO_ENABLED=0 GOARCH=arm64 go build -ldflags "$ldflags" -o dist/cookiesync-arm64 .
+          CGO_ENABLED=0 GOARCH=amd64 go build -ldflags "$ldflags" -o dist/cookiesync-amd64 .
           lipo -create -output dist/cookiesync dist/cookiesync-arm64 dist/cookiesync-amd64
-          # Prove both slices and the version stamp reached the binary (lipo -archs
-          # order is not guaranteed, so assert each arch independently).
           archs="$(lipo -archs dist/cookiesync)"
-          echo "$archs" | grep -qw arm64
-          echo "$archs" | grep -qw x86_64
-          dist/cookiesync --version | grep -q "$VERSION"
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          grep -qw arm64 <<< "$archs"
+          grep -qw x86_64 <<< "$archs"
+          dist/cookiesync --version | grep -Fq "$version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "binary=$PWD/dist/cookiesync" >> "$GITHUB_OUTPUT"
 
-      - name: Wrap the CLI in CookieSync.app (durable TCC bundle identity)
+      - name: Wrap the CLI in CookieSync.app
         id: wrap
         uses: yasyf/homebrew-tap/.github/actions/wrap-daemon-bundle@19c3d5013032ad9c88f9a8f1170d1f366c19b8d9
         with:
@@ -90,39 +155,37 @@ jobs:
           executable-name: cookiesync
           version: ${{ steps.build.outputs.version }}
 
-      - name: Zip, checksum, and attach CookieSync.app
-        id: pkg
+      - name: Package and smoke-test CookieSync.app
+        id: app
         env:
           BUNDLE: ${{ steps.wrap.outputs.bundle-path }}
         run: |
           set -euo pipefail
-          mkdir -p dist
-          # github.ref_name supplies the vX.Y.Z, so the asset stays
-          # CookieSync-v#{version}-darwin.zip — the cask url depends on it. ditto -c -k
-          # preserves the bundle metadata a plain zip drops; zip the STAPLED bundle.
           zip="dist/CookieSync-${GITHUB_REF_NAME}-darwin.zip"
           ditto -c -k --keepParent "$BUNDLE" "$zip"
-          sha="$(shasum -a 256 "$zip" | awk '{print $1}')"
-          # Write the .sha256 with the zip's BASENAME (not the dist/ path) so a
-          # `shasum -c` from the download directory resolves the sibling file.
           base="$(basename "$zip")"
-          ( cd dist && shasum -a 256 "$base" > "$base.sha256" )
+          (
+            cd dist
+            shasum -a 256 "$base" > "$base.sha256"
+            shasum -a 256 -c "$base.sha256"
+          )
+          sha="$(shasum -a 256 "$zip" | awk '{print $1}')"
+
+          smoke="$RUNNER_TEMP/local-app-smoke"
+          rm -rf "$smoke"
+          mkdir -p "$smoke"
+          ditto -x -k "$zip" "$smoke"
+          test "$(find "$smoke" -mindepth 1 -maxdepth 1 | wc -l | tr -d ' ')" = 1
+          app="$smoke/CookieSync.app"
+          test -d "$app"
+          codesign --verify --deep --strict --verbose=2 "$app"
+          xcrun stapler validate "$app"
+          spctl --assess --type execute --verbose=4 "$app"
+          "$app/Contents/MacOS/cookiesync" --version | grep -Fq "${GITHUB_REF_NAME#v}"
+
           echo "zip=$zip" >> "$GITHUB_OUTPUT"
           echo "sha256=$sha" >> "$GITHUB_OUTPUT"
 
-      - name: Attach the .app zip to the release
-        uses: softprops/action-gh-release@v3
-        with:
-          files: |
-            ${{ steps.pkg.outputs.zip }}
-            ${{ steps.pkg.outputs.zip }}.sha256
-          # goreleaser already generated the notes when it created the release; this job
-          # only adds the .app asset, so it must not regenerate the body.
-          generate_release_notes: false
-          prerelease: ${{ contains(github.ref_name, '-') }}
-
-      # Only real, non-prerelease v* tags publish the cask: a `-`-bearing tag
-      # (e.g. v1.0.0-rc1) ships a prerelease asset that must not become the tap's latest.
       - name: Render the cask
         if: ${{ !contains(github.ref_name, '-') }}
         uses: yasyf/homebrew-tap/.github/actions/render-formula@19c3d5013032ad9c88f9a8f1170d1f366c19b8d9
@@ -130,7 +193,168 @@ jobs:
           template: .github/cask/cookiesync.rb.tmpl
           output: Casks/cookiesync.rb
           substitutions: |
-            __SHA_APP__=${{ steps.pkg.outputs.sha256 }}
+            __SHA_APP__=${{ steps.app.outputs.sha256 }}
+
+      - name: Stage and verify the complete draft release
+        id: stage
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          APP_ZIP: ${{ steps.app.outputs.zip }}
+          TEAM_ID: ${{ steps.developer-id.outputs.team-id }}
+        run: |
+          set -euo pipefail
+          app_sidecar="${APP_ZIP}.sha256"
+          assets=(
+            dist/checksums.txt
+            dist/cookiesync_darwin_amd64.tar.gz
+            dist/cookiesync_darwin_arm64.tar.gz
+            "$APP_ZIP"
+            "$app_sidecar"
+          )
+          for asset in "${assets[@]}"; do test -f "$asset"; done
+
+          releases="$RUNNER_TEMP/stage-releases.json"
+          gh api --paginate --slurp \
+            "repos/${GITHUB_REPOSITORY}/releases?per_page=100" > "$releases"
+          count="$(jq --arg tag "$TAG" '[.[][] | select(.tag_name == $tag)] | length' "$releases")"
+          if [ "$count" -gt 1 ]; then
+            echo "::error::found $count releases for $TAG; refusing an ambiguous mutation"
+            exit 1
+          elif [ "$count" -eq 0 ]; then
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" \
+              --draft --generate-notes --verify-tag
+            gh api --paginate --slurp \
+              "repos/${GITHUB_REPOSITORY}/releases?per_page=100" > "$releases"
+            count="$(jq --arg tag "$TAG" '[.[][] | select(.tag_name == $tag)] | length' "$releases")"
+          fi
+          test "$count" -eq 1 || {
+            echo "::error::expected exactly one release for $TAG after draft creation, found $count"
+            exit 1
+          }
+          state="$(jq -c --arg tag "$TAG" '.[][] | select(.tag_name == $tag)' "$releases")"
+          test "$(jq -r .draft <<< "$state")" = true || {
+            echo "::error::release $TAG is public; refusing to mutate it"
+            exit 1
+          }
+          release_id="$(jq -r .id <<< "$state")"
+          test "$release_id" != null
+          echo "release-id=$release_id" >> "$GITHUB_OUTPUT"
+
+          state="$(gh api "repos/${GITHUB_REPOSITORY}/releases/${release_id}")"
+          test "$(jq -r .draft <<< "$state")" = true
+          test "$(jq -r .tag_name <<< "$state")" = "$TAG"
+          while read -r asset_id; do
+            test -z "$asset_id" || gh api --method DELETE \
+              "repos/${GITHUB_REPOSITORY}/releases/assets/${asset_id}"
+          done < <(gh api --paginate \
+            "repos/${GITHUB_REPOSITORY}/releases/${release_id}/assets?per_page=100" \
+            --jq '.[].id')
+          for asset in "${assets[@]}"; do
+            name="$(basename "$asset")"
+            gh api --method POST \
+              --header 'Content-Type: application/octet-stream' \
+              --input "$asset" \
+              -f "name=$name" \
+              "https://uploads.github.com/repos/${GITHUB_REPOSITORY}/releases/${release_id}/assets" > /dev/null
+          done
+
+          expected="$RUNNER_TEMP/expected-release-assets"
+          actual="$RUNNER_TEMP/actual-release-assets"
+          printf '%s\n' \
+            checksums.txt \
+            cookiesync_darwin_amd64.tar.gz \
+            cookiesync_darwin_arm64.tar.gz \
+            "$(basename "$APP_ZIP")" \
+            "$(basename "$app_sidecar")" | sort > "$expected"
+          gh api --paginate "repos/${GITHUB_REPOSITORY}/releases/${release_id}/assets?per_page=100" \
+            --jq '.[].name' | sort > "$actual"
+          diff -u "$expected" "$actual"
+
+          downloaded="$RUNNER_TEMP/downloaded-release"
+          rm -rf "$downloaded"
+          mkdir -p "$downloaded"
+          gh api --paginate "repos/${GITHUB_REPOSITORY}/releases/${release_id}/assets?per_page=100" \
+            --jq '.[] | [.id, .name] | @tsv' |
+            while IFS=$'\t' read -r asset_id name; do
+              gh api --header 'Accept: application/octet-stream' \
+                "repos/${GITHUB_REPOSITORY}/releases/assets/${asset_id}" > "$downloaded/$name"
+            done
+          find "$downloaded" -mindepth 1 -maxdepth 1 -type f -exec basename {} \; | sort > "$actual"
+          diff -u "$expected" "$actual"
+          for asset in "${assets[@]}"; do
+            cmp "$asset" "$downloaded/$(basename "$asset")"
+          done
+          (
+            cd "$downloaded"
+            shasum -a 256 -c checksums.txt
+            shasum -a 256 -c "$(basename "$app_sidecar")"
+          )
+
+          cli_smoke="$RUNNER_TEMP/downloaded-cli-smoke"
+          rm -rf "$cli_smoke"
+          mkdir -p "$cli_smoke/amd64" "$cli_smoke/arm64"
+          tar -xzf "$downloaded/cookiesync_darwin_amd64.tar.gz" -C "$cli_smoke/amd64"
+          tar -xzf "$downloaded/cookiesync_darwin_arm64.tar.gz" -C "$cli_smoke/arm64"
+          for binary in "$cli_smoke/amd64/cookiesync" "$cli_smoke/arm64/cookiesync"; do
+            codesign --verify --strict --verbose=2 "$binary"
+            codesign -dvvv "$binary" 2>&1 | grep -Fq "TeamIdentifier=$TEAM_ID"
+            spctl --assess --type execute --verbose=4 "$binary"
+          done
+          case "$(uname -m)" in
+            arm64) native=arm64 ;;
+            x86_64) native=amd64 ;;
+            *) echo "::error::unsupported release runner architecture $(uname -m)"; exit 1 ;;
+          esac
+          "$cli_smoke/$native/cookiesync" --version | grep -Fq "${TAG#v}"
+
+          app_smoke="$RUNNER_TEMP/downloaded-app-smoke"
+          rm -rf "$app_smoke"
+          mkdir -p "$app_smoke"
+          ditto -x -k "$downloaded/$(basename "$APP_ZIP")" "$app_smoke"
+          test "$(find "$app_smoke" -mindepth 1 -maxdepth 1 | wc -l | tr -d ' ')" = 1
+          app="$app_smoke/CookieSync.app"
+          test -d "$app"
+          codesign --verify --deep --strict --verbose=2 "$app"
+          xcrun stapler validate "$app"
+          spctl --assess --type execute --verbose=4 "$app"
+          "$app/Contents/MacOS/cookiesync" --version | grep -Fq "${TAG#v}"
+
+      - name: Publish the verified release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          RELEASE_ID: ${{ steps.stage.outputs.release-id }}
+        run: |
+          set -euo pipefail
+          prerelease=false
+          if [[ "$TAG" == *-* ]]; then prerelease=true; fi
+          state="$(gh api "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}")"
+          test "$(jq -r .tag_name <<< "$state")" = "$TAG"
+          test "$(jq -r .draft <<< "$state")" = true || {
+            echo "::error::release $TAG became public before final verification"
+            exit 1
+          }
+          gh api --method PATCH \
+            "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}" \
+            -F draft=false -F prerelease="$prerelease" > /dev/null
+          state="$(gh api "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}")"
+          test "$(jq -r .tag_name <<< "$state")" = "$TAG"
+          test "$(jq -r .draft <<< "$state")" = false
+          test "$(jq -r .prerelease <<< "$state")" = "$prerelease"
+
+          expected="$RUNNER_TEMP/published-release-assets"
+          actual="$RUNNER_TEMP/actual-published-release-assets"
+          printf '%s\n' \
+            checksums.txt \
+            cookiesync_darwin_amd64.tar.gz \
+            cookiesync_darwin_arm64.tar.gz \
+            "CookieSync-${TAG}-darwin.zip" \
+            "CookieSync-${TAG}-darwin.zip.sha256" | sort > "$expected"
+          gh api --paginate \
+            "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}/assets?per_page=100" \
+            --jq '.[].name' | sort > "$actual"
+          diff -u "$expected" "$actual"
 
       - name: Publish the cask to the tap
         if: ${{ !contains(github.ref_name, '-') }}
