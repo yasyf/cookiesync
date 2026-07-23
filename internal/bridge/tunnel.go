@@ -134,7 +134,7 @@ func dialTunnel(ctx context.Context, pool *supervise.Pool, addr string, spec Tun
 		if isBindCollision(stderr.String(), spec.LocalPort) {
 			return nil, fmt.Errorf("ssh tunnel to %s: %w", addr, ErrTunnelBindCollision)
 		}
-		return nil, fmt.Errorf("start ssh tunnel to %s: %w", addr, err)
+		return nil, fmtTunnelStartError(addr, err)
 	}
 	done := make(chan struct{})
 	t := &Tunnel{process: process, localPort: spec.LocalPort, addr: addr, done: done}
@@ -143,6 +143,13 @@ func dialTunnel(ctx context.Context, pool *supervise.Pool, addr string, spec Tun
 		close(done)
 	}()
 	return t, nil
+}
+
+func fmtTunnelStartError(addr string, err error) error {
+	if errors.Is(err, supervise.ErrProcessExitedBeforeReadiness) {
+		return fmt.Errorf("start ssh tunnel to %s: %w: %w", addr, ErrTunnelExited, err)
+	}
+	return fmt.Errorf("start ssh tunnel to %s: %w", addr, err)
 }
 
 // tunnelArgv builds the ssh argument vector for the forward: the replicated dial

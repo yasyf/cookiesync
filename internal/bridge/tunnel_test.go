@@ -13,6 +13,9 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/yasyf/daemonkit/proc"
+	"github.com/yasyf/daemonkit/supervise"
 )
 
 // TestTunnelArgv proves the ssh argument vector replicates hostregistry's dial
@@ -243,6 +246,55 @@ func TestOpenTunnelDialsAddrsInOrder(t *testing.T) {
 	want := []string{"desktop.local", "desktop.lan", target}
 	if !reflect.DeepEqual(dialed, want) {
 		t.Fatalf("dialed addrs = %v, want DialAddrs order %v", dialed, want)
+	}
+}
+
+func TestTunnelStartErrorMapsManagedEarlyExit(t *testing.T) {
+	ctx := t.Context()
+	_, startErr := testProcessPool(ctx, t).Start(ctx, supervise.ProcessSpec{
+		RecoveryClass:    proc.RecoveryTask,
+		Path:             "/usr/bin/false",
+		ReadinessTimeout: 5 * time.Second,
+		Ready: func(readyCtx context.Context, _ proc.Record) error {
+			<-readyCtx.Done()
+			return readyCtx.Err()
+		},
+	})
+	if !errors.Is(startErr, supervise.ErrProcessExitedBeforeReadiness) {
+		t.Fatalf("managed false start = %v, want typed early exit", startErr)
+	}
+	err := fmtTunnelStartError("desktop.local", startErr)
+	if !errors.Is(err, ErrTunnelExited) || !errors.Is(err, supervise.ErrProcessExitedBeforeReadiness) {
+		t.Fatalf("mapped early exit = %v, want product and daemonkit identities", err)
+	}
+}
+
+func TestTunnelStartErrorClassifiesOnlyTypedEarlyExit(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"typed child exit", errors.Join(supervise.ErrProcessExitedBeforeReadiness, errors.New("exit status 255")), true},
+		{"context cancellation", context.Canceled, false},
+		{"readiness timeout", context.DeadlineExceeded, false},
+		{"readiness mismatch", errors.New("webSocketDebuggerUrl mismatch"), false},
+		{"recorded failure", errors.New("accept managed process record: fsync failed"), false},
+		{"tracking failure", errors.New("track managed process: store failed"), false},
+		{"admission failure", supervise.ErrClosed, false},
+		{"start failure", errors.New("start managed process: executable missing"), false},
+		{"gate failure", errors.New("release managed process gate: broken pipe"), false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := fmtTunnelStartError("desktop.local", tc.err)
+			if got := errors.Is(err, ErrTunnelExited); got != tc.want {
+				t.Fatalf("ErrTunnelExited = %t, want %t: %v", got, tc.want, err)
+			}
+			if !errors.Is(err, tc.err) {
+				t.Fatalf("underlying error identity lost: %v", err)
+			}
+		})
 	}
 }
 
