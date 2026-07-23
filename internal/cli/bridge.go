@@ -1,7 +1,6 @@
 package cli
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -19,6 +18,7 @@ import (
 	"github.com/yasyf/cookiesync/internal/cookie"
 	"github.com/yasyf/cookiesync/internal/paths"
 	"github.com/yasyf/cookiesync/internal/rpc"
+	"github.com/yasyf/synckit/hostregistry"
 )
 
 // bridgeDefaultProfile is the profile a bridge target assumes when none is
@@ -105,7 +105,11 @@ var openBridge = func(ctx context.Context, host, browser, profile string, headed
 	if r, ok := resolveRequestor(); ok {
 		params["requestor"] = r
 	}
-	if capability, ok := loadCap(key); ok {
+	capability, ok, err := loadCap(key)
+	if err != nil {
+		return bridgeOpenResult{}, err
+	}
+	if ok {
 		params["capability"] = capability
 	}
 	var resp bridgeOpenResult
@@ -129,7 +133,10 @@ var openBridge = func(ctx context.Context, host, browser, profile string, headed
 // stopBridge closes the saved bridge for key host:browser:profile and drops its
 // capability, behind both `bridge stop` and the plugin's browser.close.
 var stopBridge = func(ctx context.Context, key string) error {
-	capability, ok := loadCap(key)
+	capability, ok, err := loadCap(key)
+	if err != nil {
+		return err
+	}
 	if !ok {
 		return fmt.Errorf("no saved bridge for %s", key)
 	}
@@ -339,9 +346,24 @@ type capEntry struct {
 	capability string
 }
 
+const (
+	capStateIdentity    = "cookie-sync-bridge-capability-v1"
+	capStateVersion     = uint64(1)
+	capStateDeclaration = "schema:{identity:string,version:uint64,fingerprint:string};target:string;capability:string"
+)
+
+var capStateFingerprint = hostregistry.SchemaFingerprint(capStateIdentity, capStateDeclaration)
+
+type capStateSchema struct {
+	Identity    string `json:"identity"`
+	Version     uint64 `json:"version"`
+	Fingerprint string `json:"fingerprint"`
+}
+
 type capState struct {
-	ProtocolVersion uint64 `json:"protocol_version"`
-	Capability      string `json:"capability"`
+	Schema     capStateSchema `json:"schema"`
+	Target     string         `json:"target"`
+	Capability string         `json:"capability"`
 }
 
 func capsDir() (string, error) {
@@ -362,25 +384,30 @@ func capFile(key string) (string, error) {
 }
 
 // loadCap reads the saved capability for a target key, if any.
-func loadCap(key string) (string, bool) {
+func loadCap(key string) (string, bool, error) {
 	path, err := capFile(key)
 	if err != nil {
-		return "", false
+		return "", false, err
 	}
-	raw, err := os.ReadFile(path) //nolint:gosec // G304: path is a sha256 name under our own 0700 config dir.
+	raw, present, err := readCapFile(path)
 	if err != nil {
-		return "", false
+		return "", false, err
 	}
-	capability, err := decodeCap(raw)
+	if !present {
+		return "", false, nil
+	}
+	capability, err := decodeCap(raw, key)
 	if err != nil {
-		_ = os.Remove(path)
-		return "", false
+		return "", false, fmt.Errorf("load bridge capability %s: %w", path, err)
 	}
-	return capability, true
+	return capability, true, nil
 }
 
 // saveCap persists the capability for a target key in a 0600 file.
 func saveCap(key, capability string) error {
+	if key == "" || strings.TrimSpace(capability) == "" {
+		return errors.New("bridge capability state requires target and capability")
+	}
 	dir, err := capsDir()
 	if err != nil {
 		return err
@@ -388,15 +415,30 @@ func saveCap(key, capability string) error {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return fmt.Errorf("create bridge caps dir: %w", err)
 	}
+	info, err := os.Lstat(dir)
+	if err != nil {
+		return fmt.Errorf("stat bridge caps dir: %w", err)
+	}
+	if !info.IsDir() {
+		return errors.New("bridge caps path is not a directory")
+	}
+	if err := os.Chmod(dir, 0o700); err != nil {
+		return fmt.Errorf("secure bridge caps dir: %w", err)
+	}
 	path, err := capFile(key)
 	if err != nil {
 		return err
 	}
-	data, err := json.Marshal(capState{ProtocolVersion: cookie.ProtocolVersion, Capability: capability})
+	data, err := json.Marshal(capState{
+		Schema: capStateSchema{
+			Identity: capStateIdentity, Version: capStateVersion, Fingerprint: capStateFingerprint,
+		},
+		Target: key, Capability: capability,
+	})
 	if err != nil {
 		return fmt.Errorf("encode bridge capability: %w", err)
 	}
-	if err := os.WriteFile(path, data, 0o600); err != nil {
+	if err := writeCapFile(path, data); err != nil {
 		return fmt.Errorf("save bridge capability: %w", err)
 	}
 	return nil
@@ -429,37 +471,99 @@ func listCaps() ([]capEntry, error) {
 	}
 	caps := make([]capEntry, 0, len(entries))
 	for _, e := range entries {
-		if e.IsDir() {
-			continue
-		}
 		path := filepath.Join(dir, e.Name())
-		raw, err := os.ReadFile(path) //nolint:gosec // G304: path is a sha256 name under our own 0700 config dir.
+		raw, present, err := readCapFile(path)
 		if err != nil {
-			continue
+			return nil, fmt.Errorf("read bridge capability %s: %w", path, err)
 		}
-		capability, err := decodeCap(raw)
+		if !present {
+			return nil, fmt.Errorf("bridge capability %s disappeared during listing", path)
+		}
+		state, err := decodeCapState(raw)
 		if err != nil {
-			_ = os.Remove(path)
-			continue
+			return nil, fmt.Errorf("decode bridge capability %s: %w", path, err)
 		}
-		caps = append(caps, capEntry{path: path, capability: capability})
+		expectedPath, err := capFile(state.Target)
+		if err != nil {
+			return nil, err
+		}
+		if expectedPath != path {
+			return nil, fmt.Errorf("bridge capability %s belongs to a different target", path)
+		}
+		caps = append(caps, capEntry{path: path, capability: state.Capability})
 	}
 	return caps, nil
 }
 
-func decodeCap(raw []byte) (string, error) {
-	var state capState
-	decoder := json.NewDecoder(bytes.NewReader(raw))
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(&state); err != nil {
+func decodeCap(raw []byte, target string) (string, error) {
+	state, err := decodeCapState(raw)
+	if err != nil {
 		return "", err
 	}
-	if err := decoder.Decode(&struct{}{}); err != io.EOF {
-		return "", errors.New("bridge capability carries trailing JSON")
-	}
-	if state.ProtocolVersion != cookie.ProtocolVersion || strings.TrimSpace(state.Capability) == "" {
-		return "", fmt.Errorf("bridge capability protocol version %d, want %d",
-			state.ProtocolVersion, cookie.ProtocolVersion)
+	if state.Target != target {
+		return "", errors.New("bridge capability target does not match lookup key")
 	}
 	return state.Capability, nil
+}
+
+func decodeCapState(raw []byte) (capState, error) {
+	var state capState
+	if err := hostregistry.DecodeExactJSON(raw, &state); err != nil {
+		return capState{}, err
+	}
+	if state.Schema.Identity != capStateIdentity ||
+		state.Schema.Version != capStateVersion ||
+		state.Schema.Fingerprint != capStateFingerprint {
+		return capState{}, errors.New("bridge capability schema does not match exact v1")
+	}
+	if state.Target == "" || strings.TrimSpace(state.Capability) == "" {
+		return capState{}, errors.New("bridge capability state requires target and capability")
+	}
+	return state, nil
+}
+
+func readCapFile(path string) ([]byte, bool, error) {
+	info, err := os.Lstat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	if !info.Mode().IsRegular() || info.Mode().Perm() != 0o600 {
+		return nil, true, errors.New("capability state must be a regular 0600 file")
+	}
+	raw, err := os.ReadFile(path) //nolint:gosec // G304: path is a sha256 name under our own 0700 config dir.
+	return raw, true, err
+}
+
+func writeCapFile(path string, data []byte) (err error) {
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".capability-")
+	if err != nil {
+		return err
+	}
+	name := tmp.Name()
+	defer func() {
+		if err != nil {
+			_ = os.Remove(name)
+		}
+	}()
+	n, writeErr := tmp.Write(data)
+	if writeErr == nil && n != len(data) {
+		writeErr = io.ErrShortWrite
+	}
+	chmodErr := tmp.Chmod(0o600)
+	syncErr := tmp.Sync()
+	closeErr := tmp.Close()
+	if err = errors.Join(writeErr, chmodErr, syncErr, closeErr); err != nil {
+		return err
+	}
+	if err = os.Rename(name, path); err != nil {
+		return err
+	}
+	dir, err := os.Open(filepath.Dir(path)) //nolint:gosec // fixed private capability directory.
+	if err != nil {
+		return err
+	}
+	return errors.Join(dir.Sync(), dir.Close())
 }

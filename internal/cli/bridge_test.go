@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"testing"
@@ -74,7 +76,7 @@ func TestBridgeOpenJSON(t *testing.T) {
 	}
 }
 
-func TestBridgeCapabilityStateUsesExactV1AndDiscardsForeignState(t *testing.T) {
+func TestBridgeCapabilityStateUsesExactV1(t *testing.T) {
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	const key = ":chrome:Default"
 	if err := saveCap(key, "cap-v1"); err != nil {
@@ -88,27 +90,132 @@ func TestBridgeCapabilityStateUsesExactV1AndDiscardsForeignState(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read capability: %v", err)
 	}
-	if string(raw) != `{"protocol_version":1,"capability":"cap-v1"}` {
+	want := fmt.Sprintf(
+		`{"schema":{"identity":%q,"version":1,"fingerprint":%q},"target":%q,"capability":"cap-v1"}`,
+		capStateIdentity,
+		capStateFingerprint,
+		key,
+	)
+	if string(raw) != want {
 		t.Fatalf("capability state = %s, want exact v1 envelope", raw)
 	}
-	if got, ok := loadCap(key); !ok || got != "cap-v1" {
-		t.Fatalf("loadCap = %q/%v, want cap-v1/true", got, ok)
+	if got, ok, err := loadCap(key); err != nil || !ok || got != "cap-v1" {
+		t.Fatalf("loadCap = %q/%v/%v, want cap-v1/true/nil", got, ok, err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat capability: %v", err)
+	}
+	if got := info.Mode().Perm(); got != 0o600 {
+		t.Fatalf("capability mode = %#o, want 0600", got)
+	}
+	dir, err := capsDir()
+	if err != nil {
+		t.Fatalf("capsDir: %v", err)
+	}
+	info, err = os.Stat(dir)
+	if err != nil {
+		t.Fatalf("stat caps dir: %v", err)
+	}
+	if got := info.Mode().Perm(); got != 0o700 {
+		t.Fatalf("caps dir mode = %#o, want 0700", got)
+	}
+}
+
+func TestInvalidBridgeCapabilityStateFailsLoudlyAndRemains(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	const key = ":chrome:Default"
+	path, err := capFile(key)
+	if err != nil {
+		t.Fatalf("capFile: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatalf("create caps dir: %v", err)
+	}
+	schema := func(identity string, version uint64, fingerprint string) string {
+		return fmt.Sprintf(`{"identity":%q,"version":%d,"fingerprint":%q}`, identity, version, fingerprint)
+	}
+	state := func(schemaJSON, target, capability string) string {
+		return fmt.Sprintf(`{"schema":%s,"target":%q,"capability":%q}`, schemaJSON, target, capability)
+	}
+	exactSchema := schema(capStateIdentity, capStateVersion, capStateFingerprint)
+	valid := state(exactSchema, key, "cap-v1")
+
+	cases := map[string]string{
+		"corrupt":              "not-json",
+		"legacy plaintext":     "legacy-plaintext-capability",
+		"legacy envelope":      `{"protocol_version":1,"capability":"cap-old"}`,
+		"foreign identity":     state(schema("other-state-v1", capStateVersion, capStateFingerprint), key, "cap-v1"),
+		"wrong version":        state(schema(capStateIdentity, 2, capStateFingerprint), key, "cap-v1"),
+		"wrong fingerprint":    state(schema(capStateIdentity, capStateVersion, "wrong"), key, "cap-v1"),
+		"unknown top key":      strings.TrimSuffix(valid, "}") + `,"legacy":true}`,
+		"unknown schema key":   state(strings.TrimSuffix(exactSchema, "}")+`,"legacy":true}`, key, "cap-v1"),
+		"missing schema":       fmt.Sprintf(`{"target":%q,"capability":"cap-v1"}`, key),
+		"missing target":       fmt.Sprintf(`{"schema":%s,"capability":"cap-v1"}`, exactSchema),
+		"missing capability":   fmt.Sprintf(`{"schema":%s,"target":%q}`, exactSchema, key),
+		"null target":          fmt.Sprintf(`{"schema":%s,"target":null,"capability":"cap-v1"}`, exactSchema),
+		"trailing json":        valid + `{}`,
+		"duplicate capability": strings.TrimSuffix(valid, "}") + `,"capability":"other"}`,
+		"different target":     state(exactSchema, "remote:chrome:Default", "cap-v1"),
+	}
+	for name, raw := range cases {
+		t.Run(name, func(t *testing.T) {
+			if err := os.WriteFile(path, []byte(raw), 0o600); err != nil {
+				t.Fatalf("write invalid capability: %v", err)
+			}
+			if got, ok, err := loadCap(key); err == nil || ok || got != "" {
+				t.Fatalf("loadCap = %q/%v/%v, want empty/false/error", got, ok, err)
+			}
+			got, err := os.ReadFile(path) //nolint:gosec // G304: capFile returns a hash under the test config dir.
+			if err != nil {
+				t.Fatalf("invalid capability was removed: %v", err)
+			}
+			if string(got) != raw {
+				t.Fatalf("invalid capability changed: got %q, want %q", got, raw)
+			}
+		})
 	}
 
-	for _, foreign := range []string{
-		"legacy-plaintext-capability",
-		`{"protocol_version":2,"capability":"cap-old"}`,
-		`{"protocol_version":1,"capability":"cap-v1","legacy":true}`,
-	} {
-		if err := os.WriteFile(path, []byte(foreign), 0o600); err != nil {
-			t.Fatalf("write foreign capability: %v", err)
-		}
-		if got, ok := loadCap(key); ok || got != "" {
-			t.Fatalf("loadCap(%s) = %q/%v, want discard", foreign, got, ok)
-		}
-		if _, err := os.Stat(path); !os.IsNotExist(err) {
-			t.Fatalf("foreign capability still exists: %v", err)
-		}
+	const invalid = "not-json"
+	if err := os.WriteFile(path, []byte(invalid), 0o600); err != nil {
+		t.Fatalf("write invalid capability: %v", err)
+	}
+	if _, err := openBridge(t.Context(), "", "chrome", bridgeDefaultProfile, false); err == nil {
+		t.Fatal("openBridge accepted invalid persisted capability")
+	}
+	if err := stopBridge(t.Context(), key); err == nil {
+		t.Fatal("stopBridge accepted invalid persisted capability")
+	}
+	if _, err := listCaps(); err == nil {
+		t.Fatal("listCaps accepted invalid persisted capability")
+	}
+	got, err := os.ReadFile(path) //nolint:gosec // G304: capFile returns a hash under the test config dir.
+	if err != nil {
+		t.Fatalf("invalid capability was removed by an operation: %v", err)
+	}
+	if string(got) != invalid {
+		t.Fatalf("invalid capability changed by an operation: got %q, want %q", got, invalid)
+	}
+}
+
+func TestBridgeCapabilityStateRejectsInsecureModeWithoutDeletion(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	const key = ":chrome:Default"
+	if err := saveCap(key, "cap-v1"); err != nil {
+		t.Fatalf("saveCap: %v", err)
+	}
+	path, err := capFile(key)
+	if err != nil {
+		t.Fatalf("capFile: %v", err)
+	}
+	if err := os.Chmod(path, 0o644); err != nil {
+		t.Fatalf("chmod capability: %v", err)
+	}
+	if got, ok, err := loadCap(key); err == nil || ok || got != "" {
+		t.Fatalf("loadCap = %q/%v/%v, want empty/false/error", got, ok, err)
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("insecure capability was removed: %v", err)
 	}
 }
 
