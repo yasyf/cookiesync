@@ -20,7 +20,7 @@ jobs:
   # path fits: the CLI is pure Go, and .goreleaser.yaml's notarize block reads the same
   # MACOS_* env names the reusable workflow exports.
   release:
-    uses: yasyf/homebrew-tap/.github/workflows/release-go.yml@v1
+    uses: yasyf/homebrew-tap/.github/workflows/release-go.yml@8f422c652d836c40f9cc5a9d893d4120b26bc681
     secrets: inherit
 
   # Wrap the cookiesync CLI in a signed, notarized, stapled CookieSync.app and ship it
@@ -50,7 +50,7 @@ jobs:
           cache: true
 
       - name: Import Developer ID certificate
-        uses: yasyf/homebrew-tap/.github/actions/import-developer-id@v1
+        uses: yasyf/homebrew-tap/.github/actions/import-developer-id@19c3d5013032ad9c88f9a8f1170d1f366c19b8d9
         with:
           p12: ${{ secrets.MACOS_SIGN_P12 }}
           p12-password: ${{ secrets.MACOS_SIGN_PASSWORD }}
@@ -82,7 +82,7 @@ jobs:
 
       - name: Wrap the CLI in CookieSync.app (durable TCC bundle identity)
         id: wrap
-        uses: yasyf/homebrew-tap/.github/actions/wrap-daemon-bundle@v1
+        uses: yasyf/homebrew-tap/.github/actions/wrap-daemon-bundle@19c3d5013032ad9c88f9a8f1170d1f366c19b8d9
         with:
           binary: ${{ steps.build.outputs.binary }}
           bundle-id: com.github.yasyf.cookiesync
@@ -125,7 +125,7 @@ jobs:
       # (e.g. v1.0.0-rc1) ships a prerelease asset that must not become the tap's latest.
       - name: Render the cask
         if: ${{ !contains(github.ref_name, '-') }}
-        uses: yasyf/homebrew-tap/.github/actions/render-formula@v1
+        uses: yasyf/homebrew-tap/.github/actions/render-formula@19c3d5013032ad9c88f9a8f1170d1f366c19b8d9
         with:
           template: .github/cask/cookiesync.rb.tmpl
           output: Casks/cookiesync.rb
@@ -134,7 +134,7 @@ jobs:
 
       - name: Publish the cask to the tap
         if: ${{ !contains(github.ref_name, '-') }}
-        uses: yasyf/homebrew-tap/.github/actions/publish@v2
+        uses: yasyf/homebrew-tap/.github/actions/publish@19c3d5013032ad9c88f9a8f1170d1f366c19b8d9
         with:
           token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
           dir: tap-staging
