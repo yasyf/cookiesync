@@ -422,6 +422,7 @@ func saveCap(key, capability string) error {
 	if !info.IsDir() {
 		return errors.New("bridge caps path is not a directory")
 	}
+	// #nosec G302 -- directories require execute permission; 0700 is owner-only.
 	if err := os.Chmod(dir, 0o700); err != nil {
 		return fmt.Errorf("secure bridge caps dir: %w", err)
 	}

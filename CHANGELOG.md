@@ -4,6 +4,14 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+- Pin daemonkit v0.9.0 and Synckit v0.29.0 as the exact fleet hard-cut dependencies.
+- Bridge capability files now require their exact v1 identity, fingerprint,
+  target, and capability. Foreign, malformed, or insecure files fail loudly
+  and remain intact for manual cutover inspection instead of being deleted.
+
 ## [0.17.0] - 2026-07-19
 
 ### Fixed

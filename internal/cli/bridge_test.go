@@ -208,6 +208,7 @@ func TestBridgeCapabilityStateRejectsInsecureModeWithoutDeletion(t *testing.T) {
 	if err != nil {
 		t.Fatalf("capFile: %v", err)
 	}
+	// #nosec G302 -- deliberately weaken the fixture to verify fail-closed loading.
 	if err := os.Chmod(path, 0o644); err != nil {
 		t.Fatalf("chmod capability: %v", err)
 	}
