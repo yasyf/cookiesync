@@ -6,6 +6,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.23.0] - 2026-07-23
+
+### Changed
+- Pin daemonkit v0.10.0 for the released fleet runtime.
+
+## [0.22.0] - 2026-07-23
+
 ### Changed
 - Pin daemonkit v0.9.0 and Synckit v0.29.0 as the exact fleet hard-cut dependencies.
 - Bridge capability files now require their exact v1 identity, fingerprint,
@@ -333,7 +340,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `synckitd install` now owns the agents. The host mesh is read from the shared
   `~/.config/synckit`.
 
-[Unreleased]: https://github.com/yasyf/cookiesync/compare/v0.16.0...HEAD
+[Unreleased]: https://github.com/yasyf/cookiesync/compare/v0.23.0...HEAD
+[0.23.0]: https://github.com/yasyf/cookiesync/compare/v0.22.0...v0.23.0
+[0.22.0]: https://github.com/yasyf/cookiesync/compare/v0.21.0...v0.22.0
 [0.16.0]: https://github.com/yasyf/cookiesync/releases/tag/v0.16.0
 [0.15.0]: https://github.com/yasyf/cookiesync/releases/tag/v0.15.0
 [0.14.2]: https://github.com/yasyf/cookiesync/releases/tag/v0.14.2
