@@ -227,15 +227,8 @@ func TestHelperRuntimeDrainsKeepaliveBeforeAdmissionSettlement(t *testing.T) {
 	}
 	select {
 	case result := <-callDone:
-		if result.err == nil {
-			if result.response == nil || !result.response.OK {
-				t.Fatalf("drained keepalive response=%+v", result.response)
-			}
-		} else {
-			var transportErr *synckit.TransportError
-			if !errors.As(result.err, &transportErr) || transportErr.Outcome != wire.PostSendFailure {
-				t.Fatalf("drained keepalive error=%v, want post-send shutdown settlement", result.err)
-			}
+		if result.err != nil || result.response == nil || !result.response.OK {
+			t.Fatalf("drained keepalive response=%+v err=%v", result.response, result.err)
 		}
 	case <-time.After(time.Second):
 		t.Fatal("drained keepalive did not return")
