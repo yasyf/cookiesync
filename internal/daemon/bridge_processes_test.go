@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"os"
@@ -15,11 +16,64 @@ import (
 	"time"
 
 	"github.com/yasyf/daemonkit/proc"
-	"github.com/yasyf/daemonkit/supervise"
 	"golang.org/x/sync/semaphore"
 
 	"github.com/yasyf/cookiesync/internal/paths"
 )
+
+func bridgeTestGeneration(label string) proc.OwnerGeneration {
+	digest := sha256.Sum256([]byte(label))
+	var generation proc.OwnerGeneration
+	copy(generation[:], digest[:])
+	return generation
+}
+
+func activateBridgeChildren(t *testing.T, processes *bridgeProcesses) {
+	t.Helper()
+	if err := processes.children.ClaimRuntime(); err != nil {
+		t.Fatal(err)
+	}
+	if err := processes.children.Recover(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := processes.children.Shutdown(ctx); err != nil {
+			t.Errorf("shutdown children: %v", err)
+		}
+	})
+}
+
+func startBridgeTestChild(
+	t *testing.T,
+	processes *bridgeProcesses,
+	path string,
+	args []string,
+	recorded func(context.Context, proc.ProcessReceipt) error,
+) (*proc.PreparedChild, error) {
+	t.Helper()
+	request, err := proc.NewSpawnRequest(proc.SpawnConfig{
+		RecoveryID: proc.RecoveryTaskID, Executable: path, Args: args,
+		Stdin: proc.StdioNull, Stdout: proc.StdioNull, Stderr: proc.StdioNull,
+	})
+	if err != nil {
+		return nil, err
+	}
+	child, receipt, err := processes.children.Prepare(t.Context(), request)
+	if err != nil {
+		return nil, err
+	}
+	if recorded != nil {
+		if err := recorded(t.Context(), receipt); err != nil {
+			return nil, errors.Join(err, child.Stop(context.Background()))
+		}
+	}
+	if err := child.Start(t.Context()); err != nil {
+		return nil, errors.Join(err, child.Stop(context.Background()))
+	}
+	return child, nil
+}
 
 type blockingRecoveryRunner struct {
 	started chan struct{}
@@ -51,17 +105,12 @@ func TestBridgeRecoveryReapsLeaderlessGroupBeforeReceiptAcknowledgement(t *testi
 	if err != nil {
 		t.Fatal(err)
 	}
-	old, err := newBridgeProcessesGeneration(executable, "old-generation")
+	old, err := newBridgeProcessesGeneration(executable, bridgeTestGeneration("old-generation"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	old.reaper.Grace = 50 * time.Millisecond
 	old.reaper.Settlement = time.Second
-	t.Cleanup(func() {
-		old.Close()
-		old.Cancel()
-		_ = old.Wait(context.Background())
-	})
 
 	releaseLeader := filepath.Join(t.TempDir(), "release")
 	descendantFile := filepath.Join(t.TempDir(), "descendant")
@@ -74,14 +123,16 @@ func TestBridgeRecoveryReapsLeaderlessGroupBeforeReceiptAcknowledgement(t *testi
 	if err := command.Start(); err != nil {
 		t.Fatal(err)
 	}
-	record, err := old.reaper.TrackGroup(t.Context(), command.Process.Pid, proc.RecoveryTask)
+	record, err := old.reaper.TrackGroup(t.Context(), command.Process.Pid, proc.RecoveryTaskID)
 	if err != nil {
 		t.Fatal(err)
 	}
 	const sessionID = "leaderless-session"
-	if err := old.recorded(
-		bridgeProcessTunnel, sessionID, "you@desktop:chrome:Default", "you@desktop", "cap-b-secret",
-	)(t.Context(), record); err != nil {
+	if err := old.writeMetadata(t.Context(), bridgeRecoveryMetadata{
+		Schema: bridgeRecoverySchemaV1, SessionID: sessionID, Kind: bridgeProcessTunnel,
+		Process: bridgeIdentityFromRecord(record), Endpoint: "you@desktop:chrome:Default",
+		Host: "you@desktop", Capability: "cap-b-secret",
+	}); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(releaseLeader, []byte("go"), 0o600); err != nil {
@@ -99,17 +150,13 @@ func TestBridgeRecoveryReapsLeaderlessGroupBeforeReceiptAcknowledgement(t *testi
 		t.Fatal(err)
 	}
 
-	next, err := newBridgeProcessesGeneration(executable, "next-generation")
+	next, err := newBridgeProcessesGeneration(executable, bridgeTestGeneration("next-generation"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	next.reaper.Grace = 50 * time.Millisecond
 	next.reaper.Settlement = time.Second
-	t.Cleanup(func() {
-		next.Close()
-		next.Cancel()
-		_ = next.Wait(context.Background())
-	})
+	activateBridgeChildren(t, next)
 	deletionStarted := make(chan struct{})
 	deletionRelease := make(chan struct{})
 	var deletionOnce sync.Once
@@ -122,21 +169,21 @@ func TestBridgeRecoveryReapsLeaderlessGroupBeforeReceiptAcknowledgement(t *testi
 	}
 	runner := &blockingRecoveryRunner{started: make(chan struct{}), release: make(chan struct{})}
 	done := make(chan error, 1)
-	go func() { done <- next.recover(context.Background(), runner) }()
+	go func() { done <- next.settleRecovery(context.Background(), runner) }()
 	select {
 	case <-runner.started:
 	case <-time.After(5 * time.Second):
 		t.Fatal("recovery did not reach remote-close settlement")
 	}
 
-	page, err := next.reaper.ReapReceipts(t.Context(), proc.RecoveryTask, proc.ReapReceiptCursor{}, proc.ReapReceiptPageLimit)
+	page, err := next.reaper.ReapReceipts(t.Context(), proc.RecoveryTaskID, proc.ReapReceiptCursor{}, proc.ReapReceiptPageLimit)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(page.Receipts) != 1 || page.Receipts[0].Record != record {
 		t.Fatalf("receipt before product settlement = %+v", page.Receipts)
 	}
-	metadataName, err := bridgeRecoveryFileName(bridgeProcessTunnel, record)
+	metadataName, err := bridgeRecoveryFileName(bridgeProcessTunnel, bridgeIdentityFromRecord(record))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -150,7 +197,7 @@ func TestBridgeRecoveryReapsLeaderlessGroupBeforeReceiptAcknowledgement(t *testi
 	case <-time.After(5 * time.Second):
 		t.Fatal("recovery did not durably remove product metadata")
 	}
-	page, err = next.reaper.ReapReceipts(t.Context(), proc.RecoveryTask, proc.ReapReceiptCursor{}, proc.ReapReceiptPageLimit)
+	page, err = next.reaper.ReapReceipts(t.Context(), proc.RecoveryTaskID, proc.ReapReceiptCursor{}, proc.ReapReceiptPageLimit)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -162,7 +209,7 @@ func TestBridgeRecoveryReapsLeaderlessGroupBeforeReceiptAcknowledgement(t *testi
 		t.Fatalf("recover: %v", err)
 	}
 
-	page, err = next.reaper.ReapReceipts(t.Context(), proc.RecoveryTask, proc.ReapReceiptCursor{}, proc.ReapReceiptPageLimit)
+	page, err = next.reaper.ReapReceipts(t.Context(), proc.RecoveryTaskID, proc.ReapReceiptCursor{}, proc.ReapReceiptPageLimit)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -192,15 +239,11 @@ func TestBridgeRecoveryReapsLeaderlessGroupBeforeReceiptAcknowledgement(t *testi
 
 func TestBridgeRecordedFailsClosedWhenSessionParentSyncFails(t *testing.T) {
 	t.Setenv(paths.ConfigDirEnv, t.TempDir())
-	processes, err := newBridgeProcessesGeneration("/bin/sh", "recorded-sync-generation")
+	processes, err := newBridgeProcessesGeneration("/bin/sh", bridgeTestGeneration("recorded-sync-generation"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() {
-		processes.Close()
-		processes.Cancel()
-		_ = processes.Wait(context.Background())
-	})
+	activateBridgeChildren(t, processes)
 	if err := processes.prepareRecoveryRoots(); err != nil {
 		t.Fatal(err)
 	}
@@ -212,14 +255,11 @@ func TestBridgeRecordedFailsClosedWhenSessionParentSyncFails(t *testing.T) {
 		return syncDirectory(path)
 	}
 	marker := filepath.Join(t.TempDir(), "executed")
-	_, err = processes.pool.Start(t.Context(), supervise.ProcessSpec{
-		RecoveryClass: proc.RecoveryTask,
-		Path:          "/bin/sh",
-		Args:          []string{"-c", "printf executed > " + marker},
-		Recorded: processes.recorded(
+	_, err = startBridgeTestChild(t, processes, "/bin/sh", []string{"-c", "printf executed > " + marker},
+		processes.recorded(
 			bridgeProcessChrome, "recorded-sync", "chrome:Default", "", "",
 		),
-	})
+	)
 	if !errors.Is(err, errSync) {
 		t.Fatalf("Start = %v, want parent sync failure", err)
 	}
@@ -237,25 +277,18 @@ func TestBridgeRecordedFailsClosedWhenSessionParentSyncFails(t *testing.T) {
 
 func TestBridgeRecoveryKeepsOneSidecarPerProcessAttempt(t *testing.T) {
 	t.Setenv(paths.ConfigDirEnv, t.TempDir())
-	processes, err := newBridgeProcessesGeneration("/bin/sh", "attempt-sidecar-generation")
+	processes, err := newBridgeProcessesGeneration("/bin/sh", bridgeTestGeneration("attempt-sidecar-generation"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() {
-		processes.Close()
-		processes.Cancel()
-		_ = processes.Wait(context.Background())
-	})
+	activateBridgeChildren(t, processes)
 	const sessionID = "multi-attempt-session"
 	for range 2 {
-		process, err := processes.pool.Start(t.Context(), supervise.ProcessSpec{
-			RecoveryClass: proc.RecoveryTask,
-			Path:          "/bin/sleep",
-			Args:          []string{"30"},
-			Recorded: processes.recorded(
+		process, err := startBridgeTestChild(t, processes, "/bin/sleep", []string{"30"},
+			processes.recorded(
 				bridgeProcessTunnel, sessionID, "you@desktop:chrome:Default", "you@desktop", "cap-b-secret",
 			),
-		})
+		)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -276,26 +309,24 @@ func TestBridgeRecoveryKeepsOneSidecarPerProcessAttempt(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(metadata) != 2 || metadata[0].Record == metadata[1].Record {
+	if len(metadata) != 2 || metadata[0].Process == metadata[1].Process {
 		t.Fatalf("recovery metadata = %+v, want two distinct process records", metadata)
 	}
 }
 
 func TestBridgeProcessShutdownLeavesNoAuthorityOrMetadata(t *testing.T) {
 	t.Setenv(paths.ConfigDirEnv, t.TempDir())
-	processes, err := newBridgeProcessesGeneration("/bin/sh", "shutdown-generation")
+	processes, err := newBridgeProcessesGeneration("/bin/sh", bridgeTestGeneration("shutdown-generation"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	const sessionID = "shutdown-session"
-	process, err := processes.pool.Start(t.Context(), supervise.ProcessSpec{
-		RecoveryClass: proc.RecoveryTask,
-		Path:          "/bin/sh",
-		Args:          []string{"-c", "trap '' TERM; while :; do sleep 1; done"},
-		Recorded: processes.recorded(
+	activateBridgeChildren(t, processes)
+	process, err := startBridgeTestChild(t, processes, "/bin/sh", []string{"-c", "trap '' TERM; while :; do sleep 1; done"},
+		processes.recorded(
 			bridgeProcessChrome, sessionID, "chrome:Default", "", "",
 		),
-	})
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -305,11 +336,6 @@ func TestBridgeProcessShutdownLeavesNoAuthorityOrMetadata(t *testing.T) {
 	if err := os.RemoveAll(processes.sessionDir(sessionID)); err != nil {
 		t.Fatal(err)
 	}
-	processes.Close()
-	processes.Cancel()
-	if err := processes.Wait(context.Background()); err != nil {
-		t.Fatal(err)
-	}
 	records, err := processes.reaper.Store.Load(t.Context())
 	if err != nil {
 		t.Fatal(err)
@@ -317,7 +343,7 @@ func TestBridgeProcessShutdownLeavesNoAuthorityOrMetadata(t *testing.T) {
 	if len(records) != 0 {
 		t.Fatalf("shutdown records = %+v", records)
 	}
-	page, err := processes.reaper.ReapReceipts(t.Context(), proc.RecoveryTask, proc.ReapReceiptCursor{}, proc.ReapReceiptPageLimit)
+	page, err := processes.reaper.ReapReceipts(t.Context(), proc.RecoveryTaskID, proc.ReapReceiptCursor{}, proc.ReapReceiptPageLimit)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -56,6 +56,15 @@ func writeMeshState(t *testing.T, self string, hosts ...string) {
 	if err := hostregistry.Mesh.InitializeState(context.Background()); err != nil {
 		t.Fatal(err)
 	}
+	for _, host := range hosts {
+		fact, err := hostregistry.NewSSHHostFact(host, "/usr/local/bin/synckitd", []string{host})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := hostregistry.Mesh.RegisterHost(context.Background(), fact); err != nil {
+			t.Fatal(err)
+		}
+	}
 	if _, err := hostregistry.Mesh.Update(context.Background(), func(g *hostregistry.Registry) error { g.Self = self; g.Hosts = hosts; return nil }); err != nil {
 		t.Fatal(err)
 	}

@@ -86,6 +86,12 @@ func (d *Driver) LoadRegistry(ctx context.Context) (cregistry.Registry[state.End
 	return d.store.LoadRegistry(ctx)
 }
 
+func (d *Driver) useRegistry(reg cregistry.Registry[state.EndpointMeta]) {
+	d.mu.Lock()
+	d.merged = reg
+	d.mu.Unlock()
+}
+
 // SaveRegistry compacts tombstones older than tombstoneCompactHorizon out of the merged
 // registry, then persists it back into state.json through the lock-free path (the
 // orchestration already holds the flock) and stashes it so Reconcile can enumerate

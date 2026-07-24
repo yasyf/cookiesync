@@ -12,10 +12,10 @@ import (
 	"github.com/yasyf/cookiesync/internal/daemon"
 	"github.com/yasyf/cookiesync/internal/paths"
 	"github.com/yasyf/cookiesync/internal/state"
+	"github.com/yasyf/cookiesync/internal/transfer"
 	"github.com/yasyf/synckit/codec"
 	"github.com/yasyf/synckit/hostregistry"
 	"github.com/yasyf/synckit/manifest"
-	"github.com/yasyf/synckit/rpc"
 )
 
 // watchDebounce is the settle window synckitd holds a local store's write burst for
@@ -35,29 +35,6 @@ func newHelperServeCmd(build string) *cobra.Command {
 	return cmd
 }
 
-// newRPCServeCmd builds the stdin/stdout bridge synckitd starts as cookiesync's typed
-// sync service: it forwards each rpc frame on stdin to the resident helper's unix socket
-// and writes the response frame back on stdout, byte-exact (it never decodes the payload,
-// so a get_state response's int64 CRDT stamps survive). It is NOT a fresh daemon — it
-// never primes a Secure-Enclave key nor prompts Touch ID; it bridges to the warm resident
-// helper, so a cross-host svc.sync/svc.get_state reuses that peer's already-primed key.
-// stdout is the framing channel, so nothing may log there on this path.
-func newRPCServeCmd() *cobra.Command {
-	cmd := &cobra.Command{
-		Use:   "rpc-serve",
-		Short: "Bridge typed sync RPC frames from stdin/stdout to the resident helper's socket (used by synckitd).",
-		Args:  cobra.NoArgs,
-		RunE: func(cmd *cobra.Command, _ []string) error {
-			sock, err := paths.SockPath()
-			if err != nil {
-				return err
-			}
-			return rpc.Proxy(cmd.Context(), os.Stdin, os.Stdout, sock)
-		},
-	}
-	return cmd
-}
-
 func newInstallCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "install",
@@ -69,10 +46,8 @@ func newInstallCmd() *cobra.Command {
 }
 
 // cookiesyncManifest is the synckit manifest synckitd reads to drive cookiesync: the
-// watch backend that fingerprints local stores, the typed service block synckitd drives
-// reconcile/sync/state over (the rpc-serve bridge to the resident socket), and the
-// resident helper to keep alive. synckitd dials the service socket directly and speaks
-// the typed svc.* contract — no shell, no argv templating.
+// watch backend that fingerprints local stores, the exact resident transfer service,
+// and the resident helper to keep alive. synckitd dials the service socket directly.
 func cookiesyncManifest() (manifest.Manifest, error) {
 	sock, err := paths.SockPath()
 	if err != nil {
@@ -86,9 +61,7 @@ func cookiesyncManifest() (manifest.Manifest, error) {
 			Debounce: codec.Duration(watchDebounce),
 		},
 		Service: manifest.ServiceSpec{
-			Transport: "socket",
-			ServeArgs: []string{"rpc-serve"},
-			Sock:      sock,
+			Kind: "resident", Socket: sock, SchemaFingerprint: transfer.Fingerprint,
 		},
 		Helper: &manifest.HelperSpec{
 			Command:     "helper-serve",

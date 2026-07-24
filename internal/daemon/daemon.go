@@ -37,7 +37,7 @@ import (
 
 	dkdaemon "github.com/yasyf/daemonkit/daemon"
 	"github.com/yasyf/daemonkit/proc"
-	"github.com/yasyf/daemonkit/supervise"
+	"github.com/yasyf/daemonkit/worker"
 	"golang.org/x/sync/semaphore"
 
 	"github.com/yasyf/cookiesync/internal/auth"
@@ -49,6 +49,7 @@ import (
 	"github.com/yasyf/cookiesync/internal/mesh"
 	"github.com/yasyf/cookiesync/internal/paths"
 	"github.com/yasyf/cookiesync/internal/state"
+	"github.com/yasyf/cookiesync/internal/transfer"
 	"github.com/yasyf/synckit/debug"
 	"github.com/yasyf/synckit/helperruntime"
 	"github.com/yasyf/synckit/presence"
@@ -88,7 +89,7 @@ type Daemon struct {
 	probe    Probe
 	runner   engine.SSHRunner
 	state    StateLoader
-	registry RegistryLoader
+	registry transfer.RegistryStore
 
 	// seedSource and hostBinary are the local-bridge test seams: the profile read
 	// and the Chrome resolver, defaulted in New and overridden in tests.
@@ -97,8 +98,8 @@ type Daemon struct {
 
 	// openTunnel and openKeepalive are the cross-host bridge seams: the ssh -L
 	// forward and the keepalive supervisor, defaulted in New and faked in tests.
-	openTunnel    func(context.Context, bridge.TunnelSpec, func(context.Context, proc.Record) error) (bridgeTunnel, error)
-	openKeepalive func(context.Context, string, string, func(context.Context, proc.Record) error) (bridgeKeepalive, error)
+	openTunnel    func(context.Context, bridge.TunnelSpec, func(context.Context, proc.ProcessReceipt) error) (bridgeTunnel, error)
+	openKeepalive func(context.Context, string, string, string, func(context.Context, proc.ProcessReceipt) error) (bridgeKeepalive, error)
 	processes     *bridgeProcesses
 	bridgeSlots   *semaphore.Weighted
 
@@ -115,8 +116,8 @@ type Daemon struct {
 // the presence probes, and the ssh runner. The returned closer is the cache's
 // Close — it evicts every entry and drops the Enclave key; Serve calls it, but
 // a caller that builds without serving must too.
-func buildDaemon(ctx context.Context, pool *supervise.Pool) (*Daemon, func(context.Context) error, error) {
-	d, keyCache, err := build(ctx, pool)
+func buildDaemon(ctx context.Context, workers *worker.Pool) (*Daemon, func(context.Context) error, error) {
+	d, keyCache, err := build(ctx, workers)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -125,7 +126,7 @@ func buildDaemon(ctx context.Context, pool *supervise.Pool) (*Daemon, func(conte
 
 // build is buildDaemon with the key cache exposed, so generation tests drive the real
 // cache the daemon was wired over.
-func build(ctx context.Context, pool *supervise.Pool) (*Daemon, *cache.KeyCache, error) {
+func build(ctx context.Context, workers *worker.Pool) (*Daemon, *cache.KeyCache, error) {
 	store := state.New(paths.Config)
 	// Load once here to fail fast on a malformed state file; handlers re-read it live.
 	if _, err := store.Load(ctx); err != nil {
@@ -136,7 +137,7 @@ func build(ctx context.Context, pool *supervise.Pool) (*Daemon, *cache.KeyCache,
 	if err != nil {
 		return nil, nil, err
 	}
-	runner := engine.NewExecSSHRunner(pool)
+	runner := engine.NewExecSSHRunner(workers)
 
 	// synckitd owns the watch loop and reconcile tick; the engine records
 	// applied digests through a standalone recorder.
@@ -154,7 +155,7 @@ func build(ctx context.Context, pool *supervise.Pool) (*Daemon, *cache.KeyCache,
 // auth broker is constructed here over the same seams; buildDaemon pins its
 // KeybagProbe to the ioreg-only read, and tests pin the broker's exported
 // fields directly.
-func New(consent cookie.Consent, c Cache, eng *engine.Engine, probe Probe, runner engine.SSHRunner, st StateLoader, reg RegistryLoader) *Daemon {
+func New(consent cookie.Consent, c Cache, eng *engine.Engine, probe Probe, runner engine.SSHRunner, st StateLoader, reg transfer.RegistryStore) *Daemon {
 	d := &Daemon{
 		broker:      auth.NewBroker(consent, c, probe, runner, st),
 		engine:      eng,
@@ -168,15 +169,15 @@ func New(consent cookie.Consent, c Cache, eng *engine.Engine, probe Probe, runne
 		seedSource:  cookie.SeedState,
 		hostBinary:  bridge.ResolveHostBinary,
 	}
-	d.openTunnel = func(ctx context.Context, spec bridge.TunnelSpec, recorded func(context.Context, proc.Record) error) (bridgeTunnel, error) {
-		t, err := bridge.OpenTunnel(ctx, d.processes.pool, spec, recorded)
+	d.openTunnel = func(ctx context.Context, spec bridge.TunnelSpec, recorded func(context.Context, proc.ProcessReceipt) error) (bridgeTunnel, error) {
+		t, err := bridge.OpenTunnel(ctx, d.processes.children, spec, recorded)
 		if err != nil {
 			return nil, err
 		}
 		return t, nil
 	}
-	d.openKeepalive = func(ctx context.Context, addr, capability string, recorded func(context.Context, proc.Record) error) (bridgeKeepalive, error) {
-		k, err := bridge.OpenKeepalive(ctx, d.processes.pool, addr, capability, recorded)
+	d.openKeepalive = func(ctx context.Context, target, addr, capability string, recorded func(context.Context, proc.ProcessReceipt) error) (bridgeKeepalive, error) {
+		k, err := bridge.OpenKeepalive(ctx, d.processes.children, target, addr, capability, recorded)
 		if err != nil {
 			return nil, err
 		}
@@ -187,10 +188,9 @@ func New(consent cookie.Consent, c Cache, eng *engine.Engine, probe Probe, runne
 
 // Dispatcher builds the synckit Dispatcher with every peer and local method
 // bound. The transport dispatches handlers concurrently, so a host mid-pass
-// keeps answering its peers. Only sync and reconcile are registered exclusive:
-// they run the flock-wrapped converge pass, queueing behind the same
-// per-dispatcher mutex as svc.sync and svc.reconcile instead of contending on
-// the non-reentrant flock. Everything else stays concurrent — request_consent
+// keeps answering its peers. Product sync/reconcile and Synckit's mutating transfer
+// methods share the dispatcher's exclusive lane instead of contending on the
+// non-reentrant state flock. Everything else stays concurrent — request_consent
 // above all, since a routed consent must be answerable while this host is
 // itself mid-prime (the same-host routed-consent cycle). The shared in-process
 // state behind the concurrent handlers locks internally; handleApply serializes
@@ -203,8 +203,7 @@ func (d *Daemon) Dispatcher() *synckit.Dispatcher {
 }
 
 func (d *Daemon) register(dispatcher *synckit.Dispatcher) {
-	// The typed sync contract synckitd drives over the resident socket, served
-	// here so a cross-host svc.sync reuses the already-primed SE key.
+	// Synckit's exact v1 transfer contract runs in the warm resident product.
 	syncservice.RegisterConsumer(dispatcher, newSyncConsumer(d.engine, d.state, d.registry))
 	// The bare fleet/local methods. sync and reconcile take the state flock,
 	// so they are exclusive.
@@ -262,153 +261,70 @@ func helperRolePath() (string, error) {
 	return filepath.Clean(rolePath), nil
 }
 
-type helperBuilder func(context.Context, *supervise.Pool) (*Daemon, func(context.Context) error, error)
+type helperBuilder func(context.Context, *worker.Pool) (*Daemon, func(context.Context) error, error)
 
-func newHelperRuntime(sock, rolePath, build string, builder helperBuilder) (*dkdaemon.Runtime, error) {
+func newHelperRuntime(sock, rolePath, build string, builder helperBuilder) (*helperruntime.Runtime, error) {
 	dispatcher := synckit.NewDispatcher()
-	rpcServer := runtimeRPCServer(dispatcher)
-	owner := newHelperOwner()
 	processes, err := newBridgeProcesses(rolePath)
 	if err != nil {
 		return nil, err
 	}
-	workers := helperWorkers{owner: owner, processes: processes}
-	runtime, err := helperruntime.New(helperruntime.Config{
-		App:    helperruntime.App{Name: paths.ToolName, RuntimeBuild: build},
-		Socket: sock, Server: rpcServer,
-		Workers: workers, State: runtimeState{}, Resources: helperResources{owner: owner},
-		Drain: func() error {
-			owner.Close()
-			return nil
-		},
-		Activate: func(activation dkdaemon.Activation) error {
-			dir, err := paths.Dir()
-			if err != nil {
-				return err
-			}
-			if err := os.MkdirAll(dir, 0o700); err != nil {
-				return fmt.Errorf("create config dir %s: %w", dir, err)
-			}
-			if err := processes.reap(activation.Startup); err != nil {
-				return err
-			}
-			if err := debug.DumpOnSIGUSR1(activation.Lifetime, filepath.Join(dir, "debug")); err != nil {
-				return err
-			}
-			d, closer, err := builder(activation.Startup, processes.pool)
-			if err != nil {
-				return err
-			}
-			d.processes = processes
-			if err := processes.settleRecovery(activation.Startup, d.runner); err != nil {
-				closeCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-				defer cancel()
-				return errors.Join(err, closer(closeCtx))
-			}
-			d.startBridgeReaper()
-			owner.set(d, closer)
-			d.register(dispatcher)
-			return nil
-		},
-	})
+	stopStorePath, err := paths.RuntimeStopStorePath()
 	if err != nil {
-		processes.Close()
-		processes.Cancel()
-		_ = processes.Wait(context.Background())
 		return nil, err
 	}
-	return runtime, nil
-}
-
-type helperWorkers struct {
-	owner     *helperOwner
-	processes *bridgeProcesses
-}
-
-func (w helperWorkers) Close() {
-	w.owner.Close()
-	w.processes.Close()
-}
-
-func (w helperWorkers) Cancel() {
-	w.owner.Cancel()
-	w.processes.Cancel()
-}
-
-func (w helperWorkers) Wait(ctx context.Context) error {
-	return errors.Join(w.owner.Wait(ctx), w.processes.Wait(ctx))
-}
-
-func runtimeRPCServer(dispatcher *synckit.Dispatcher) *synckit.Server {
-	return synckit.NewServer(dispatcher)
-}
-
-type runtimeState struct{}
-
-func (runtimeState) Close() error { return nil }
-
-type helperOwner struct {
-	mu        sync.Mutex
-	daemon    *Daemon
-	closer    func(context.Context) error
-	closeOnce sync.Once
-	done      chan struct{}
-}
-
-func newHelperOwner() *helperOwner { return &helperOwner{done: make(chan struct{})} }
-
-func (o *helperOwner) set(d *Daemon, closer func(context.Context) error) {
-	o.mu.Lock()
-	defer o.mu.Unlock()
-	o.daemon = d
-	o.closer = closer
-}
-
-func (o *helperOwner) Close() {
-	o.closeOnce.Do(func() {
-		go func() {
-			o.mu.Lock()
-			d := o.daemon
-			o.mu.Unlock()
-			if d != nil {
-				d.closeAllBridges(context.Background())
+	runtime, err := helperruntime.New(helperruntime.Config{
+		App:    helperruntime.App{Name: paths.ToolName, RuntimeBuild: build},
+		Socket: sock, Dispatcher: dispatcher,
+		Workers: processes.workers, Children: processes.children,
+		StopStore: &proc.FileStore{Path: stopStorePath},
+		Prepare: func(activation dkdaemon.Activation) (helperruntime.Product, error) {
+			activationCtx := activation.Context()
+			dir, err := paths.Dir()
+			if err != nil {
+				return nil, err
 			}
-			close(o.done)
-		}()
+			if err := os.MkdirAll(dir, 0o700); err != nil {
+				return nil, fmt.Errorf("create config dir %s: %w", dir, err)
+			}
+			if err := debug.DumpOnSIGUSR1(activationCtx, filepath.Join(dir, "debug")); err != nil {
+				return nil, err
+			}
+			d, closer, err := builder(activationCtx, processes.workers)
+			if err != nil {
+				return nil, err
+			}
+			d.processes = processes
+			if err := processes.settleRecovery(activationCtx, d.runner); err != nil {
+				closeCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+				defer cancel()
+				return nil, errors.Join(err, closer(closeCtx))
+			}
+			d.startBridgeReaper()
+			d.register(dispatcher)
+			return &helperProduct{daemon: d, closer: closer}, nil
+		},
 	})
+	return runtime, err
 }
 
-func (o *helperOwner) Cancel() { o.Close() }
-
-func (o *helperOwner) Wait(ctx context.Context) error {
-	select {
-	case <-o.done:
-		return nil
-	case <-ctx.Done():
-		<-o.done
-		return ctx.Err()
-	}
+type helperProduct struct {
+	daemon *Daemon
+	closer func(context.Context) error
 }
 
-func (o *helperOwner) closeResources() error {
-	o.mu.Lock()
-	closer := o.closer
-	o.closer = nil
-	o.mu.Unlock()
-	if closer == nil {
+func (p *helperProduct) Drain(ctx context.Context) error {
+	p.daemon.closeAllBridges(ctx)
+	return nil
+}
+
+func (p *helperProduct) Close(ctx context.Context) error {
+	if p.closer == nil {
 		return nil
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
+	closer := p.closer
+	p.closer = nil
 	return closer(ctx)
-}
-
-type helperResources struct {
-	owner *helperOwner
-}
-
-func (r helperResources) Close() error {
-	return r.owner.closeResources()
 }
 
 func onlyError(err, target error) bool {

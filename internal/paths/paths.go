@@ -45,13 +45,31 @@ func BridgeRecoveryRoot() (string, error) {
 	return filepath.Join(dir, "bridge"), nil
 }
 
-// BridgeProcessStorePath returns the daemonkit process and receipt ledger.
-func BridgeProcessStorePath() (string, error) {
+// BridgeChildrenStorePath returns the daemonkit long-lived child ledger.
+func BridgeChildrenStorePath() (string, error) {
 	root, err := BridgeRecoveryRoot()
 	if err != nil {
 		return "", err
 	}
-	return filepath.Join(root, "processes.db"), nil
+	return filepath.Join(root, "children.db"), nil
+}
+
+// BridgeWorkersStorePath returns the daemonkit disposable-worker ledger.
+func BridgeWorkersStorePath() (string, error) {
+	root, err := BridgeRecoveryRoot()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(root, "workers.db"), nil
+}
+
+// RuntimeStopStorePath returns the daemonkit stop-control ledger.
+func RuntimeStopStorePath() (string, error) {
+	dir, err := Dir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, "runtime-stops.db"), nil
 }
 
 // BridgeSessionsRoot returns the root for derived bridge session state.

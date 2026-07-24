@@ -20,6 +20,15 @@ func writeMesh(t *testing.T, self string, hosts ...string) {
 	if err := hostregistry.Mesh.InitializeState(context.Background()); err != nil {
 		t.Fatal(err)
 	}
+	for _, host := range hosts {
+		fact, err := hostregistry.NewSSHHostFact(host, "/usr/local/bin/synckitd", []string{host})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := hostregistry.Mesh.RegisterHost(context.Background(), fact); err != nil {
+			t.Fatal(err)
+		}
+	}
 	if _, err := hostregistry.Mesh.Update(context.Background(), func(g *hostregistry.Registry) error { g.Self = self; g.Hosts = hosts; return nil }); err != nil {
 		t.Fatal(err)
 	}
@@ -28,7 +37,7 @@ func writeMesh(t *testing.T, self string, hosts ...string) {
 // TestResolveReturnsSelfAndPeers proves Resolve reads the mesh self target and the
 // other hosts as the peer mesh — the set cookiesync converges across.
 func TestResolveReturnsSelfAndPeers(t *testing.T) {
-	writeMesh(t, "me@laptop", "you@desktop", "她@air")
+	writeMesh(t, "me@laptop", "you@desktop", "she@air")
 
 	self, peers, err := Resolve(context.Background())
 	if err != nil {
@@ -37,8 +46,8 @@ func TestResolveReturnsSelfAndPeers(t *testing.T) {
 	if self != "me@laptop" {
 		t.Fatalf("self = %q, want me@laptop", self)
 	}
-	if len(peers) != 2 || peers[0] != "you@desktop" || peers[1] != "她@air" {
-		t.Fatalf("peers = %v, want [you@desktop 她@air]", peers)
+	if len(peers) != 2 || peers[0] != "you@desktop" || peers[1] != "she@air" {
+		t.Fatalf("peers = %v, want [you@desktop she@air]", peers)
 	}
 }
 

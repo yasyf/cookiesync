@@ -10,11 +10,11 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"slices"
 	"strings"
+	"time"
 
 	"github.com/yasyf/daemonkit/proc"
-	"github.com/yasyf/daemonkit/supervise"
+	"github.com/yasyf/daemonkit/worker"
 
 	"github.com/yasyf/cookiesync/internal/engine"
 	"github.com/yasyf/cookiesync/internal/paths"
@@ -36,15 +36,45 @@ const (
 )
 
 type bridgeRecoveryMetadata struct {
-	Schema     uint64            `json:"schema"`
-	SessionID  string            `json:"session_id"`
-	Kind       bridgeProcessKind `json:"kind"`
-	Record     proc.Record       `json:"record"`
-	Endpoint   string            `json:"endpoint"`
-	Host       string            `json:"host,omitempty"`
-	Capability string            `json:"capability,omitempty"`
+	Schema     uint64                `json:"schema"`
+	SessionID  string                `json:"session_id"`
+	Kind       bridgeProcessKind     `json:"kind"`
+	Process    bridgeProcessIdentity `json:"process"`
+	Endpoint   string                `json:"endpoint"`
+	Host       string                `json:"host,omitempty"`
+	Capability string                `json:"capability,omitempty"`
 
 	path string
+}
+
+type bridgeProcessIdentity struct {
+	PID        int                  `json:"pid"`
+	StartTime  string               `json:"start_time"`
+	Boot       string               `json:"boot"`
+	Generation proc.OwnerGeneration `json:"generation"`
+}
+
+func bridgeIdentityFromReceipt(receipt proc.ProcessReceipt) bridgeProcessIdentity {
+	identity := receipt.ProcessIdentity()
+	return bridgeProcessIdentity{
+		PID: identity.PID, StartTime: identity.StartTime, Boot: identity.Boot,
+		Generation: receipt.OwnerGeneration(),
+	}
+}
+
+func bridgeIdentityFromRecord(record proc.Record) bridgeProcessIdentity {
+	return bridgeProcessIdentity{
+		PID: record.PID, StartTime: record.StartTime, Boot: record.Boot,
+		Generation: record.Generation,
+	}
+}
+
+func (i bridgeProcessIdentity) validate() error {
+	if i.PID <= 1 || i.StartTime == "" || i.Boot == "" ||
+		i.Generation == (proc.OwnerGeneration{}) {
+		return fmt.Errorf("bridge: recovery process identity is incomplete: pid=%d start=%q boot=%q generation=%q", i.PID, i.StartTime, i.Boot, i.Generation)
+	}
+	return nil
 }
 
 func (m bridgeRecoveryMetadata) validate() error {
@@ -54,11 +84,8 @@ func (m bridgeRecoveryMetadata) validate() error {
 	if m.SessionID == "" || filepath.Base(m.SessionID) != m.SessionID || m.Endpoint == "" {
 		return errors.New("bridge: recovery metadata has invalid session identity")
 	}
-	if err := m.Record.Validate(); err != nil {
+	if err := m.Process.validate(); err != nil {
 		return err
-	}
-	if m.Record.RecoveryClass != proc.RecoveryTask {
-		return errors.New("bridge: recovery record has wrong class")
 	}
 	switch m.Kind {
 	case bridgeProcessChrome, bridgeProcessKeepalive:
@@ -76,7 +103,8 @@ func (m bridgeRecoveryMetadata) validate() error {
 }
 
 type bridgeProcesses struct {
-	pool         *supervise.Pool
+	children     *proc.Manager
+	workers      *worker.Pool
 	reaper       *proc.Reaper
 	recoveryRoot string
 	sessionsRoot string
@@ -93,8 +121,12 @@ func newBridgeProcesses(rolePath string) (*bridgeProcesses, error) {
 	return newBridgeProcessesGeneration(rolePath, generation)
 }
 
-func newBridgeProcessesGeneration(rolePath, generation string) (*bridgeProcesses, error) {
-	storePath, err := paths.BridgeProcessStorePath()
+func newBridgeProcessesGeneration(rolePath string, generation proc.OwnerGeneration) (*bridgeProcesses, error) {
+	childrenPath, err := paths.BridgeChildrenStorePath()
+	if err != nil {
+		return nil, err
+	}
+	workersPath, err := paths.BridgeWorkersStorePath()
 	if err != nil {
 		return nil, err
 	}
@@ -107,25 +139,30 @@ func newBridgeProcessesGeneration(rolePath, generation string) (*bridgeProcesses
 		return nil, err
 	}
 	reaper := &proc.Reaper{
-		Store:      &proc.FileStore{Path: storePath, MaxOutstanding: 4 * bridgeProcessCapacity},
+		Store:      &proc.FileStore{Path: childrenPath, MaxOutstanding: 4 * bridgeProcessCapacity},
 		Generation: generation,
-		Grace:      supervise.TerminationGrace,
+		Grace:      500 * time.Millisecond,
 	}
-	pool, err := supervise.NewPool(bridgeProcessCapacity, reaper)
+	children, err := proc.NewManager(bridgeProcessCapacity, reaper)
+	if err != nil {
+		return nil, err
+	}
+	workers, err := worker.NewPool(worker.Config{
+		Capacity: bridgeProcessCapacity, QueueCapacity: bridgeProcessCapacity,
+		MaxTotalRun: 12 * time.Minute, MaxStdinBytes: 16 << 20,
+		MaxStdoutBytes: 16 << 20, MaxStderrBytes: 1 << 20,
+	}, &proc.Reaper{
+		Store:      &proc.FileStore{Path: workersPath, MaxOutstanding: 4 * bridgeProcessCapacity},
+		Generation: generation, Grace: 500 * time.Millisecond,
+	})
 	if err != nil {
 		return nil, err
 	}
 	return &bridgeProcesses{
-		pool: pool, reaper: reaper, recoveryRoot: recoveryRoot, sessionsRoot: sessionsRoot,
+		children: children, workers: workers, reaper: reaper, recoveryRoot: recoveryRoot, sessionsRoot: sessionsRoot,
 		rolePath: rolePath, syncDir: syncDirectory,
 	}, nil
 }
-
-func (p *bridgeProcesses) Close() { p.pool.Close() }
-
-func (p *bridgeProcesses) Cancel() { p.pool.Cancel() }
-
-func (p *bridgeProcesses) Wait(ctx context.Context) error { return p.pool.Wait(ctx) }
 
 func (p *bridgeProcesses) sessionDir(sessionID string) string {
 	return filepath.Join(p.sessionsRoot, sessionID)
@@ -167,11 +204,14 @@ func (p *bridgeProcesses) prepareSessionDir(sessionID string) (string, error) {
 func (p *bridgeProcesses) recorded(
 	kind bridgeProcessKind,
 	sessionID, endpoint, host, capability string,
-) func(context.Context, proc.Record) error {
-	return func(ctx context.Context, record proc.Record) error {
+) func(context.Context, proc.ProcessReceipt) error {
+	return func(ctx context.Context, receipt proc.ProcessReceipt) error {
+		if !receipt.Prepared() {
+			return errors.New("bridge: process receipt is not live")
+		}
 		metadata := bridgeRecoveryMetadata{
 			Schema: bridgeRecoverySchemaV1, SessionID: sessionID, Kind: kind,
-			Record: record, Endpoint: endpoint, Host: host, Capability: capability,
+			Process: bridgeIdentityFromReceipt(receipt), Endpoint: endpoint, Host: host, Capability: capability,
 		}
 		return p.writeMetadata(ctx, metadata)
 	}
@@ -192,7 +232,7 @@ func (p *bridgeProcesses) writeMetadata(ctx context.Context, metadata bridgeReco
 	if err != nil {
 		return fmt.Errorf("bridge: encode recovery metadata: %w", err)
 	}
-	name, err := bridgeRecoveryFileName(metadata.Kind, metadata.Record)
+	name, err := bridgeRecoveryFileName(metadata.Kind, metadata.Process)
 	if err != nil {
 		return err
 	}
@@ -214,14 +254,13 @@ func (p *bridgeProcesses) writeMetadata(ctx context.Context, metadata bridgeReco
 	return p.syncDir(dir)
 }
 
-func (p *bridgeProcesses) reap(ctx context.Context) error {
+func (p *bridgeProcesses) settleRecovery(ctx context.Context, runner engine.SSHRunner) error {
+	if _, err := p.children.RecoveryReceipt(proc.RecoveryTaskID); err != nil {
+		return fmt.Errorf("bridge: require recovered child generation: %w", err)
+	}
 	if err := p.prepareRecoveryRoots(); err != nil {
 		return err
 	}
-	return p.pool.Recover(ctx)
-}
-
-func (p *bridgeProcesses) settleRecovery(ctx context.Context, runner engine.SSHRunner) error {
 	if err := p.removeUncommittedMetadata(); err != nil {
 		return err
 	}
@@ -229,24 +268,25 @@ func (p *bridgeProcesses) settleRecovery(ctx context.Context, runner engine.SSHR
 	if err != nil {
 		return err
 	}
-	byRecord := make(map[proc.Record]bridgeRecoveryMetadata, len(metadata))
+	byProcess := make(map[bridgeProcessIdentity]bridgeRecoveryMetadata, len(metadata))
 	for _, item := range metadata {
-		byRecord[item.Record] = item
+		byProcess[item.Process] = item
 	}
 	var cursor proc.ReapReceiptCursor
 	for {
-		page, err := p.reaper.ReapReceipts(ctx, proc.RecoveryTask, cursor, proc.ReapReceiptPageLimit)
+		page, err := p.reaper.ReapReceipts(ctx, proc.RecoveryTaskID, cursor, proc.ReapReceiptPageLimit)
 		if err != nil {
 			return err
 		}
 		for _, receipt := range page.Receipts {
-			item, ok := byRecord[receipt.Record]
+			identity := bridgeIdentityFromRecord(receipt.Record)
+			item, ok := byProcess[identity]
 			if ok {
 				p.settleProduct(ctx, runner, item)
 				if err := p.removeMetadata(item); err != nil {
 					return err
 				}
-				delete(byRecord, receipt.Record)
+				delete(byProcess, identity)
 			}
 			if _, err := p.reaper.AcknowledgeReap(ctx, receipt); err != nil {
 				return err
@@ -261,8 +301,12 @@ func (p *bridgeProcesses) settleRecovery(ctx context.Context, runner engine.SSHR
 	if err != nil {
 		return err
 	}
-	for _, item := range byRecord {
-		if slices.Contains(active, item.Record) {
+	activeProcesses := make(map[bridgeProcessIdentity]struct{}, len(active))
+	for _, record := range active {
+		activeProcesses[bridgeIdentityFromRecord(record)] = struct{}{}
+	}
+	for identity, item := range byProcess {
+		if _, ok := activeProcesses[identity]; ok {
 			continue
 		}
 		p.settleProduct(ctx, runner, item)
@@ -271,13 +315,6 @@ func (p *bridgeProcesses) settleRecovery(ctx context.Context, runner engine.SSHR
 		}
 	}
 	return nil
-}
-
-func (p *bridgeProcesses) recover(ctx context.Context, runner engine.SSHRunner) error {
-	if err := p.reap(ctx); err != nil {
-		return err
-	}
-	return p.settleRecovery(ctx, runner)
 }
 
 func (p *bridgeProcesses) removeUncommittedMetadata() error {
@@ -319,7 +356,7 @@ func (p *bridgeProcesses) loadMetadata() ([]bridgeRecoveryMetadata, error) {
 		if err := item.validate(); err != nil {
 			return nil, fmt.Errorf("bridge: validate recovery metadata %s: %w", path, err)
 		}
-		name, err := bridgeRecoveryFileName(item.Kind, item.Record)
+		name, err := bridgeRecoveryFileName(item.Kind, item.Process)
 		if err != nil {
 			return nil, err
 		}
@@ -332,8 +369,8 @@ func (p *bridgeProcesses) loadMetadata() ([]bridgeRecoveryMetadata, error) {
 	return items, nil
 }
 
-func bridgeRecoveryFileName(kind bridgeProcessKind, record proc.Record) (string, error) {
-	raw, err := json.Marshal(record)
+func bridgeRecoveryFileName(kind bridgeProcessKind, process bridgeProcessIdentity) (string, error) {
+	raw, err := json.Marshal(process)
 	if err != nil {
 		return "", fmt.Errorf("bridge: encode recovery record identity: %w", err)
 	}

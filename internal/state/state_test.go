@@ -156,9 +156,15 @@ func TestExactEnvelopeOwnersDoNotClobberEachOther(t *testing.T) {
 
 	// Seed a host-registry slice into the same file first.
 	cfg := store.cfg
+	fact, err := hostregistry.NewSSHHostFact("you@desktop", "/usr/local/bin/synckitd", []string{"you@desktop"})
+	if err != nil {
+		t.Fatalf("new host fact: %v", err)
+	}
+	if err := cfg.RegisterHost(ctx, fact); err != nil {
+		t.Fatalf("register host fact: %v", err)
+	}
 	if _, err := cfg.Update(ctx, func(g *hostregistry.Registry) error {
 		g.Self = "me@laptop"
-		g.UpsertHost("you@desktop")
 		return nil
 	}); err != nil {
 		t.Fatalf("seed host registry: %v", err)
@@ -174,7 +180,7 @@ func TestExactEnvelopeOwnersDoNotClobberEachOther(t *testing.T) {
 	if err := json.Unmarshal(raw["host_registry"], &host); err != nil {
 		t.Fatalf("parse host_registry: %v", err)
 	}
-	if host.Self != "me@laptop" || len(host.Hosts) != 1 || host.Hosts[0] != "you@desktop" {
+	if host.Self != "me@laptop" || len(host.Hosts) != 1 || host.Hosts[0].Identity != "you@desktop" {
 		t.Fatalf("host_registry = %+v", host)
 	}
 	var persisted stateJSON
@@ -187,9 +193,8 @@ func TestExactEnvelopeOwnersDoNotClobberEachOther(t *testing.T) {
 }
 
 type hostRegistryStateForTest struct {
-	Self  string              `json:"self"`
-	Hosts []string            `json:"hosts"`
-	Addrs map[string][]string `json:"addrs"`
+	Self  string                     `json:"self"`
+	Hosts []hostregistry.SSHHostFact `json:"hosts"`
 }
 
 // TestSaveRegistryUnlockedNoSelfDeadlock proves the *Unlocked save path can be called

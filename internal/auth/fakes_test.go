@@ -44,6 +44,15 @@ func fakeMesh(t *testing.T, self string, peers ...string) {
 	if err := hostregistry.Mesh.InitializeState(context.Background()); err != nil {
 		t.Fatal(err)
 	}
+	for _, peer := range peers {
+		fact, err := hostregistry.NewSSHHostFact(peer, "/usr/local/bin/synckitd", []string{peer})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := hostregistry.Mesh.RegisterHost(context.Background(), fact); err != nil {
+			t.Fatal(err)
+		}
+	}
 	if _, err := hostregistry.Mesh.Update(context.Background(), func(g *hostregistry.Registry) error { g.Self = self; g.Hosts = peers; return nil }); err != nil {
 		t.Fatal(err)
 	}

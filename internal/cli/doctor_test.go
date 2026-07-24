@@ -13,6 +13,7 @@ import (
 
 	"github.com/yasyf/cookiesync/internal/paths"
 	"github.com/yasyf/cookiesync/internal/state"
+	"github.com/yasyf/cookiesync/internal/transfer"
 	"github.com/yasyf/synckit/manifest"
 )
 
@@ -229,20 +230,18 @@ func TestInstallWritesManifest(t *testing.T) {
 	if time.Duration(m.Watch.Debounce) != watchDebounce {
 		t.Fatalf("manifest watch debounce = %v, want %v", time.Duration(m.Watch.Debounce), watchDebounce)
 	}
-	// The typed service block: synckitd starts `cookiesync rpc-serve` and bridges the
-	// svc.* contract to the resident socket, dialing the socket directly.
-	if m.Service.Transport != "socket" {
-		t.Fatalf("manifest service transport = %q, want socket", m.Service.Transport)
+	if m.Service.Kind != "resident" {
+		t.Fatalf("manifest service kind = %q, want resident", m.Service.Kind)
 	}
-	if len(m.Service.ServeArgs) != 1 || m.Service.ServeArgs[0] != "rpc-serve" {
-		t.Fatalf("manifest service serve_args = %v, want [rpc-serve]", m.Service.ServeArgs)
+	if m.Service.SchemaFingerprint != transfer.Fingerprint {
+		t.Fatalf("manifest service fingerprint = %q, want %q", m.Service.SchemaFingerprint, transfer.Fingerprint)
 	}
 	sock, err := paths.SockPath()
 	if err != nil {
 		t.Fatalf("SockPath: %v", err)
 	}
-	if m.Service.Sock != sock {
-		t.Fatalf("manifest service sock = %q, want %q (the resident socket)", m.Service.Sock, sock)
+	if m.Service.Socket != sock {
+		t.Fatalf("manifest service socket = %q, want %q", m.Service.Socket, sock)
 	}
 	if m.Helper == nil || m.Helper.Command != "helper-serve" {
 		t.Fatalf("manifest helper = %+v, want command helper-serve", m.Helper)

@@ -49,17 +49,27 @@ func TestBridgeRecoveryPathsAreExactUnderConfig(t *testing.T) {
 	if err != nil {
 		t.Fatalf("BridgeRecoveryRoot: %v", err)
 	}
-	store, err := BridgeProcessStorePath()
+	children, err := BridgeChildrenStorePath()
 	if err != nil {
-		t.Fatalf("BridgeProcessStorePath: %v", err)
+		t.Fatalf("BridgeChildrenStorePath: %v", err)
+	}
+	workers, err := BridgeWorkersStorePath()
+	if err != nil {
+		t.Fatalf("BridgeWorkersStorePath: %v", err)
+	}
+	stops, err := RuntimeStopStorePath()
+	if err != nil {
+		t.Fatalf("RuntimeStopStorePath: %v", err)
 	}
 	sessions, err := BridgeSessionsRoot()
 	if err != nil {
 		t.Fatalf("BridgeSessionsRoot: %v", err)
 	}
 	if recovery != filepath.Join(root, "bridge") ||
-		store != filepath.Join(root, "bridge", "processes.db") ||
+		children != filepath.Join(root, "bridge", "children.db") ||
+		workers != filepath.Join(root, "bridge", "workers.db") ||
+		stops != filepath.Join(root, "runtime-stops.db") ||
 		sessions != filepath.Join(root, "bridge", "sessions") {
-		t.Fatalf("bridge paths = recovery %q store %q sessions %q", recovery, store, sessions)
+		t.Fatalf("bridge paths = recovery %q children %q workers %q stops %q sessions %q", recovery, children, workers, stops, sessions)
 	}
 }

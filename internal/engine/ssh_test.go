@@ -8,10 +8,7 @@ import (
 	"time"
 
 	"github.com/yasyf/cookiesync/internal/cookie"
-	"github.com/yasyf/cookiesync/internal/state"
-	"github.com/yasyf/synckit/cregistry"
 	"github.com/yasyf/synckit/rpc"
-	"github.com/yasyf/synckit/syncservice"
 )
 
 // recordingRunner captures each ssh call and returns a canned stdout, so the backend's
@@ -162,99 +159,5 @@ func TestSSHBackendDeadlines(t *testing.T) {
 				t.Fatalf("%s error %q does not name the operation and peer %q", tt.name, err, tt.want)
 			}
 		})
-	}
-}
-
-// fakeStateGetter serves a canned svc.get_state reply and records its Close, so the
-// fetcher's parse and its Close-on-defer contract are asserted without spawning ssh. It
-// has NO write method — that absence is the structural loop guard: the fetcher cannot
-// mutate the peer because its only collaborator exposes a read and a close.
-type fakeStateGetter struct {
-	raw    syncservice.RawRegistry
-	closed bool
-}
-
-func (g *fakeStateGetter) GetState(context.Context) (syncservice.RawRegistry, error) {
-	return g.raw, nil
-}
-
-func (g *fakeStateGetter) Close() error {
-	g.closed = true
-	return nil
-}
-
-// TestSSHFetcherRoundTrip proves the fetcher parses the registry JSON svc.get_state
-// emits back into a convergent registry, and closes the client when done.
-func TestSSHFetcherRoundTrip(t *testing.T) {
-	reg := cregistry.New[state.EndpointMeta]()
-	ep := state.Endpoint{Host: "you@desktop", Browser: "chrome", Profile: "Default"}
-	reg.Add(string(ep.ID()), ep.Meta(), 42)
-	body, err := MarshalRegistry(reg)
-	if err != nil {
-		t.Fatalf("MarshalRegistry: %v", err)
-	}
-
-	getter := &fakeStateGetter{raw: syncservice.RawRegistry(body)}
-	fetcher := newSSHFetcher(func(string) stateGetter { return getter })
-	got, err := fetcher.Fetch(context.Background(), "you@desktop")
-	if err != nil {
-		t.Fatalf("Fetch: %v", err)
-	}
-	entry, ok := got[string(ep.ID())]
-	if !ok || entry.Value != ep.Meta() {
-		t.Fatalf("fetched registry = %+v, want endpoint %s", got, ep.ID())
-	}
-	if !getter.closed {
-		t.Fatalf("fetcher did not close the typed client")
-	}
-}
-
-func TestSSHFetcherRejectsForeignRegistryEpochs(t *testing.T) {
-	for _, body := range []string{
-		`{"browsers":{}}`,
-		`{"protocol_version":2,"browsers":{}}`,
-		`{"protocol_version":1,"browsers":{},"legacy":true}`,
-		`{"protocol_version":1}`,
-	} {
-		getter := &fakeStateGetter{raw: syncservice.RawRegistry(body)}
-		fetcher := newSSHFetcher(func(string) stateGetter { return getter })
-		if _, err := fetcher.Fetch(context.Background(), "you@desktop"); err == nil {
-			t.Fatalf("Fetch(%s) succeeded", body)
-		}
-		if !getter.closed {
-			t.Fatalf("Fetch(%s) did not close its client", body)
-		}
-	}
-}
-
-// wedgedStateGetter blocks until the fetch deadline fires, then returns the context
-// error the way the real ssh-stdio transport does on ctx.Done().
-type wedgedStateGetter struct{}
-
-func (wedgedStateGetter) GetState(ctx context.Context) (syncservice.RawRegistry, error) {
-	<-ctx.Done()
-	return nil, ctx.Err()
-}
-
-func (wedgedStateGetter) Close() error { return nil }
-
-// TestSSHFetcherDeadline proves a wedged peer makes Fetch fail at fetchTimeout with an
-// error that is context.DeadlineExceeded and names the operation and peer.
-func TestSSHFetcherDeadline(t *testing.T) {
-	restore := fetchTimeout
-	fetchTimeout = 25 * time.Millisecond
-	t.Cleanup(func() { fetchTimeout = restore })
-
-	fetcher := newSSHFetcher(func(string) stateGetter { return wedgedStateGetter{} })
-	start := time.Now()
-	_, err := fetcher.Fetch(context.Background(), "you@desktop")
-	if elapsed := time.Since(start); elapsed > 2*time.Second {
-		t.Fatalf("Fetch took %v, want failure at the ~25ms deadline", elapsed)
-	}
-	if !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("Fetch error = %v, want context.DeadlineExceeded", err)
-	}
-	if want := "get_state from you@desktop"; !strings.Contains(err.Error(), want) {
-		t.Fatalf("Fetch error %q does not name the operation and peer %q", err, want)
 	}
 }

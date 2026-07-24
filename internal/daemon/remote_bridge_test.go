@@ -65,11 +65,11 @@ func newProxyDaemon(t *testing.T, runner *recordingRunner) (*Daemon, *bridge.Tun
 
 	var gotSpec bridge.TunnelSpec
 	var gotKeepaliveAddr string
-	d.openTunnel = func(_ context.Context, spec bridge.TunnelSpec, _ func(context.Context, proc.Record) error) (bridgeTunnel, error) {
+	d.openTunnel = func(_ context.Context, spec bridge.TunnelSpec, _ func(context.Context, proc.ProcessReceipt) error) (bridgeTunnel, error) {
 		gotSpec = spec
 		return &fakeTunnel{addr: "desktop.local", done: make(chan struct{})}, nil
 	}
-	d.openKeepalive = func(_ context.Context, addr, _ string, _ func(context.Context, proc.Record) error) (bridgeKeepalive, error) {
+	d.openKeepalive = func(_ context.Context, _, addr, _ string, _ func(context.Context, proc.ProcessReceipt) error) (bridgeKeepalive, error) {
 		gotKeepaliveAddr = addr
 		return &fakeKeepalive{done: make(chan struct{})}, nil
 	}
@@ -282,7 +282,7 @@ func TestRemoteBridgeOpenRetriesOnlyOnForwardExit(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			runner := &recordingRunner{byMethod: map[string]string{"bridge_open": cannedBridgeOpenReply}}
 			d, _, _ := newProxyDaemon(t, runner)
-			d.openTunnel = func(context.Context, bridge.TunnelSpec, func(context.Context, proc.Record) error) (bridgeTunnel, error) {
+			d.openTunnel = func(context.Context, bridge.TunnelSpec, func(context.Context, proc.ProcessReceipt) error) (bridgeTunnel, error) {
 				return nil, tc.tunnelErr
 			}
 

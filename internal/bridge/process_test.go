@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
-	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
@@ -12,7 +11,6 @@ import (
 	"time"
 
 	"github.com/yasyf/daemonkit/proc"
-	"github.com/yasyf/daemonkit/supervise"
 )
 
 const chromeChildTestMarker = "_bridge-chrome-child-test"
@@ -74,24 +72,34 @@ func TestChromeChildRole(t *testing.T) {
 	}
 }
 
-func testProcessPool(ctx context.Context, t *testing.T) *supervise.Pool {
+func testProcessManager(ctx context.Context, t *testing.T) *proc.Manager {
 	t.Helper()
+	generation, err := proc.ProcessGeneration()
+	if err != nil {
+		t.Fatalf("ProcessGeneration: %v", err)
+	}
 	reaper := &proc.Reaper{
 		Store:      &proc.FileStore{Path: filepath.Join(t.TempDir(), "processes.db")},
-		Generation: fmt.Sprintf("test-%s-%d", t.Name(), time.Now().UnixNano()),
+		Generation: generation,
 	}
-	pool, err := supervise.NewPool(8, reaper)
+	manager, err := proc.NewManager(8, reaper)
 	if err != nil {
-		t.Fatalf("NewPool: %v", err)
+		t.Fatalf("NewManager: %v", err)
+	}
+	if err := manager.ClaimRuntime(); err != nil {
+		t.Fatalf("ClaimRuntime: %v", err)
+	}
+	if err := manager.Recover(ctx); err != nil {
+		t.Fatalf("Recover: %v", err)
 	}
 	t.Cleanup(func() {
-		pool.Close()
-		pool.Cancel()
-		if err := pool.Wait(context.WithoutCancel(ctx)); err != nil {
-			t.Errorf("process pool Wait: %v", err)
+		closeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+		defer cancel()
+		if err := manager.Shutdown(closeCtx); err != nil {
+			t.Errorf("process manager Shutdown: %v", err)
 		}
 	})
-	return pool
+	return manager
 }
 
 func launchTestChrome(ctx context.Context, t *testing.T, binary, dataDir string, headed bool) (*Proc, error) {
@@ -100,7 +108,7 @@ func launchTestChrome(ctx context.Context, t *testing.T, binary, dataDir string,
 	if err != nil {
 		return nil, err
 	}
-	return Launch(ctx, testProcessPool(ctx, t), LaunchSpec{
+	return Launch(ctx, testProcessManager(ctx, t), LaunchSpec{
 		HostBinary: binary,
 		RolePath:   executable,
 		RoleArgs:   []string{"-test.run=TestChromeChildRole", "--", chromeChildTestMarker},
@@ -110,28 +118,30 @@ func launchTestChrome(ctx context.Context, t *testing.T, binary, dataDir string,
 }
 
 func TestLaunchDoesNotExecBeforeRecorded(t *testing.T) {
-	pool := testProcessPool(t.Context(), t)
+	manager := testProcessManager(t.Context(), t)
 	executable, err := os.Executable()
 	if err != nil {
 		t.Fatal(err)
 	}
 	marker := filepath.Join(t.TempDir(), "chrome-exec")
 	t.Setenv(fakeChromeEnv, marker)
-	recorded := make(chan proc.Record, 1)
+	recorded := make(chan proc.ProcessReceipt, 1)
 	release := make(chan struct{})
 	dataDir := filepath.Join(t.TempDir(), "profile")
+	launchCtx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
 	done := make(chan struct {
 		proc *Proc
 		err  error
 	}, 1)
 	go func() {
-		p, launchErr := Launch(context.Background(), pool, LaunchSpec{
+		p, launchErr := Launch(launchCtx, manager, LaunchSpec{
 			HostBinary: executable,
 			RolePath:   executable,
 			RoleArgs:   []string{"-test.run=TestChromeChildRole", "--", chromeChildTestMarker},
 			DataDir:    dataDir,
-			Recorded: func(_ context.Context, record proc.Record) error {
-				recorded <- record
+			Recorded: func(_ context.Context, receipt proc.ProcessReceipt) error {
+				recorded <- receipt
 				<-release
 				return nil
 			},
@@ -141,7 +151,14 @@ func TestLaunchDoesNotExecBeforeRecorded(t *testing.T) {
 			err  error
 		}{p, launchErr}
 	}()
-	record := <-recorded
+	var receipt proc.ProcessReceipt
+	select {
+	case receipt = <-recorded:
+	case result := <-done:
+		t.Fatalf("Launch returned before Recorded callback: %v", result.err)
+	case <-launchCtx.Done():
+		t.Fatalf("Launch never reached Recorded callback: %v", launchCtx.Err())
+	}
 	if _, err := os.Stat(marker); !os.IsNotExist(err) {
 		t.Fatalf("chrome exec raced durable Recorded callback: %v", err)
 	}
@@ -150,8 +167,8 @@ func TestLaunchDoesNotExecBeforeRecorded(t *testing.T) {
 	if result.err != nil {
 		t.Fatalf("Launch: %v", result.err)
 	}
-	if result.proc.Pid() != record.PID {
-		t.Fatalf("managed pid = %d, recorded pid %d", result.proc.Pid(), record.PID)
+	if result.proc.Pid() != receipt.ProcessIdentity().PID {
+		t.Fatalf("managed pid = %d, recorded pid %d", result.proc.Pid(), receipt.ProcessIdentity().PID)
 	}
 	if _, err := os.Stat(marker); err != nil {
 		t.Fatalf("fake chrome never execed: %v", err)

@@ -7,7 +7,7 @@ import (
 	"time"
 
 	"github.com/yasyf/cookiesync/internal/cookie"
-	"github.com/yasyf/daemonkit/supervise"
+	"github.com/yasyf/daemonkit/worker"
 	"github.com/yasyf/synckit/hostregistry"
 	"github.com/yasyf/synckit/rpc"
 )
@@ -34,11 +34,11 @@ type SSHRunner interface {
 }
 
 type hostRegistrySSHRunner struct {
-	runner supervise.TaskRunner
+	runner *worker.Pool
 }
 
 // NewExecSSHRunner returns the production SSHRunner backed by hostregistry.ExecSSH.
-func NewExecSSHRunner(runner supervise.TaskRunner) SSHRunner {
+func NewExecSSHRunner(runner *worker.Pool) SSHRunner {
 	return hostRegistrySSHRunner{runner: runner}
 }
 

@@ -16,6 +16,7 @@ import (
 	"github.com/yasyf/cookiesync/internal/paths"
 	"github.com/yasyf/cookiesync/internal/rpc"
 	"github.com/yasyf/cookiesync/internal/state"
+	"github.com/yasyf/cookiesync/internal/transfer"
 	"github.com/yasyf/synckit/authkit"
 	"github.com/yasyf/synckit/manifest"
 	"github.com/yasyf/synckit/syncservice"
@@ -141,7 +142,7 @@ func checkHelper(ctx context.Context) check {
 // sync contract synckitd drives — the "is the helper up and serving svc.*?" check. It
 // dials the socket and round-trips svc.capabilities, the lightest typed call (no cookie
 // store read, no SE key), so a green line proves the contract is live end to end through
-// the same socket synckitd's rpc-serve bridge forwards to.
+// the same resident socket Synckit targets for export, apply, and reconciliation.
 func checkSocket(ctx context.Context) check {
 	sock, err := paths.SockPath()
 	if err != nil {
@@ -239,8 +240,8 @@ func checkManifest(_ context.Context) check {
 	if err != nil {
 		return check{label: "manifest", detail: fmt.Sprintf("registered at %s but does not validate (stale schema); re-run 'cookiesync install': %v", path, err)}
 	}
-	if m.Service.Transport != "socket" {
-		return check{label: "manifest", detail: fmt.Sprintf("service transport = %q at %s, want socket; re-run 'cookiesync install'", m.Service.Transport, path)}
+	if m.Service.Kind != "resident" || m.Service.Socket == "" || m.Service.SchemaFingerprint != transfer.Fingerprint {
+		return check{label: "manifest", detail: fmt.Sprintf("service contract = %+v at %s, want exact resident transfer contract; re-run 'cookiesync install'", m.Service, path)}
 	}
 	return check{label: "manifest", ok: true, detail: path}
 }

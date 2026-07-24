@@ -6,6 +6,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- Hard-cut the resident helper to daemonkit v0.17.2 and Synckit v0.33.0: one
+  publication-bound runtime, exact v1 export/apply transfer, and distinct
+  durable owners for long-lived bridge children and disposable commands.
+- Replace product-level peer-registry pulls with Synckit's authoritative
+  transfer service. Applied registries reconcile immediately from one frozen
+  per-pass snapshot, with base-fenced revisions and exact delivery receipts.
+- Bind every bridge SSH tunnel and keepalive to the registered immutable host
+  fact and Synckit's private strict-host-key trust file.
+- Replace the bridge recovery sidecar with an exact v1 process identity and
+  generation contract; old derived bridge state is not read.
+
 ## [0.25.1] - 2026-07-23
 
 ### Fixed

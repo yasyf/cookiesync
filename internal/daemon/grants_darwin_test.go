@@ -4,14 +4,18 @@ package daemon
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strconv"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/yasyf/cookiesync/internal/cookie"
+	"github.com/yasyf/cookiesync/internal/paths"
 	"github.com/yasyf/daemonkit/wire"
+	"github.com/yasyf/daemonkit/worker"
 	synckit "github.com/yasyf/synckit/rpc"
 )
 
@@ -28,22 +32,36 @@ func TestPeerSIDRequestorOverSocket(t *testing.T) {
 	consent := &fakeConsent{key: cookie.DeriveKey(cookie.SafeStorageKey("peanuts"))}
 	d := New(consent, newFakeCache(), nil, staticProbe(liveSession(currentUser(t))), &recordingRunner{}, fixedState{st: st}, fixedState{st: st})
 
+	t.Setenv(paths.ConfigDirEnv, t.TempDir())
 	sock := filepath.Join(t.TempDir(), "d.sock")
-	ctx, cancel := context.WithCancel(context.Background())
-	ln, err := synckit.Listen(ctx, sock)
+	executable, err := os.Executable()
 	if err != nil {
-		t.Fatalf("listen: %v", err)
+		t.Fatalf("executable: %v", err)
 	}
-	done := make(chan struct{})
+	prepareHelperRuntime(t, executable)
+	fakeMesh(t, self)
+	runtime, err := newHelperRuntime(sock, executable, "peer-sid-test", func(context.Context, *worker.Pool) (*Daemon, func(context.Context) error, error) {
+		return d, func(context.Context) error { return nil }, nil
+	})
+	if err != nil {
+		t.Fatalf("new helper runtime: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
 	go func() {
-		defer close(done)
-		_ = synckit.NewServer(d.Dispatcher()).Serve(ctx, ln)
+		done <- runtime.Run(ctx)
 	}()
 	t.Cleanup(func() {
 		cancel()
-		_ = ln.Close()
-		<-done
+		if err := <-done; err != nil && !errors.Is(err, context.Canceled) {
+			t.Errorf("runtime: %v", err)
+		}
 	})
+	readyCtx, readyCancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer readyCancel()
+	if _, err := waitRuntimeHealth(readyCtx, sock); err != nil {
+		t.Fatalf("wait runtime health: %v", err)
+	}
 
 	client := synckit.NewClient(synckit.ClientConfig{Dial: wire.UnixDialer(sock), WireBuild: synckit.WireBuild})
 	defer func() { _ = client.Close() }()

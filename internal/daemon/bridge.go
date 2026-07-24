@@ -269,7 +269,7 @@ func (d *Daemon) openBridge(ctx context.Context, requestor, endpoint, browser, p
 		_ = os.RemoveAll(dataDir)
 	}()
 
-	proc, err = bridge.Launch(sessionCtx, d.processes.pool, bridge.LaunchSpec{
+	proc, err = bridge.Launch(sessionCtx, d.processes.children, bridge.LaunchSpec{
 		HostBinary: hostBin, RolePath: d.processes.rolePath, DataDir: dataDir, Headed: headed,
 		RoleArgs: d.processes.roleArgs,
 		Recorded: d.processes.recorded(bridgeProcessChrome, sessionID, endpoint, "", ""),

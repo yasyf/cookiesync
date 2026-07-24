@@ -2,7 +2,6 @@ package daemon
 
 import (
 	"context"
-	"fmt"
 	"os"
 	"testing"
 	"time"
@@ -35,17 +34,28 @@ func testBridgeProcesses(t *testing.T) *bridgeProcesses {
 	}
 	processes, err := newBridgeProcessesGeneration(
 		executable,
-		fmt.Sprintf("test-%s-%d", t.Name(), time.Now().UnixNano()),
+		bridgeTestGeneration(t.Name()),
 	)
 	if err != nil {
 		t.Fatalf("newBridgeProcessesGeneration: %v", err)
 	}
 	processes.roleArgs = []string{"-test.run=TestDaemonChromeChildRole", "--", daemonChromeChildMarker}
+	activateBridgeChildren(t, processes)
+	workerClaim, err := processes.workers.ClaimRuntime()
+	if err != nil {
+		t.Fatalf("claim worker runtime: %v", err)
+	}
+	if err := workerClaim.Recover(t.Context()); err != nil {
+		t.Fatalf("recover worker runtime: %v", err)
+	}
+	if err := workerClaim.Activate(); err != nil {
+		t.Fatalf("activate worker runtime: %v", err)
+	}
 	t.Cleanup(func() {
-		processes.Close()
-		processes.Cancel()
-		if err := processes.Wait(context.Background()); err != nil {
-			t.Errorf("bridge process Wait: %v", err)
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := workerClaim.Close(ctx); err != nil {
+			t.Errorf("close worker runtime: %v", err)
 		}
 	})
 	return processes

@@ -1,11 +1,11 @@
 package bridge
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"strings"
@@ -13,22 +13,11 @@ import (
 	"time"
 
 	"github.com/yasyf/daemonkit/proc"
-	"github.com/yasyf/daemonkit/supervise"
 	"github.com/yasyf/synckit/hostregistry"
 )
 
 // sshBin is the ssh binary the tunnel shells; a var so tests point it at a fake.
-var sshBin = "ssh"
-
-// tunnelDialOpts replicates synckit hostregistry's unexported per-attempt ssh
-// options (BatchMode, a short ConnectTimeout, and keepalives) verbatim, since
-// they are not exported. The forward adds ExitOnForwardFailure and -N on top.
-var tunnelDialOpts = []string{
-	"-o", "BatchMode=yes",
-	"-o", "ConnectTimeout=3",
-	"-o", "ServerAliveInterval=5",
-	"-o", "ServerAliveCountMax=3",
-}
+var sshBin = "/usr/bin/ssh"
 
 // tunnelProveTimeout bounds the proven-up handshake over a freshly-spawned
 // forward; a var so tests shrink it.
@@ -77,12 +66,12 @@ type TunnelSpec struct {
 // Tunnel is a detached, daemonkit-managed `ssh -N -L` local forward. It is
 // proven up before OpenTunnel returns it.
 type Tunnel struct {
-	process   *supervise.Process
-	localPort int
-	addr      string
-	done      chan struct{}
-	closeOnce sync.Once
-	closeErr  error
+	process    *proc.PreparedChild
+	stderrDone <-chan error
+	localPort  int
+	addr       string
+	closeOnce  sync.Once
+	closeErr   error
 }
 
 // OpenTunnel spawns a proven-up ssh -L forward to spec.Host, dialing the ordered
@@ -92,14 +81,14 @@ type Tunnel struct {
 // metadata while daemonkit's execution gate is still closed. A
 // local-bind collision short-circuits the candidate walk, since every addr shares
 // the same local port — the caller re-allocates and re-opens on that alone.
-func OpenTunnel(ctx context.Context, pool *supervise.Pool, spec TunnelSpec, recorded func(context.Context, proc.Record) error) (*Tunnel, error) {
+func OpenTunnel(ctx context.Context, manager *proc.Manager, spec TunnelSpec, recorded func(context.Context, proc.ProcessReceipt) error) (*Tunnel, error) {
 	addrs, err := hostregistry.DialAddrs(spec.Host)
 	if err != nil {
 		return nil, err
 	}
 	var lastErr error
 	for _, addr := range addrs {
-		t, err := dialTunnel(ctx, pool, addr, spec, recorded)
+		t, err := dialTunnel(ctx, manager, addr, spec, recorded)
 		if err == nil {
 			return t, nil
 		}
@@ -112,58 +101,65 @@ func OpenTunnel(ctx context.Context, pool *supervise.Pool, spec TunnelSpec, reco
 }
 
 // dialTunnel starts one recorded ssh forward to addr and proves it up.
-func dialTunnel(ctx context.Context, pool *supervise.Pool, addr string, spec TunnelSpec, recorded func(context.Context, proc.Record) error) (*Tunnel, error) {
-	var stderr bytes.Buffer
+func dialTunnel(ctx context.Context, manager *proc.Manager, addr string, spec TunnelSpec, recorded func(context.Context, proc.ProcessReceipt) error) (*Tunnel, error) {
+	stderr := &lockedBuffer{}
 	probeURL := fmt.Sprintf("http://127.0.0.1:%d/%s/json/version", spec.LocalPort, spec.Token)
 	proveTimeout, probeInterval := tunnelProveTimeout, tunnelProbeInterval
-	process, err := pool.Start(ctx, supervise.ProcessSpec{
-		RecoveryClass:    proc.RecoveryTask,
-		Path:             sshBin,
-		Args:             tunnelArgv(addr, spec.LocalPort, spec.RemotePort),
-		Stderr:           &stderr,
-		Recorded:         recorded,
-		ReadinessTimeout: proveTimeout,
-		Ready: func(readyCtx context.Context, _ proc.Record) error {
-			return proveTunnelUpPolicy(
-				readyCtx, nil, &stderr, spec.LocalPort, probeURL, spec.WantWSURL,
-				proveTimeout, probeInterval,
-			)
-		},
-	})
+	readyCtx, cancel := context.WithTimeout(ctx, proveTimeout)
+	defer cancel()
+	argv, err := tunnelArgv(spec.Host, addr, spec.LocalPort, spec.RemotePort)
 	if err != nil {
-		if isBindCollision(stderr.String(), spec.LocalPort) {
-			return nil, fmt.Errorf("ssh tunnel to %s: %w", addr, ErrTunnelBindCollision)
-		}
-		return nil, fmtTunnelStartError(addr, err)
+		return nil, err
 	}
-	done := make(chan struct{})
-	t := &Tunnel{process: process, localPort: spec.LocalPort, addr: addr, done: done}
+	process, _, err := prepareChild(readyCtx, manager, proc.SpawnConfig{
+		RecoveryID: proc.RecoveryTaskID,
+		Executable: sshBin,
+		Args:       argv,
+		Env:        bridgeEnvironment(),
+		Stdin:      proc.StdioNull,
+		Stdout:     proc.StdioNull,
+		Stderr:     proc.StdioPipe,
+	}, recorded)
+	if err != nil {
+		return nil, fmt.Errorf("prepare ssh tunnel to %s: %w", addr, err)
+	}
+	stderrPipe, err := process.TakeStderr()
+	if err != nil {
+		return nil, stopPreparedChild(ctx, process, fmt.Errorf("take ssh tunnel stderr: %w", err))
+	}
+	stderrDone := make(chan error, 1)
 	go func() {
-		_ = process.Wait(context.WithoutCancel(ctx))
-		close(done)
+		_, copyErr := io.Copy(stderr, stderrPipe)
+		stderrDone <- errors.Join(copyErr, stderrPipe.Close())
 	}()
-	return t, nil
-}
-
-func fmtTunnelStartError(addr string, err error) error {
-	if errors.Is(err, supervise.ErrProcessExitedBeforeReadiness) {
-		return fmt.Errorf("start ssh tunnel to %s: %w: %w", addr, ErrTunnelExited, err)
+	if err := process.Start(readyCtx); err != nil {
+		return nil, errors.Join(fmt.Errorf("start ssh tunnel to %s: %w", addr, err), stopPreparedChild(ctx, process, nil), <-stderrDone)
 	}
-	return fmt.Errorf("start ssh tunnel to %s: %w", addr, err)
+	if err := proveTunnelUpPolicy(
+		readyCtx, process.Done(), stderr, spec.LocalPort, probeURL, spec.WantWSURL,
+		proveTimeout, probeInterval,
+	); err != nil {
+		return nil, errors.Join(fmt.Errorf("start ssh tunnel to %s: %w", addr, err), stopPreparedChild(ctx, process, nil), <-stderrDone)
+	}
+	t := &Tunnel{process: process, stderrDone: stderrDone, localPort: spec.LocalPort, addr: addr}
+	return t, nil
 }
 
 // tunnelArgv builds the ssh argument vector for the forward: the replicated dial
 // options, ExitOnForwardFailure so a dead peer exits rather than hangs, -N (no
 // remote command), and an explicit 127.0.0.1-only local bind so the forward is
 // never exposed off loopback.
-func tunnelArgv(addr string, localPort, remotePort int) []string {
-	args := append([]string{}, tunnelDialOpts...)
+func tunnelArgv(target, addr string, localPort, remotePort int) ([]string, error) {
+	args, address, err := sealedSSHBase(target, addr)
+	if err != nil {
+		return nil, err
+	}
 	return append(args,
 		"-o", "ExitOnForwardFailure=yes",
 		"-N",
 		"-L", fmt.Sprintf("127.0.0.1:%d:127.0.0.1:%d", localPort, remotePort),
-		addr,
-	)
+		address,
+	), nil
 }
 
 // proveTunnelUp polls the peer's /json/version through the forward until its
@@ -173,7 +169,7 @@ func tunnelArgv(addr string, localPort, remotePort int) []string {
 // classified from its stderr: a local-bind collision the caller re-allocates
 // around, or a terminal exit it must not re-tap. Diagnostics redact the token the
 // probe/ws urls carry, so it never reaches a log.
-func proveTunnelUp(ctx context.Context, done <-chan struct{}, stderr *bytes.Buffer, localPort int, probeURL, wantWSURL string) error {
+func proveTunnelUp(ctx context.Context, done <-chan struct{}, stderr interface{ String() string }, localPort int, probeURL, wantWSURL string) error {
 	return proveTunnelUpPolicy(
 		ctx, done, stderr, localPort, probeURL, wantWSURL,
 		tunnelProveTimeout, tunnelProbeInterval,
@@ -183,7 +179,7 @@ func proveTunnelUp(ctx context.Context, done <-chan struct{}, stderr *bytes.Buff
 func proveTunnelUpPolicy(
 	ctx context.Context,
 	done <-chan struct{},
-	stderr *bytes.Buffer,
+	stderr interface{ String() string },
 	localPort int,
 	probeURL, wantWSURL string,
 	proveTimeout, probeInterval time.Duration,
@@ -223,7 +219,7 @@ func proveTunnelUpPolicy(
 // bind collision (retryable on a fresh port) from any other exit (auth, network,
 // a dead peer — terminal), returning a bare sentinel so no ssh stderr text is
 // surfaced.
-func classifyTunnelExit(stderr *bytes.Buffer, localPort int) error {
+func classifyTunnelExit(stderr interface{ String() string }, localPort int) error {
 	if isBindCollision(stderr.String(), localPort) {
 		return ErrTunnelBindCollision
 	}
@@ -317,7 +313,7 @@ func probeVersion(ctx context.Context, probeURL string, probeInterval time.Durat
 // Done is closed when the ssh forward exits — the signal the daemon's session
 // watcher tears the proxy bridge down on.
 func (t *Tunnel) Done() <-chan struct{} {
-	return t.done
+	return t.process.Done()
 }
 
 // LocalPort is the 127.0.0.1 port the forward binds, the loopback port a bridge
@@ -338,6 +334,14 @@ func (t *Tunnel) Close() error {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		t.closeErr = t.process.Stop(ctx)
+		if t.stderrDone != nil {
+			select {
+			case err := <-t.stderrDone:
+				t.closeErr = errors.Join(t.closeErr, err)
+			case <-ctx.Done():
+				t.closeErr = errors.Join(t.closeErr, ctx.Err())
+			}
+		}
 	})
 	return t.closeErr
 }

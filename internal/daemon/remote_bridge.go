@@ -276,7 +276,7 @@ func (d *Daemon) tryRemoteBridgeOpen(ctx context.Context, self, host, browser, p
 	}
 
 	keepalive, err = d.openKeepalive(
-		sessionCtx, tunnel.HostAddr(), reply.Capability,
+		sessionCtx, host, tunnel.HostAddr(), reply.Capability,
 		d.processes.recorded(bridgeProcessKeepalive, sessionID, reply.Endpoint, "", ""),
 	)
 	if err != nil {

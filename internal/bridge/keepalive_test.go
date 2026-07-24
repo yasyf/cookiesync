@@ -9,7 +9,11 @@ import (
 // options and brew-shellenv wrapping, targets the given addr, runs the keepalive
 // command, and swaps in the sshBin seam at argv[0].
 func TestKeepaliveArgv(t *testing.T) {
-	got := keepaliveArgv("you@desktop")
+	seedDialAddrs(t, "you@desktop", nil)
+	got, err := keepaliveArgv("you@desktop", "you@desktop")
+	if err != nil {
+		t.Fatal(err)
+	}
 	if got[0] != sshBin {
 		t.Fatalf("keepaliveArgv[0] = %q, want the sshBin seam %q", got[0], sshBin)
 	}
@@ -17,7 +21,7 @@ func TestKeepaliveArgv(t *testing.T) {
 	for _, want := range []string{
 		"BatchMode=yes",
 		"ServerAliveInterval=5",
-		"you@desktop",
+		"-l you desktop",
 		"cookiesync rpc bridge_keepalive",
 	} {
 		if !strings.Contains(joined, want) {

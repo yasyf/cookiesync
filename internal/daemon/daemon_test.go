@@ -20,6 +20,7 @@ import (
 	"github.com/yasyf/cookiesync/internal/helper"
 	"github.com/yasyf/synckit/authkit"
 	synckit "github.com/yasyf/synckit/rpc"
+	"github.com/yasyf/synckit/syncservice"
 )
 
 // TestDispatcherRoutesEveryMethod proves the dispatcher binds every method in the
@@ -38,12 +39,10 @@ func TestDispatcherRoutesEveryMethod(t *testing.T) {
 	// store, or the cookie layer and come back as a handler error (or a panic the
 	// dispatcher recovers into an error response) — that still proves the method
 	// routed. The one thing none may return is "unknown method".
-	methods := []string{
+	methods := append([]string{
 		"whoami", "auth_status", "request_consent",
 		"extract", "apply", "sync", "reconcile", "prime_auth", "get_cookies",
-		// The typed sync contract synckitd drives over the resident socket.
-		"svc.capabilities", "svc.list", "svc.reconcile", "svc.sync", "svc.get_state",
-	}
+	}, syncservice.AllMethods...)
 	for _, method := range methods {
 		t.Run(method, func(t *testing.T) {
 			resp := dispatcher.Dispatch(context.Background(), request(method))
@@ -565,7 +564,7 @@ func TestHandleAuthStatusMasksBoundedCacheReadAfterUnlockedProbe(t *testing.T) {
 }
 
 // TestConvergeMethodsShareOneExclusiveMutex proves every method that runs the
-// flock-wrapped converge pass — sync, reconcile, svc.sync, svc.reconcile — is
+// flock-wrapped converge pass — sync, reconcile, and svc.reconcile — is
 // registered exclusive: two passes never hold the store lock at once, whichever
 // method drives them.
 func TestConvergeMethodsShareOneExclusiveMutex(t *testing.T) {
@@ -587,7 +586,7 @@ func TestConvergeMethodsShareOneExclusiveMutex(t *testing.T) {
 	dispatcher := newConvergeDaemon(t, store, &fakeConsent{}).Dispatcher()
 
 	var wg sync.WaitGroup
-	for _, method := range []string{"sync", "reconcile", "svc.sync", "svc.reconcile", "sync"} {
+	for _, method := range []string{"sync", "reconcile", syncservice.MethodReconcile, "sync"} {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()

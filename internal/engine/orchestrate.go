@@ -6,17 +6,8 @@ import (
 
 	"github.com/yasyf/cookiesync/internal/cookie"
 	"github.com/yasyf/cookiesync/internal/mesh"
-	"github.com/yasyf/cookiesync/internal/state"
 	"github.com/yasyf/synckit/converge"
-	"github.com/yasyf/synckit/syncservice"
 )
-
-// newFetcher builds the pull-only peer-registry fetcher a converge pass reads peers
-// through. Production dials each peer's rpc-serve bridge over ssh-stdio; it is a package
-// var so a test substitutes a fake fetcher and drives the merge without spawning ssh.
-var newFetcher = func(runner syncservice.TransportRunner) converge.Fetcher[state.EndpointMeta] {
-	return NewSSHFetcher(runner)
-}
 
 // Store is the slice of the state store the orchestration needs: the convergent
 // registry read/write paths the Driver consumes, the rowcount ledger the mass-drop
@@ -28,8 +19,8 @@ type Store interface {
 	WithLock(ctx context.Context, fn func() error) error
 }
 
-// Engine ties the cookie Driver, the ssh peer-registry Fetcher, and the state store
-// into the two convergent-reconcile entry points (Sync and Reconcile). It builds the
+// Engine ties the cookie Driver and applied registry state into the two
+// convergent-reconcile entry points (Sync and Reconcile). It builds the
 // converge collaborators from injected seams — the key cache, the ssh runner, and the
 // anti-echo recorder — so the whole orchestration runs in tests against fakes.
 type Engine struct {
@@ -37,11 +28,6 @@ type Engine struct {
 	cache    KeyCache
 	runner   SSHRunner
 	recorder cookie.Recorder
-
-	// status is the converge transition tracker: it lives for the resident helper's
-	// process life so an unreachable peer logs once per outage across passes rather
-	// than on every pass, and its recovery reports the outage duration.
-	status *converge.PeerStatus
 
 	// applyLocks serializes writes to one endpoint's local store: the daemon's apply
 	// handler and a converge pass's local applies hold the same per-endpoint mutex, so
@@ -51,7 +37,7 @@ type Engine struct {
 
 // New builds the sync engine over the state store and the injected collaborators.
 func New(store Store, cache KeyCache, runner SSHRunner, recorder cookie.Recorder) *Engine {
-	return &Engine{store: store, cache: cache, runner: runner, recorder: recorder, status: converge.NewPeerStatus()}
+	return &Engine{store: store, cache: cache, runner: runner, recorder: recorder}
 }
 
 // Recorder is the anti-echo ledger the engine records applied digests through; the
@@ -87,13 +73,9 @@ func (e *Engine) Reconcile(ctx context.Context) ([]Result, error) {
 	return e.run(ctx, "")
 }
 
-// run resolves the self target and peer mesh from reposync — cookiesync rides reposync's
-// host registry, so the hosts to pull peer registries from (and the self target threaded
-// into the Driver and sources) come from the mesh, not this host's own state, which is
-// empty on a freshly-installed host. It then drives synckit's pull-only converge.Reconcile
-// under the state flock with the cookie Driver and the ssh peer-registry Fetcher, zipping
-// each present endpoint's ItemResult with the merged cookie count the Driver recorded for
-// it.
+// run resolves the self target and peer mesh from Synckit's host registry, then
+// reconciles the authoritative registry already applied by the transfer service. The
+// state flock pins one immutable registry snapshot for the complete pass.
 func (e *Engine) run(ctx context.Context, origin string) ([]Result, error) {
 	self, peers, err := mesh.Resolve(ctx)
 	if err != nil {
@@ -110,9 +92,18 @@ func (e *Engine) run(ctx context.Context, origin string) ([]Result, error) {
 	}
 	driver := NewDriver(e.store, self, deps)
 	var items []converge.ItemResult
-	err = syncservice.WithTransportRunner(ctx, func(runner syncservice.TransportRunner) error {
-		items, err = converge.Reconcile(ctx, e.store.WithLock, driver, newFetcher(runner), e.status, peers, origin)
-		return err
+	err = e.store.WithLock(ctx, func() error {
+		registry, err := driver.LoadRegistry(ctx)
+		if err != nil {
+			return err
+		}
+		driver.useRegistry(registry)
+		items = make([]converge.ItemResult, 0, len(registry))
+		for id, entry := range registry.Present() {
+			outcome, itemErr := driver.Reconcile(ctx, id, entry, peers, origin)
+			items = append(items, converge.ItemResult{ID: id, Outcome: outcome, Err: itemErr})
+		}
+		return nil
 	})
 	if err != nil {
 		return nil, err

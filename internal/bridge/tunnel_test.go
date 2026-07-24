@@ -14,8 +14,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/yasyf/daemonkit/proc"
-	"github.com/yasyf/daemonkit/supervise"
 	"github.com/yasyf/synckit/hostregistry"
 )
 
@@ -23,19 +21,23 @@ import (
 // options, adds ExitOnForwardFailure and -N, and binds the local forward to
 // 127.0.0.1 only (never the wildcard).
 func TestTunnelArgv(t *testing.T) {
-	got := tunnelArgv("you@desktop", 5000, 6000)
-	want := []string{
-		"-o", "BatchMode=yes",
-		"-o", "ConnectTimeout=3",
-		"-o", "ServerAliveInterval=5",
-		"-o", "ServerAliveCountMax=3",
-		"-o", "ExitOnForwardFailure=yes",
-		"-N",
-		"-L", "127.0.0.1:5000:127.0.0.1:6000",
-		"you@desktop",
+	seedDialAddrs(t, "you@desktop", nil)
+	got, err := tunnelArgv("you@desktop", "you@desktop", 5000, 6000)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("tunnelArgv = %v, want %v", got, want)
+	joined := strings.Join(got, " ")
+	for _, want := range []string{
+		"-F /dev/null", "StrictHostKeyChecking=yes", "HostKeyAlias=desktop",
+		"IdentitiesOnly=yes", "IdentityAgent=none", "ProxyCommand=none",
+		"ExitOnForwardFailure=yes", "-N", "-L 127.0.0.1:5000:127.0.0.1:6000", "-l you",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("tunnelArgv = %v, missing %q", got, want)
+		}
+	}
+	if got[len(got)-1] != "desktop" {
+		t.Fatalf("tunnelArgv destination = %q, want desktop", got[len(got)-1])
 	}
 	// The forward must never bind the wildcard.
 	if strings.Contains(strings.Join(got, " "), "0.0.0.0:") || strings.Contains(strings.Join(got, " "), "*:") {
@@ -236,7 +238,7 @@ func TestOpenTunnelDialsAddrsInOrder(t *testing.T) {
 	// Every fake ssh exits 0 without forwarding, so no candidate proves up and
 	// OpenTunnel exhausts the ordered list.
 	ctx := t.Context()
-	_, err := OpenTunnel(ctx, testProcessPool(ctx, t), TunnelSpec{
+	_, err := OpenTunnel(ctx, testProcessManager(ctx, t), TunnelSpec{
 		Host: target, LocalPort: 41000, RemotePort: 42000, Token: "tok", WantWSURL: "ws://never",
 	}, nil)
 	if err == nil {
@@ -244,58 +246,25 @@ func TestOpenTunnelDialsAddrsInOrder(t *testing.T) {
 	}
 
 	dialed := recordedAddrs(t, recordPath)
-	want := []string{"desktop.local", "desktop.lan", target}
+	want := []string{"desktop.local", "desktop.lan", "desktop"}
 	if !reflect.DeepEqual(dialed, want) {
 		t.Fatalf("dialed addrs = %v, want DialAddrs order %v", dialed, want)
 	}
 }
 
-func TestTunnelStartErrorMapsManagedEarlyExit(t *testing.T) {
-	ctx := t.Context()
-	_, startErr := testProcessPool(ctx, t).Start(ctx, supervise.ProcessSpec{
-		RecoveryClass:    proc.RecoveryTask,
-		Path:             "/usr/bin/false",
-		ReadinessTimeout: 5 * time.Second,
-		Ready: func(readyCtx context.Context, _ proc.Record) error {
-			<-readyCtx.Done()
-			return readyCtx.Err()
-		},
-	})
-	if !errors.Is(startErr, supervise.ErrProcessExitedBeforeReadiness) {
-		t.Fatalf("managed false start = %v, want typed early exit", startErr)
-	}
-	err := fmtTunnelStartError("desktop.local", startErr)
-	if !errors.Is(err, ErrTunnelExited) || !errors.Is(err, supervise.ErrProcessExitedBeforeReadiness) {
-		t.Fatalf("mapped early exit = %v, want product and daemonkit identities", err)
-	}
-}
+func TestTunnelEarlyExitIsProductFailure(t *testing.T) {
+	seedDialAddrs(t, "you@desktop.local", nil)
+	restore := sshBin
+	sshBin = "/usr/bin/false"
+	t.Cleanup(func() { sshBin = restore })
 
-func TestTunnelStartErrorClassifiesOnlyTypedEarlyExit(t *testing.T) {
-	tests := []struct {
-		name string
-		err  error
-		want bool
-	}{
-		{"typed child exit", errors.Join(supervise.ErrProcessExitedBeforeReadiness, errors.New("exit status 255")), true},
-		{"context cancellation", context.Canceled, false},
-		{"readiness timeout", context.DeadlineExceeded, false},
-		{"readiness mismatch", errors.New("webSocketDebuggerUrl mismatch"), false},
-		{"recorded failure", errors.New("accept managed process record: fsync failed"), false},
-		{"tracking failure", errors.New("track managed process: store failed"), false},
-		{"admission failure", supervise.ErrClosed, false},
-		{"start failure", errors.New("start managed process: executable missing"), false},
-		{"gate failure", errors.New("release managed process gate: broken pipe"), false},
-	}
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			err := fmtTunnelStartError("desktop.local", tc.err)
-			if got := errors.Is(err, ErrTunnelExited); got != tc.want {
-				t.Fatalf("ErrTunnelExited = %t, want %t: %v", got, tc.want, err)
-			}
-			if !errors.Is(err, tc.err) {
-				t.Fatalf("underlying error identity lost: %v", err)
-			}
-		})
+	ctx := t.Context()
+	_, err := OpenTunnel(ctx, testProcessManager(ctx, t), TunnelSpec{
+		Host: "you@desktop.local", LocalPort: 41000, RemotePort: 42000,
+		Token: "tok", WantWSURL: "ws://never",
+	}, nil)
+	if !errors.Is(err, ErrTunnelExited) {
+		t.Fatalf("early ssh exit = %v, want ErrTunnelExited", err)
 	}
 }
 
@@ -304,15 +273,27 @@ func TestTunnelStartErrorClassifiesOnlyTypedEarlyExit(t *testing.T) {
 // them without a real registration.
 func seedDialAddrs(t *testing.T, target string, addrs []string) {
 	t.Helper()
-	xdg := t.TempDir()
+	xdg, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
 	t.Setenv("XDG_CONFIG_HOME", xdg)
 	if err := hostregistry.Mesh.InitializeState(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	for _, addr := range addrs {
-		if err := hostregistry.Mesh.AddAddr(context.Background(), target, addr); err != nil {
-			t.Fatal(err)
-		}
+	fact, err := hostregistry.NewSSHHostFact(target, "/usr/local/bin/synckitd", addrs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := hostregistry.Mesh.RegisterHost(context.Background(), fact); err != nil {
+		t.Fatal(err)
+	}
+	knownHosts, err := hostregistry.Mesh.KnownHostsPath()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(knownHosts, nil, 0o600); err != nil {
+		t.Fatal(err)
 	}
 }
 

@@ -1092,7 +1092,7 @@ func newConvergeFixture(t *testing.T) *convergeFixture {
 	t.Helper()
 	ctx := context.Background()
 	key := cookie.DeriveKey(cookie.SafeStorageKey("peanuts"))
-	fakeMesh(t, "me@laptop")
+	fakeMesh(t, "me@laptop", "you@desktop")
 	cache := newFakeCache()
 	localEP := state.Endpoint{Host: "me@laptop", Browser: "chrome", Profile: "Default"}
 	peerEP := state.Endpoint{Host: "you@desktop", Browser: "chrome", Profile: "Default"}
@@ -1130,6 +1130,8 @@ func (fx *convergeFixture) holdConvergeMidLocalWrite(ctx context.Context, t *tes
 		if ep != fx.localID {
 			t.Fatalf("converge first recorded %s, want the local endpoint %s", ep, fx.localID)
 		}
+	case err := <-syncDone:
+		t.Fatalf("converge pass returned before its local write: %v", err)
 	case <-time.After(5 * time.Second):
 		t.Fatal("converge pass never reached its local write")
 	}
