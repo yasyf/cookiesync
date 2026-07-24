@@ -6,6 +6,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.25.1] - 2026-07-23
+
+### Fixed
+- Seal the verified native release assets and rendered cask into one immutable
+  delivery artifact before publishing the release. Tap retries now reverify the
+  public release by exact ID and publish only the preserved cask.
+
 ## [0.25.0] - 2026-07-23
 
 ### Fixed
@@ -349,7 +356,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `synckitd install` now owns the agents. The host mesh is read from the shared
   `~/.config/synckit`.
 
-[Unreleased]: https://github.com/yasyf/cookiesync/compare/v0.24.0...HEAD
+[Unreleased]: https://github.com/yasyf/cookiesync/compare/v0.25.1...HEAD
+[0.25.1]: https://github.com/yasyf/cookiesync/compare/v0.25.0...v0.25.1
+[0.25.0]: https://github.com/yasyf/cookiesync/compare/v0.24.0...v0.25.0
 [0.24.0]: https://github.com/yasyf/cookiesync/compare/v0.23.0...v0.24.0
 [0.22.0]: https://github.com/yasyf/cookiesync/compare/v0.21.0...v0.22.0
 [0.16.0]: https://github.com/yasyf/cookiesync/releases/tag/v0.16.0

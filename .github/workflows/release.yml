@@ -14,6 +14,11 @@ permissions:
 jobs:
   release:
     runs-on: macos-15
+    outputs:
+      tag: ${{ steps.manifest.outputs.tag }}
+      prerelease: ${{ steps.manifest.outputs.prerelease }}
+      release-id: ${{ steps.stage.outputs['release-id'] }}
+      tap-artifact-name: ${{ steps.tap-artifact.outputs.name }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -42,7 +47,6 @@ jobs:
           MACOS_NOTARY_KEY: ${{ secrets.MACOS_NOTARY_KEY }}
           MACOS_NOTARY_KEY_ID: ${{ secrets.MACOS_NOTARY_KEY_ID }}
           MACOS_NOTARY_ISSUER_ID: ${{ secrets.MACOS_NOTARY_ISSUER_ID }}
-          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
         run: |
           set -euo pipefail
           for name in \
@@ -50,8 +54,7 @@ jobs:
             MACOS_SIGN_PASSWORD \
             MACOS_NOTARY_KEY \
             MACOS_NOTARY_KEY_ID \
-            MACOS_NOTARY_ISSUER_ID \
-            HOMEBREW_TAP_TOKEN; do
+            MACOS_NOTARY_ISSUER_ID; do
             test -n "${!name}" || { echo "::error::required secret $name is empty"; exit 1; }
           done
 
@@ -167,15 +170,6 @@ jobs:
           echo "zip=$zip" >> "$GITHUB_OUTPUT"
           echo "sha256=$sha" >> "$GITHUB_OUTPUT"
 
-      - name: Render the cask
-        if: ${{ !contains(github.ref_name, '-') }}
-        uses: yasyf/homebrew-tap/.github/actions/render-formula@19c3d5013032ad9c88f9a8f1170d1f366c19b8d9
-        with:
-          template: .github/cask/cookiesync.rb.tmpl
-          output: Casks/cookiesync.rb
-          substitutions: |
-            __SHA_APP__=${{ steps.app.outputs.sha256 }}
-
       - name: Record the exact release asset manifest
         id: manifest
         env:
@@ -200,9 +194,19 @@ jobs:
           prerelease=false
           if [[ "$core" == *-* ]]; then prerelease=true; fi
           {
+            echo "tag=$TAG"
             echo "path=$manifest"
             echo "prerelease=$prerelease"
           } >> "$GITHUB_OUTPUT"
+
+      - name: Render the cask
+        if: ${{ steps.manifest.outputs.prerelease == 'false' }}
+        uses: yasyf/homebrew-tap/.github/actions/render-formula@19c3d5013032ad9c88f9a8f1170d1f366c19b8d9
+        with:
+          template: .github/cask/cookiesync.rb.tmpl
+          output: Casks/cookiesync.rb
+          substitutions: |
+            __SHA_APP__=${{ steps.app.outputs.sha256 }}
 
       - name: Stage and verify the complete draft release
         id: stage
@@ -258,6 +262,34 @@ jobs:
           spctl --assess --type execute --verbose=4 "$app"
           "$app/Contents/MacOS/cookiesync" --version | grep -Fq "${TAG#v}"
 
+      - name: Package immutable release and Homebrew delivery
+        if: ${{ steps.manifest.outputs.prerelease == 'false' }}
+        uses: yasyf/homebrew-tap/.github/actions/tap-delivery@c70d7e51bdb512db2a73d054e3a94afe0a61eedb
+        with:
+          mode: pack
+          bundle: ${{ runner.temp }}/tap-delivery
+          release-dir: ${{ steps.stage.outputs['download-dir'] }}
+          tap-dir: tap-staging
+          repository: ${{ github.repository }}
+          source-sha: ${{ github.sha }}
+          tag: ${{ steps.manifest.outputs.tag }}
+          release-id: ${{ steps.stage.outputs['release-id'] }}
+          run-id: ${{ github.run_id }}
+
+      - name: Resolve immutable delivery artifact name
+        if: ${{ steps.manifest.outputs.prerelease == 'false' }}
+        id: tap-artifact
+        run: echo "name=tap-delivery-${GITHUB_RUN_ID}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload immutable release and Homebrew delivery
+        if: ${{ steps.manifest.outputs.prerelease == 'false' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.tap-artifact.outputs.name }}
+          path: ${{ runner.temp }}/tap-delivery
+          if-no-files-found: error
+          compression-level: 0
+
       - name: Publish the verified release
         uses: yasyf/homebrew-tap/.github/actions/publish-draft-release@54e3e194bda69896894a82c17fcdb2822beefab5
         with:
@@ -268,10 +300,53 @@ jobs:
           prerelease: ${{ steps.manifest.outputs.prerelease }}
           make-latest: ${{ steps.manifest.outputs.prerelease == 'false' }}
 
-      - name: Publish the cask to the tap
-        if: ${{ steps.manifest.outputs.prerelease == 'false' }}
+  publish-tap:
+    name: Publish the verified cask
+    needs: release
+    if: ${{ needs.release.outputs.prerelease == 'false' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download immutable release and Homebrew delivery
+        uses: actions/download-artifact@v8
+        with:
+          name: ${{ needs.release.outputs.tap-artifact-name }}
+          path: ${{ runner.temp }}/tap-delivery
+
+      - name: Verify immutable release and Homebrew delivery
+        uses: yasyf/homebrew-tap/.github/actions/tap-delivery@c70d7e51bdb512db2a73d054e3a94afe0a61eedb
+        with:
+          mode: verify
+          bundle: ${{ runner.temp }}/tap-delivery
+          repository: ${{ github.repository }}
+          source-sha: ${{ github.sha }}
+          tag: ${{ needs.release.outputs.tag }}
+          release-id: ${{ needs.release.outputs.release-id }}
+          run-id: ${{ github.run_id }}
+
+      - name: Record the preserved release asset manifest
+        id: manifest
+        env:
+          RELEASE_DIR: ${{ runner.temp }}/tap-delivery/release-assets
+        run: |
+          set -euo pipefail
+          manifest="$RUNNER_TEMP/cookiesync-preserved-release-assets"
+          find "$RELEASE_DIR" -mindepth 1 -maxdepth 1 -type f -print | LC_ALL=C sort > "$manifest"
+          test "$(wc -l < "$manifest" | tr -d ' ')" = 5
+          echo "path=$manifest" >> "$GITHUB_OUTPUT"
+
+      - name: Reverify the published release by exact ID
+        uses: yasyf/homebrew-tap/.github/actions/publish-draft-release@c70d7e51bdb512db2a73d054e3a94afe0a61eedb
+        with:
+          token: ${{ github.token }}
+          release-id: ${{ needs.release.outputs.release-id }}
+          tag: ${{ needs.release.outputs.tag }}
+          manifest: ${{ steps.manifest.outputs.path }}
+          prerelease: "false"
+          require-published: "true"
+
+      - name: Publish the preserved cask to the tap
         uses: yasyf/homebrew-tap/.github/actions/publish@9ca67392d45d66b6ae01e262383c8f3138d56f5e
         with:
           token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
-          dir: tap-staging
-          message: "cookiesync ${{ github.ref_name }}"
+          dir: ${{ runner.temp }}/tap-delivery/tap
+          message: "cookiesync ${{ needs.release.outputs.tag }}"
