@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/yasyf/cookiesync/internal/bridge"
+	"github.com/yasyf/daemonkit/trust"
 )
 
 const daemonChromeChildMarker = "_daemon-bridge-chrome-child-test"
@@ -41,7 +42,7 @@ func testBridgeProcesses(t *testing.T) *bridgeProcesses {
 	}
 	processes.roleArgs = []string{"-test.run=TestDaemonChromeChildRole", "--", daemonChromeChildMarker}
 	activateBridgeChildren(t, processes)
-	workerClaim, err := processes.workers.ClaimRuntime()
+	workerClaim, err := processes.workers.ClaimRuntime(trust.VerifierWorkerBudgets())
 	if err != nil {
 		t.Fatalf("claim worker runtime: %v", err)
 	}

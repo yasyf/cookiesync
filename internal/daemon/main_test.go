@@ -1,23 +1,20 @@
-// Command cookiesync syncs your browser cookies across your Macs.
-package main
+package daemon
 
 import (
 	"fmt"
 	"os"
+	"testing"
 
-	"github.com/yasyf/cookiesync/internal/cli"
 	"github.com/yasyf/daemonkit/trust"
 )
 
-var version = "dev"
-
-func main() {
+func TestMain(m *testing.M) {
 	if handled, err := trust.RunVerifierChild(os.Args[1:], os.Stdout); handled {
 		if err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
 		}
-		return
+		os.Exit(0)
 	}
-	cli.Execute(version)
+	os.Exit(m.Run())
 }

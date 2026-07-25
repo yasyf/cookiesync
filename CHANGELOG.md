@@ -6,6 +6,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.27.0] - 2026-07-24
+
+### Changed
+- Hard-cut the resident helper to daemonkit v0.18.0 and Synckit v0.35.1.
+  Verifier workers use daemonkit-owned budgets, and every serving process
+  dispatches the verifier child before command parsing so startup self-probes
+  prove the trust path before admitting peers.
+
 ## [0.26.0] - 2026-07-24
 
 ### Changed
@@ -370,7 +378,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `synckitd install` now owns the agents. The host mesh is read from the shared
   `~/.config/synckit`.
 
-[Unreleased]: https://github.com/yasyf/cookiesync/compare/v0.26.0...HEAD
+[Unreleased]: https://github.com/yasyf/cookiesync/compare/v0.27.0...HEAD
+[0.27.0]: https://github.com/yasyf/cookiesync/compare/v0.26.0...v0.27.0
 [0.26.0]: https://github.com/yasyf/cookiesync/compare/v0.25.1...v0.26.0
 [0.25.1]: https://github.com/yasyf/cookiesync/compare/v0.25.0...v0.25.1
 [0.25.0]: https://github.com/yasyf/cookiesync/compare/v0.24.0...v0.25.0
