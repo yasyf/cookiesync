@@ -25,7 +25,7 @@ jobs:
           fetch-depth: 0
 
       - name: Verify the tag is on main
-        uses: yasyf/homebrew-tap/.github/actions/verify-tag-on-main@19c3d5013032ad9c88f9a8f1170d1f366c19b8d9
+        uses: yasyf/homebrew-tap/.github/actions/verify-tag-on-main@6ff6d7538aa743581185054c46627a9a644ba695
 
       - uses: actions/setup-go@v6
         with:
