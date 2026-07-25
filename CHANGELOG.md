@@ -6,6 +6,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.27.2] - 2026-07-24
+
+### Fixed
+- Pin daemonkit v0.19.1 and Synckit v0.35.2 so a terminalized runtime worker
+  claim tears down the resident helper instead of leaving a process that cannot
+  admit trusted work.
+- Require an annotated tag signed by the fleet release key before any CLI,
+  CookieSync.app, or Homebrew cask artifact is built or published.
+
+### Changed
+- Retain `cookie-sync-state-v1` as the only accepted state contract. This hard
+  cut adds no legacy reader, migration, or compatibility fallback.
+
 ## [0.27.1] - 2026-07-24
 
 ### Fixed
@@ -384,7 +397,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `synckitd install` now owns the agents. The host mesh is read from the shared
   `~/.config/synckit`.
 
-[Unreleased]: https://github.com/yasyf/cookiesync/compare/v0.27.1...HEAD
+[Unreleased]: https://github.com/yasyf/cookiesync/compare/v0.27.2...HEAD
+[0.27.2]: https://github.com/yasyf/cookiesync/compare/v0.27.1...v0.27.2
 [0.27.1]: https://github.com/yasyf/cookiesync/compare/v0.27.0...v0.27.1
 [0.27.0]: https://github.com/yasyf/cookiesync/compare/v0.26.0...v0.27.0
 [0.26.0]: https://github.com/yasyf/cookiesync/compare/v0.25.1...v0.26.0
