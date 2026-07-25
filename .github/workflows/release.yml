@@ -345,7 +345,7 @@ jobs:
           require-published: "true"
 
       - name: Publish the preserved cask to the tap
-        uses: yasyf/homebrew-tap/.github/actions/publish@9ca67392d45d66b6ae01e262383c8f3138d56f5e
+        uses: yasyf/homebrew-tap/.github/actions/publish@9525763796fce4d1042cf3393d9479f791908eaa
         with:
           token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
           dir: ${{ runner.temp }}/tap-delivery/tap
