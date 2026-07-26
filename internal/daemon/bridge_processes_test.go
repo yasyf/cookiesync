@@ -45,6 +45,24 @@ func activateBridgeChildren(t *testing.T, processes *bridgeProcesses) {
 	})
 }
 
+func waitBridgeUntracked(t *testing.T, processes *bridgeProcesses, what string) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		records, err := processes.reaper.Store.Load(t.Context())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(records) == 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%s: %+v", what, records)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
 func startBridgeTestChild(
 	t *testing.T,
 	processes *bridgeProcesses,
@@ -266,13 +284,7 @@ func TestBridgeRecordedFailsClosedWhenSessionParentSyncFails(t *testing.T) {
 	if _, err := os.Stat(marker); !os.IsNotExist(err) {
 		t.Fatalf("child crossed execution gate after sync failure: %v", err)
 	}
-	records, err := processes.reaper.Store.Load(t.Context())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(records) != 0 {
-		t.Fatalf("rejected record remains tracked: %+v", records)
-	}
+	waitBridgeUntracked(t, processes, "rejected record remains tracked")
 }
 
 func TestBridgeRecoveryKeepsOneSidecarPerProcessAttempt(t *testing.T) {
@@ -336,13 +348,7 @@ func TestBridgeProcessShutdownLeavesNoAuthorityOrMetadata(t *testing.T) {
 	if err := os.RemoveAll(processes.sessionDir(sessionID)); err != nil {
 		t.Fatal(err)
 	}
-	records, err := processes.reaper.Store.Load(t.Context())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(records) != 0 {
-		t.Fatalf("shutdown records = %+v", records)
-	}
+	waitBridgeUntracked(t, processes, "shutdown records")
 	page, err := processes.reaper.ReapReceipts(t.Context(), proc.RecoveryTaskID, proc.ReapReceiptCursor{}, proc.ReapReceiptPageLimit)
 	if err != nil {
 		t.Fatal(err)
