@@ -6,6 +6,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.27.3] - 2026-07-26
+
+### Changed
+- Pin daemonkit v0.20.6 and Synckit v0.36.2. Durable recovery untracking is
+  deferred off the child settlement path, so a settled bridge child no longer
+  waits on durable store I/O to release its authority; the record is drained
+  at shutdown instead.
+
 ## [0.27.2] - 2026-07-24
 
 ### Fixed
@@ -397,7 +405,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `synckitd install` now owns the agents. The host mesh is read from the shared
   `~/.config/synckit`.
 
-[Unreleased]: https://github.com/yasyf/cookiesync/compare/v0.27.2...HEAD
+[Unreleased]: https://github.com/yasyf/cookiesync/compare/v0.27.3...HEAD
+[0.27.3]: https://github.com/yasyf/cookiesync/compare/v0.27.2...v0.27.3
 [0.27.2]: https://github.com/yasyf/cookiesync/compare/v0.27.1...v0.27.2
 [0.27.1]: https://github.com/yasyf/cookiesync/compare/v0.27.0...v0.27.1
 [0.27.0]: https://github.com/yasyf/cookiesync/compare/v0.26.0...v0.27.0
