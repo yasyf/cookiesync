@@ -6,6 +6,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.27.4] - 2026-07-27
+
+### Changed
+- Pin daemonkit v0.20.9. The real home directory is resolved from the passwd
+  database, so a helper install survives Homebrew postinstall's sandboxed
+  temporary HOME; a launchctl exit 5 is no longer retried as transient; and
+  recovery-mode reconcile clears a self-wedged install.
+
 ## [0.27.3] - 2026-07-26
 
 ### Changed
@@ -405,7 +413,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `synckitd install` now owns the agents. The host mesh is read from the shared
   `~/.config/synckit`.
 
-[Unreleased]: https://github.com/yasyf/cookiesync/compare/v0.27.3...HEAD
+[Unreleased]: https://github.com/yasyf/cookiesync/compare/v0.27.4...HEAD
+[0.27.4]: https://github.com/yasyf/cookiesync/compare/v0.27.3...v0.27.4
 [0.27.3]: https://github.com/yasyf/cookiesync/compare/v0.27.2...v0.27.3
 [0.27.2]: https://github.com/yasyf/cookiesync/compare/v0.27.1...v0.27.2
 [0.27.1]: https://github.com/yasyf/cookiesync/compare/v0.27.0...v0.27.1
