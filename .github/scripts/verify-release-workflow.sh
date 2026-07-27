@@ -14,7 +14,7 @@ yasyf/homebrew-tap/.github/actions/render-formula@19c3d5013032ad9c88f9a8f1170d1f
 yasyf/homebrew-tap/.github/actions/stage-draft-release@e4c3108e693681df1a3c666bae80e890bc44cf3e
 yasyf/homebrew-tap/.github/actions/tap-delivery@c70d7e51bdb512db2a73d054e3a94afe0a61eedb
 yasyf/homebrew-tap/.github/actions/tap-delivery@c70d7e51bdb512db2a73d054e3a94afe0a61eedb
-yasyf/homebrew-tap/.github/actions/verify-tag-on-main@a4179241558456339fa2e41b97693a6cebae2e36
+yasyf/homebrew-tap/.github/actions/verify-tag-on-main@2281a3ea884422db190de44fad65ce9bc08b19c4
 yasyf/homebrew-tap/.github/actions/wrap-daemon-bundle@19c3d5013032ad9c88f9a8f1170d1f366c19b8d9
 REFS
 grep -Eo 'yasyf/homebrew-tap/[^[:space:]]+@[0-9a-f]{40}' "$workflow" | sort > "$actual"
