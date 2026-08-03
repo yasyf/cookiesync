@@ -3,18 +3,23 @@ package bridge
 import (
 	"context"
 	"errors"
-	"fmt"
+	"io"
 	"os"
 	"slices"
 	"strings"
 	"time"
 
-	"github.com/yasyf/daemonkit/proc"
+	"github.com/yasyf/daemonkit"
 )
 
 const childSettlementTimeout = 10 * time.Second
 
-type preparedRecorder func(context.Context, proc.ProcessReceipt) error
+// Spawner starts one long-lived owned child under a durable process-ownership
+// scope. Both daemonkit.Ctx (a daemon's scope) and *daemonkit.Owned (a CLI's)
+// satisfy it.
+type Spawner interface {
+	Spawn(ctx context.Context, cmd daemonkit.Cmd, channel daemonkit.Channel, stderr io.Writer) (*daemonkit.Child, error)
+}
 
 func bridgeEnvironment() []string {
 	keys := map[string]string{}
@@ -36,33 +41,22 @@ func bridgeEnvironment() []string {
 	return environment
 }
 
-func prepareChild(
-	ctx context.Context,
-	manager *proc.Manager,
-	config proc.SpawnConfig,
-	recorded preparedRecorder,
-) (*proc.PreparedChild, proc.ProcessReceipt, error) {
-	if manager == nil {
-		return nil, proc.ProcessReceipt{}, errors.New("bridge: process manager is required")
-	}
-	request, err := proc.NewSpawnRequest(config)
-	if err != nil {
-		return nil, proc.ProcessReceipt{}, err
-	}
-	child, receipt, err := manager.Prepare(ctx, request)
-	if err != nil {
-		return nil, proc.ProcessReceipt{}, err
-	}
-	if recorded != nil {
-		if err := recorded(ctx, receipt); err != nil {
-			return nil, proc.ProcessReceipt{}, stopPreparedChild(ctx, child, fmt.Errorf("bridge: record prepared child: %w", err))
-		}
-	}
-	return child, receipt, nil
-}
-
-func stopPreparedChild(parent context.Context, child *proc.PreparedChild, cause error) error {
+// stopChild settles child within a fresh settlement budget, joining cause so a
+// teardown a failure triggered reports both.
+func stopChild(parent context.Context, child *daemonkit.Child, cause error) error {
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(parent), childSettlementTimeout)
 	defer cancel()
-	return errors.Join(cause, child.Stop(ctx))
+	_, err := child.Stop(ctx)
+	return errors.Join(cause, err)
+}
+
+// closed adapts a child's single-delivery terminal to a channel every watcher
+// can select on, which is the shape the daemon's session watchers hold.
+func closed(child *daemonkit.Child) <-chan struct{} {
+	done := make(chan struct{})
+	go func() {
+		<-child.Done()
+		close(done)
+	}()
+	return done
 }

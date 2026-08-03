@@ -1,8 +1,8 @@
-// Package paths resolves cookiesync's on-disk locations: the per-tool config
-// directory and the resident daemon's RPC unix socket, both under
-// XDG_CONFIG_HOME (or ~/.config). It forwards to the shared
+// Package paths resolves cookiesync's on-disk locations under XDG_CONFIG_HOME
+// (or ~/.config). It forwards to the shared
 // github.com/yasyf/synckit/hostregistry primitives so cookiesync and reposync
-// agree on the config-dir convention.
+// agree on the config-dir convention. The resident daemon's socket is not among
+// them: daemonkit derives it from the helper's launchd label.
 package paths
 
 import (
@@ -21,19 +21,13 @@ const ToolName = "cookiesync"
 const ConfigDirEnv = "COOKIESYNC_CONFIG_DIR"
 
 // Config is cookiesync's host-registry handle, naming the tool so hostregistry
-// resolves the config dir and the daemon socket path, with ConfigDirEnv as the
-// per-tool config-dir override.
+// resolves the config dir, with ConfigDirEnv as the per-tool config-dir
+// override.
 var Config = hostregistry.Config{Name: ToolName, DirEnv: ConfigDirEnv}
 
 // Dir returns cookiesync's config directory (~/.config/cookiesync).
 func Dir() (string, error) {
 	return Config.Dir()
-}
-
-// SockPath returns the absolute path to the resident daemon's RPC unix socket
-// (~/.config/cookiesync/rpc.sock).
-func SockPath() (string, error) {
-	return Config.SockPath()
 }
 
 // BridgeRecoveryRoot returns the v1 bridge process-liability root.

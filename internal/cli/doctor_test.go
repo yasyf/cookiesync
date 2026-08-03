@@ -11,7 +11,6 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/yasyf/cookiesync/internal/paths"
 	"github.com/yasyf/cookiesync/internal/state"
 	"github.com/yasyf/cookiesync/internal/transfer"
 	"github.com/yasyf/synckit/manifest"
@@ -235,13 +234,6 @@ func TestInstallWritesManifest(t *testing.T) {
 	}
 	if m.Service.SchemaFingerprint != transfer.Fingerprint {
 		t.Fatalf("manifest service fingerprint = %q, want %q", m.Service.SchemaFingerprint, transfer.Fingerprint)
-	}
-	sock, err := paths.SockPath()
-	if err != nil {
-		t.Fatalf("SockPath: %v", err)
-	}
-	if m.Service.Socket != sock {
-		t.Fatalf("manifest service socket = %q, want %q", m.Service.Socket, sock)
 	}
 	if m.Helper == nil || m.Helper.Command != "helper-serve" {
 		t.Fatalf("manifest helper = %+v, want command helper-serve", m.Helper)

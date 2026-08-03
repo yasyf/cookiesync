@@ -23,13 +23,13 @@ import (
 // the Cookies DB to land as one change.
 const watchDebounce = 3 * time.Second
 
-func newHelperServeCmd(build string) *cobra.Command {
+func newHelperServeCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "helper-serve",
 		Short: "Run the resident cookiesync helper: serve the SE key cache and Touch ID consent over the RPC socket.",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			return daemon.Serve(cmd.Context(), build)
+			return daemon.Serve(cmd.Context())
 		},
 	}
 	return cmd
@@ -47,12 +47,9 @@ func newInstallCmd() *cobra.Command {
 
 // cookiesyncManifest is the synckit manifest synckitd reads to drive cookiesync: the
 // watch backend that fingerprints local stores, the exact resident transfer service,
-// and the resident helper to keep alive. synckitd dials the service socket directly.
-func cookiesyncManifest() (manifest.Manifest, error) {
-	sock, err := paths.SockPath()
-	if err != nil {
-		return manifest.Manifest{}, err
-	}
+// and the resident helper to keep alive. The service declares no socket: synckitd
+// derives it from the helper's launchd label.
+func cookiesyncManifest() manifest.Manifest {
 	return manifest.Manifest{
 		Name:   "cookiesync",
 		Binary: "cookiesync",
@@ -61,13 +58,13 @@ func cookiesyncManifest() (manifest.Manifest, error) {
 			Debounce: codec.Duration(watchDebounce),
 		},
 		Service: manifest.ServiceSpec{
-			Kind: "resident", Socket: sock, SchemaFingerprint: transfer.Fingerprint,
+			Kind: "resident", SchemaFingerprint: transfer.Fingerprint,
 		},
 		Helper: &manifest.HelperSpec{
 			Command:     "helper-serve",
 			SessionType: manifest.SessionTypeAqua,
 		},
-	}, nil
+	}
 }
 
 // manifestPath is the file synckitd discovers cookiesync's manifest at,
@@ -90,11 +87,7 @@ func runInstall(cmd *cobra.Command, _ []string) error {
 		return fmt.Errorf("initialize cookie-sync state: %w", err)
 	}
 	noteHelper(cmd)
-	m, err := cookiesyncManifest()
-	if err != nil {
-		return err
-	}
-	if err := writeManifest(m); err != nil {
+	if err := writeManifest(cookiesyncManifest()); err != nil {
 		return err
 	}
 	path, err := manifestPath()

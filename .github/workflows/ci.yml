@@ -7,7 +7,9 @@ on:
 
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  # Only a pull-request push supersedes its own in-flight run; a push to main is
+  # never cancelled by the next one.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
@@ -18,6 +20,7 @@ jobs:
     # tests must run on macOS — the install/service/session tests need a real
     # launchd and refuse to run elsewhere.
     runs-on: macos-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v6
@@ -28,12 +31,18 @@ jobs:
       - name: Vet
         run: go vet ./...
       - name: Test
-        run: go test -race ./...
+        run: ./scripts/test.sh -race ./...
       - name: Build
         run: go build ./...
 
+  # daemonkit does not compile off darwin, so the analysis jobs cross-target it
+  # from ubuntu rather than moving to a macOS runner.
   lint:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      GOOS: darwin
+      GOARCH: arm64
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v6
@@ -48,6 +57,7 @@ jobs:
 
   vuln:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v6
@@ -58,10 +68,11 @@ jobs:
       - name: govulncheck
         run: |
           go install golang.org/x/vuln/cmd/govulncheck@latest
-          govulncheck ./...
+          GOOS=darwin GOARCH=arm64 govulncheck ./...
 
   workflow:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v6

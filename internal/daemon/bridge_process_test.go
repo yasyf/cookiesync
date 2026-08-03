@@ -1,13 +1,10 @@
 package daemon
 
 import (
-	"context"
 	"os"
 	"testing"
-	"time"
 
 	"github.com/yasyf/cookiesync/internal/bridge"
-	"github.com/yasyf/daemonkit/trust"
 )
 
 const daemonChromeChildMarker = "_daemon-bridge-chrome-child-test"
@@ -33,31 +30,7 @@ func testBridgeProcesses(t *testing.T) *bridgeProcesses {
 	if err != nil {
 		t.Fatalf("os.Executable: %v", err)
 	}
-	processes, err := newBridgeProcessesGeneration(
-		executable,
-		bridgeTestGeneration(t.Name()),
-	)
-	if err != nil {
-		t.Fatalf("newBridgeProcessesGeneration: %v", err)
-	}
+	processes := testBridgeProcessesAt(t, executable)
 	processes.roleArgs = []string{"-test.run=TestDaemonChromeChildRole", "--", daemonChromeChildMarker}
-	activateBridgeChildren(t, processes)
-	workerClaim, err := processes.workers.ClaimRuntime(trust.VerifierWorkerBudgets())
-	if err != nil {
-		t.Fatalf("claim worker runtime: %v", err)
-	}
-	if err := workerClaim.Recover(t.Context()); err != nil {
-		t.Fatalf("recover worker runtime: %v", err)
-	}
-	if err := workerClaim.Activate(); err != nil {
-		t.Fatalf("activate worker runtime: %v", err)
-	}
-	t.Cleanup(func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		if err := workerClaim.Close(ctx); err != nil {
-			t.Errorf("close worker runtime: %v", err)
-		}
-	})
 	return processes
 }

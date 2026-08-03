@@ -269,10 +269,12 @@ func (d *Daemon) openBridge(ctx context.Context, requestor, endpoint, browser, p
 		_ = os.RemoveAll(dataDir)
 	}()
 
-	proc, err = bridge.Launch(sessionCtx, d.processes.children, bridge.LaunchSpec{
+	if err := d.processes.record(bridgeProcessChrome, sessionID, endpoint, "", ""); err != nil {
+		return nil, err
+	}
+	proc, err = bridge.Launch(sessionCtx, d.processes.spawner, bridge.LaunchSpec{
 		HostBinary: hostBin, RolePath: d.processes.rolePath, DataDir: dataDir, Headed: headed,
 		RoleArgs: d.processes.roleArgs,
-		Recorded: d.processes.recorded(bridgeProcessChrome, sessionID, endpoint, "", ""),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("launch bridge: %w", err)
@@ -474,6 +476,19 @@ func (d *Daemon) closeAllBridges(_ context.Context) {
 	}
 	wg.Wait()
 	d.bridgeWG.Wait()
+}
+
+// stopBridgesOnDrain closes the bridge stop signal the moment daemonkit begins
+// the drain, which is what cancels ctx. The keepalive handler is a long poll
+// that returns on that signal, and daemonkit's shutdown ladder settles in-flight
+// requests BEFORE it runs the product's Drain — so a keepalive that waited for
+// Drain to close the signal would hold the requests stage open for its whole
+// share of the shutdown budget. Teardown still belongs to closeAllBridges; both
+// close through bridgeStopOnce.
+func (d *Daemon) stopBridgesOnDrain(ctx context.Context) {
+	context.AfterFunc(ctx, func() {
+		d.bridgeStopOnce.Do(func() { close(d.bridgeStop) })
+	})
 }
 
 // startBridgeReaper launches the expiry reaper; it runs until closeAllBridges.

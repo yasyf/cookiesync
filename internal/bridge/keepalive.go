@@ -5,68 +5,68 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"os"
+	"net"
 	"sync"
 	"time"
 
-	"github.com/yasyf/daemonkit/proc"
+	"github.com/yasyf/daemonkit"
 )
 
 // keepaliveRemoteCmd is the peer-side supervisor the origin shells: it reads the
 // bridge capability off stdin and blocks until the origin closes the pipe.
 const keepaliveRemoteCmd = "cookiesync rpc bridge_keepalive"
 
+// keepaliveWriteTimeout bounds the one capability write.
+const keepaliveWriteTimeout = 5 * time.Second
+
 // Keepalive is a detached ssh child running the peer's bridge_keepalive over a
 // held-open stdin pipe, so the peer reaps the proxied bridge the moment this side
 // closes the pipe or dies. Daemonkit owns the ssh process identity,
 // termination, and crash recovery.
 type Keepalive struct {
-	process   *proc.PreparedChild
-	stdin     *os.File
+	child     *daemonkit.Child
+	stdin     net.Conn
+	done      <-chan struct{}
 	closeOnce sync.Once
 	closeErr  error
 }
 
 // OpenKeepalive spawns the peer's keepalive supervisor over ssh to addr under
-// ctx, writes capability to the child's stdin, and keeps the pipe open so the
-// supervisor blocks until this side tears down or dies.
-func OpenKeepalive(ctx context.Context, manager *proc.Manager, target, addr, capability string, recorded func(context.Context, proc.ProcessReceipt) error) (*Keepalive, error) {
+// ctx, writes capability to the child's stdin, and keeps the channel open so the
+// supervisor blocks until this side tears down or dies. ssh cannot take fd 3, so
+// the channel is the stdio pair; its read half is drained rather than read,
+// since a full pipe would block the peer.
+func OpenKeepalive(ctx context.Context, spawner Spawner, target, addr, capability string) (*Keepalive, error) {
 	argv, err := keepaliveArgv(target, addr)
 	if err != nil {
 		return nil, err
 	}
-	readyCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	readyCtx, cancel := context.WithTimeout(ctx, keepaliveWriteTimeout)
 	defer cancel()
-	child, _, err := prepareChild(readyCtx, manager, proc.SpawnConfig{
-		RecoveryID: proc.RecoveryTaskID,
-		Executable: argv[0], Args: argv[1:],
-		Env:   bridgeEnvironment(),
-		Stdin: proc.StdioPipe, Stdout: proc.StdioNull, Stderr: proc.StdioNull,
-	}, recorded)
+	child, err := spawner.Spawn(readyCtx, daemonkit.Cmd{
+		Path: argv[0], Args: argv[1:],
+		Env:     bridgeEnvironment(),
+		Session: true,
+		Exec:    daemonkit.ServingSameUser(),
+	}, daemonkit.ChannelStdio, io.Discard)
 	if err != nil {
-		return nil, fmt.Errorf("prepare keepalive to %s: %w", addr, err)
+		return nil, fmt.Errorf("start keepalive to %s: %w", addr, err)
 	}
-	stdin, err := child.TakeStdin()
+	stdin, err := child.Conn()
 	if err != nil {
-		return nil, stopPreparedChild(ctx, child, fmt.Errorf("take keepalive stdin: %w", err))
+		return nil, stopChild(ctx, child, fmt.Errorf("take keepalive stdin: %w", err))
 	}
-	if err := child.Start(readyCtx); err != nil {
-		_ = stdin.Close()
-		return nil, stopPreparedChild(ctx, child, fmt.Errorf("start keepalive to %s: %w", addr, err))
-	}
-	if err := stdin.SetWriteDeadline(time.Now().Add(5 * time.Second)); err != nil {
-		_ = stdin.Close()
-		return nil, stopPreparedChild(ctx, child, err)
+	if err := stdin.SetWriteDeadline(time.Now().Add(keepaliveWriteTimeout)); err != nil {
+		return nil, stopChild(ctx, child, errors.Join(err, stdin.Close()))
 	}
 	if _, err := io.WriteString(stdin, capability+"\n"); err != nil {
-		_ = stdin.Close()
-		return nil, stopPreparedChild(ctx, child, fmt.Errorf("write keepalive capability: %w", err))
+		return nil, stopChild(ctx, child, errors.Join(fmt.Errorf("write keepalive capability: %w", err), stdin.Close()))
 	}
 	if err := stdin.SetWriteDeadline(time.Time{}); err != nil {
-		_ = stdin.Close()
-		return nil, stopPreparedChild(ctx, child, err)
+		return nil, stopChild(ctx, child, errors.Join(err, stdin.Close()))
 	}
-	return &Keepalive{process: child, stdin: stdin}, nil
+	go func() { _, _ = io.Copy(io.Discard, stdin) }()
+	return &Keepalive{child: child, stdin: stdin, done: closed(child)}, nil
 }
 
 // keepaliveArgv builds the ssh argv for the supervisor, reusing hostregistry's
@@ -83,15 +83,16 @@ func keepaliveArgv(target, addr string) ([]string, error) {
 // Done is closed when the ssh keepalive child exits — a transport drop the
 // daemon's session watcher tears the proxy bridge down on.
 func (k *Keepalive) Done() <-chan struct{} {
-	return k.process.Done()
+	return k.done
 }
 
 // Close stops and reaps the exact managed ssh keepalive. It is idempotent.
 func (k *Keepalive) Close() error {
 	k.closeOnce.Do(func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), childSettlementTimeout)
 		defer cancel()
-		k.closeErr = errors.Join(k.stdin.Close(), k.process.Stop(ctx))
+		_, stopErr := k.child.Stop(ctx)
+		k.closeErr = errors.Join(k.stdin.Close(), stopErr)
 	})
 	return k.closeErr
 }

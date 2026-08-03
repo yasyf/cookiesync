@@ -70,7 +70,7 @@ func TestBuildOpensAndDropsTheEnclaveKey(t *testing.T) {
 	fakeMesh(t, "me@laptop")
 	ctx := context.Background()
 
-	_, keyCache, err := build(ctx, nil)
+	_, keyCache, err := build(bridgeTestScope(t))
 	if err != nil {
 		t.Fatalf("Build: %v", err)
 	}
@@ -124,7 +124,7 @@ func TestBuildDegradedPresenceStartsWithMemoryCache(t *testing.T) {
 	t.Cleanup(func() { slog.SetDefault(prev) })
 
 	ctx := context.Background()
-	_, keyCache, err := build(ctx, nil)
+	_, keyCache, err := build(bridgeTestScope(t))
 	if err != nil {
 		t.Fatalf("Build with a presence-unavailable helper must degrade, got %v", err)
 	}
@@ -178,7 +178,7 @@ func TestBuildNoEnclaveStaysFatal(t *testing.T) {
 	t.Setenv(authkit.HelperEnvVar, binary)
 	fakeMesh(t, "me@laptop")
 
-	d, closer, err := buildDaemon(context.Background(), nil)
+	d, closer, err := buildDaemon(bridgeTestScope(t))
 	if err == nil || !strings.Contains(err.Error(), "cache-newkey exited 2") || !strings.Contains(err.Error(), "OSStatus -34018") {
 		t.Fatalf("Build = %v, want the fatal exit-2 error carrying the helper stderr", err)
 	}

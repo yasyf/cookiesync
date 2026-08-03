@@ -35,9 +35,7 @@ import (
 	"sync"
 	"time"
 
-	dkdaemon "github.com/yasyf/daemonkit/daemon"
-	"github.com/yasyf/daemonkit/proc"
-	"github.com/yasyf/daemonkit/worker"
+	"github.com/yasyf/daemonkit"
 	"golang.org/x/sync/semaphore"
 
 	"github.com/yasyf/cookiesync/internal/auth"
@@ -64,6 +62,10 @@ const consentReason = "sync them across your Macs"
 // defaultProfile is the profile a method assumes when the request omits one,
 // matching the Python DEFAULT_PROFILE.
 const defaultProfile = "Default"
+
+// settleRecoveryCloseBudget bounds the key cache's close when recovery fails
+// during preparation, after the activation context is already spent.
+const settleRecoveryCloseBudget = 10 * time.Second
 
 // Cache is the key-cache slice the daemon threads into the auth broker.
 type Cache = auth.Cache
@@ -98,8 +100,8 @@ type Daemon struct {
 
 	// openTunnel and openKeepalive are the cross-host bridge seams: the ssh -L
 	// forward and the keepalive supervisor, defaulted in New and faked in tests.
-	openTunnel    func(context.Context, bridge.TunnelSpec, func(context.Context, proc.ProcessReceipt) error) (bridgeTunnel, error)
-	openKeepalive func(context.Context, string, string, string, func(context.Context, proc.ProcessReceipt) error) (bridgeKeepalive, error)
+	openTunnel    func(context.Context, bridge.TunnelSpec) (bridgeTunnel, error)
+	openKeepalive func(context.Context, string, string, string) (bridgeKeepalive, error)
 	processes     *bridgeProcesses
 	bridgeSlots   *semaphore.Weighted
 
@@ -116,8 +118,8 @@ type Daemon struct {
 // the presence probes, and the ssh runner. The returned closer is the cache's
 // Close — it evicts every entry and drops the Enclave key; Serve calls it, but
 // a caller that builds without serving must too.
-func buildDaemon(ctx context.Context, workers *worker.Pool) (*Daemon, func(context.Context) error, error) {
-	d, keyCache, err := build(ctx, workers)
+func buildDaemon(c daemonkit.Ctx) (*Daemon, func(context.Context) error, error) {
+	d, keyCache, err := build(c)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -126,7 +128,8 @@ func buildDaemon(ctx context.Context, workers *worker.Pool) (*Daemon, func(conte
 
 // build is buildDaemon with the key cache exposed, so generation tests drive the real
 // cache the daemon was wired over.
-func build(ctx context.Context, workers *worker.Pool) (*Daemon, *cache.KeyCache, error) {
+func build(c daemonkit.Ctx) (*Daemon, *cache.KeyCache, error) {
+	ctx := c.Context
 	store := state.New(paths.Config)
 	// Load once here to fail fast on a malformed state file; handlers re-read it live.
 	if _, err := store.Load(ctx); err != nil {
@@ -137,7 +140,7 @@ func build(ctx context.Context, workers *worker.Pool) (*Daemon, *cache.KeyCache,
 	if err != nil {
 		return nil, nil, err
 	}
-	runner := engine.NewExecSSHRunner(workers)
+	runner := engine.NewExecSSHRunner(c)
 
 	// synckitd owns the watch loop and reconcile tick; the engine records
 	// applied digests through a standalone recorder.
@@ -169,15 +172,15 @@ func New(consent cookie.Consent, c Cache, eng *engine.Engine, probe Probe, runne
 		seedSource:  cookie.SeedState,
 		hostBinary:  bridge.ResolveHostBinary,
 	}
-	d.openTunnel = func(ctx context.Context, spec bridge.TunnelSpec, recorded func(context.Context, proc.ProcessReceipt) error) (bridgeTunnel, error) {
-		t, err := bridge.OpenTunnel(ctx, d.processes.children, spec, recorded)
+	d.openTunnel = func(ctx context.Context, spec bridge.TunnelSpec) (bridgeTunnel, error) {
+		t, err := bridge.OpenTunnel(ctx, d.processes.spawner, spec)
 		if err != nil {
 			return nil, err
 		}
 		return t, nil
 	}
-	d.openKeepalive = func(ctx context.Context, target, addr, capability string, recorded func(context.Context, proc.ProcessReceipt) error) (bridgeKeepalive, error) {
-		k, err := bridge.OpenKeepalive(ctx, d.processes.children, target, addr, capability, recorded)
+	d.openKeepalive = func(ctx context.Context, target, addr, capability string) (bridgeKeepalive, error) {
+		k, err := bridge.OpenKeepalive(ctx, d.processes.spawner, target, addr, capability)
 		if err != nil {
 			return nil, err
 		}
@@ -229,16 +232,12 @@ func (d *Daemon) register(dispatcher *synckit.Dispatcher) {
 // Serve runs the resident helper as one exact daemonkit generation. The
 // Secure Enclave key, bridge owner, dispatcher, and readiness are constructed
 // only after listener takeover has established exclusive ownership.
-func Serve(ctx context.Context, build string) error {
-	sock, err := paths.SockPath()
-	if err != nil {
-		return err
-	}
+func Serve(ctx context.Context) error {
 	rolePath, err := helperRolePath()
 	if err != nil {
 		return err
 	}
-	runtime, err := newHelperRuntime(sock, rolePath, build, buildDaemon) //nolint:contextcheck // Runtime.Run owns ctx; construction has no request-scoped work.
+	runtime, err := newHelperRuntime(rolePath, buildDaemon) //nolint:contextcheck // Runtime.Run owns ctx; construction has no request-scoped work.
 	if err != nil {
 		return err
 	}
@@ -261,25 +260,22 @@ func helperRolePath() (string, error) {
 	return filepath.Clean(rolePath), nil
 }
 
-type helperBuilder func(context.Context, *worker.Pool) (*Daemon, func(context.Context) error, error)
+type helperBuilder func(daemonkit.Ctx) (*Daemon, func(context.Context) error, error)
 
-func newHelperRuntime(sock, rolePath, build string, builder helperBuilder) (*helperruntime.Runtime, error) {
+// newHelperRuntime composes the resident helper. MaxFrame is left unstated so
+// the spec takes synckit's rpc.MaxFrame, the one number both ends of every
+// session must agree on.
+func newHelperRuntime(rolePath string, builder helperBuilder) (*helperruntime.Runtime, error) {
 	dispatcher := synckit.NewDispatcher()
-	processes, err := newBridgeProcesses(rolePath)
+	program, err := daemonkit.Stable()
 	if err != nil {
 		return nil, err
 	}
-	stopStorePath, err := paths.RuntimeStopStorePath()
-	if err != nil {
-		return nil, err
-	}
-	runtime, err := helperruntime.New(helperruntime.Config{
-		App:    helperruntime.App{Name: paths.ToolName, RuntimeBuild: build},
-		Socket: sock, Dispatcher: dispatcher,
-		Workers: processes.workers, Children: processes.children,
-		StopStore: &proc.FileStore{Path: stopStorePath},
-		Prepare: func(activation dkdaemon.Activation) (helperruntime.Product, error) {
-			activationCtx := activation.Context()
+	return helperruntime.New(helperruntime.Config{
+		App:        helperruntime.App{Name: paths.ToolName},
+		Program:    program,
+		Dispatcher: dispatcher,
+		Prepare: func(c daemonkit.Ctx) (helperruntime.Product, error) {
 			dir, err := paths.Dir()
 			if err != nil {
 				return nil, err
@@ -287,25 +283,29 @@ func newHelperRuntime(sock, rolePath, build string, builder helperBuilder) (*hel
 			if err := os.MkdirAll(dir, 0o700); err != nil {
 				return nil, fmt.Errorf("create config dir %s: %w", dir, err)
 			}
-			if err := debug.DumpOnSIGUSR1(activationCtx, filepath.Join(dir, "debug")); err != nil {
+			if err := debug.DumpOnSIGUSR1(c.Context, filepath.Join(dir, "debug")); err != nil {
 				return nil, err
 			}
-			d, closer, err := builder(activationCtx, processes.workers)
+			processes, err := newBridgeProcesses(rolePath, c)
+			if err != nil {
+				return nil, err
+			}
+			d, closer, err := builder(c)
 			if err != nil {
 				return nil, err
 			}
 			d.processes = processes
-			if err := processes.settleRecovery(activationCtx, d.runner); err != nil {
-				closeCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			if err := processes.settleRecovery(c.Context, d.runner); err != nil {
+				closeCtx, cancel := context.WithTimeout(context.Background(), settleRecoveryCloseBudget)
 				defer cancel()
 				return nil, errors.Join(err, closer(closeCtx))
 			}
 			d.startBridgeReaper()
+			d.stopBridgesOnDrain(c.Context)
 			d.register(dispatcher)
 			return &helperProduct{daemon: d, closer: closer}, nil
 		},
 	})
-	return runtime, err
 }
 
 type helperProduct struct {

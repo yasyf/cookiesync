@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
@@ -265,9 +266,9 @@ func TestBridgeFreshOpensDoNotShareSecrets(t *testing.T) {
 		}
 		tokens[sess.token] = true
 		// Fix 2: the crash-durability record is on disk the moment open returns.
-		records, err := filepath.Glob(filepath.Join(sess.dataDir, string(bridgeProcessChrome)+"-*"+bridgeProcessSuffix))
-		if err != nil || len(records) != 1 {
-			t.Fatalf("open %d: session records = %v, err %v", i, records, err)
+		record := filepath.Join(sess.dataDir, bridgeRecoveryFileName(bridgeProcessChrome))
+		if _, err := os.Stat(record); err != nil {
+			t.Fatalf("open %d: session record %s: %v", i, record, err)
 		}
 	}
 	if len(caps) != n || len(urls) != n || len(tokens) != n {

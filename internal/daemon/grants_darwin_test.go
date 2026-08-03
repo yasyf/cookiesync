@@ -13,9 +13,7 @@ import (
 	"time"
 
 	"github.com/yasyf/cookiesync/internal/cookie"
-	"github.com/yasyf/cookiesync/internal/paths"
-	"github.com/yasyf/daemonkit/wire"
-	"github.com/yasyf/daemonkit/worker"
+	"github.com/yasyf/daemonkit"
 	synckit "github.com/yasyf/synckit/rpc"
 )
 
@@ -32,15 +30,13 @@ func TestPeerSIDRequestorOverSocket(t *testing.T) {
 	consent := &fakeConsent{key: cookie.DeriveKey(cookie.SafeStorageKey("peanuts"))}
 	d := New(consent, newFakeCache(), nil, staticProbe(liveSession(currentUser(t))), &recordingRunner{}, fixedState{st: st}, fixedState{st: st})
 
-	t.Setenv(paths.ConfigDirEnv, t.TempDir())
-	sock := filepath.Join(t.TempDir(), "d.sock")
 	executable, err := os.Executable()
 	if err != nil {
 		t.Fatalf("executable: %v", err)
 	}
 	prepareHelperRuntime(t, executable)
 	fakeMesh(t, self)
-	runtime, err := newHelperRuntime(sock, executable, "peer-sid-test", func(context.Context, *worker.Pool) (*Daemon, func(context.Context) error, error) {
+	runtime, err := newHelperRuntime(executable, func(daemonkit.Ctx) (*Daemon, func(context.Context) error, error) {
 		return d, func(context.Context) error { return nil }, nil
 	})
 	if err != nil {
@@ -57,13 +53,16 @@ func TestPeerSIDRequestorOverSocket(t *testing.T) {
 			t.Errorf("runtime: %v", err)
 		}
 	})
-	readyCtx, readyCancel := context.WithTimeout(t.Context(), 5*time.Second)
+	control := helperClient(t)
+	readyCtx, readyCancel := context.WithTimeout(t.Context(), 30*time.Second)
 	defer readyCancel()
-	if _, err := waitRuntimeHealth(readyCtx, sock); err != nil {
-		t.Fatalf("wait runtime health: %v", err)
+	if err := awaitBusinessReady(readyCtx, control); err != nil {
+		t.Fatalf("await readiness: %v", err)
 	}
 
-	client := synckit.NewClient(synckit.ClientConfig{Dial: wire.UnixDialer(sock), WireBuild: synckit.WireBuild})
+	client := synckit.NewClient(synckit.ClientConfig{
+		Open: func(context.Context) (*daemonkit.Business, error) { return control.Business(), nil },
+	})
 	defer func() { _ = client.Close() }()
 	resp, err := client.Call(context.Background(), &synckit.Request{
 		Method: "prime_auth", Params: map[string]any{"browser": "chrome"},

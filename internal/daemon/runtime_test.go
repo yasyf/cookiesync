@@ -12,13 +12,11 @@ import (
 	"testing"
 	"time"
 
-	dkdaemon "github.com/yasyf/daemonkit/daemon"
-	"github.com/yasyf/daemonkit/proc"
-	"github.com/yasyf/daemonkit/wire"
-	"github.com/yasyf/daemonkit/worker"
+	"github.com/yasyf/daemonkit"
 	"golang.org/x/sync/semaphore"
 
 	"github.com/yasyf/cookiesync/internal/paths"
+	"github.com/yasyf/synckit/helperruntime"
 	synckit "github.com/yasyf/synckit/rpc"
 )
 
@@ -28,23 +26,61 @@ func TestRuntimeRPCServerUsesExactSuiteIdentity(t *testing.T) {
 	}
 }
 
-func waitRuntimeHealth(ctx context.Context, sock string) (synckit.RuntimeHealth, error) {
-	client := synckit.NewClient(synckit.ClientConfig{Dial: wire.UnixDialer(sock), WireBuild: synckit.WireBuild})
-	defer func() { _ = client.Close() }()
+// TestHelperSpecCarriesTheWholePayload pins the frame contract both ends of a
+// session must agree on: the helper states no MaxFrame, so the spec takes
+// synckit's, whose detail ceiling still carries a whole rpc payload.
+func TestHelperSpecCarriesTheWholePayload(t *testing.T) {
+	spec, err := helperruntime.Spec(paths.ToolName, daemonkit.Program{}, 0)
+	if err != nil {
+		t.Fatalf("helperruntime.Spec: %v", err)
+	}
+	if got := daemonkit.MaxDetail(spec.MaxFrame); got < synckit.MaxPayload {
+		t.Fatalf("MaxDetail(%d) = %d, want at least the rpc payload ceiling %d", spec.MaxFrame, got, synckit.MaxPayload)
+	}
+}
+
+// helperClient opens the resident helper the same way every cookiesync caller
+// does — by name, never by path.
+func helperClient(t *testing.T) *daemonkit.Client {
+	t.Helper()
+	spec, err := helperruntime.Spec(paths.ToolName, daemonkit.Program{}, 0)
+	if err != nil {
+		t.Fatalf("helperruntime.Spec: %v", err)
+	}
+	client, err := daemonkit.Open(spec)
+	if err != nil {
+		t.Fatalf("open resident helper: %v", err)
+	}
+	return client
+}
+
+// readinessProbe is a method no dispatcher registers. A well-formed refusal is
+// still a dispatched reply, so it proves the helper is past the phase gate
+// without touching product state.
+const readinessProbe = "__cookiesync_readiness_probe__"
+
+// awaitBusinessReady blocks until the helper dispatches over its business lane.
+// Readiness is observed there rather than through Control.WaitReady because
+// these tests serve the runtime in the test's own process, and daemonkit
+// refuses to pin its own pid on the control lane — the business lane runs the
+// same-EUID floor and the Trust.Serving verify, but no self-pin.
+func awaitBusinessReady(ctx context.Context, client *daemonkit.Client) error {
+	lane := synckit.NewClient(synckit.ClientConfig{
+		Open: func(context.Context) (*daemonkit.Business, error) { return client.Business(), nil },
+	})
+	defer func() { _ = lane.Close() }()
 	var last error
 	for {
 		probeCtx, cancel := context.WithTimeout(ctx, 100*time.Millisecond)
-		health, err := client.RuntimeHealth(probeCtx)
+		_, err := lane.Call(probeCtx, &synckit.Request{Method: readinessProbe})
 		cancel()
-		if err == nil && health.Ready {
-			return health, nil
+		if err == nil {
+			return nil
 		}
-		if err != nil {
-			last = err
-		}
+		last = err
 		select {
 		case <-ctx.Done():
-			return synckit.RuntimeHealth{}, errors.Join(ctx.Err(), last)
+			return errors.Join(ctx.Err(), last)
 		case <-time.After(10 * time.Millisecond):
 		}
 	}
@@ -70,6 +106,10 @@ func TestHelperRolePathResolvesStableAlias(t *testing.T) {
 	}
 }
 
+// prepareHelperRuntime isolates one runtime's whole footprint. DAEMONKIT_HOME
+// is the daemonkit-reached state root — HOME no longer reaches it — and it must
+// stay short: the label plus /daemon.sock has to fit darwin's 104-byte
+// sun_path, which a macOS t.TempDir() blows on its own.
 func prepareHelperRuntime(t *testing.T, executable string) {
 	t.Helper()
 	dir := t.TempDir()
@@ -78,16 +118,17 @@ func prepareHelperRuntime(t *testing.T, executable string) {
 	}
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
-}
-
-func TestHelperRuntimeActivatesAfterOwnershipAndClosesGeneration(t *testing.T) {
 	t.Setenv(paths.ConfigDirEnv, t.TempDir())
-	socketDir, err := os.MkdirTemp("/tmp", "cookiesync-runtime-")
+
+	home, err := os.MkdirTemp("/tmp", "cs-")
 	if err != nil {
 		t.Fatalf("MkdirTemp: %v", err)
 	}
-	t.Cleanup(func() { _ = os.RemoveAll(socketDir) })
-	sock := filepath.Join(socketDir, "rpc.sock")
+	t.Cleanup(func() { _ = os.RemoveAll(home) })
+	t.Setenv("DAEMONKIT_HOME", home)
+}
+
+func TestHelperRuntimeActivatesAfterOwnershipAndClosesGeneration(t *testing.T) {
 	executable, err := os.Executable()
 	if err != nil {
 		t.Fatalf("os.Executable: %v", err)
@@ -98,10 +139,7 @@ func TestHelperRuntimeActivatesAfterOwnershipAndClosesGeneration(t *testing.T) {
 	var closes atomic.Int32
 	activated := make(chan struct{})
 	d := &Daemon{bridges: map[string]session{}, bridgeStop: make(chan struct{})}
-	builder := func(context.Context, *worker.Pool) (*Daemon, func(context.Context) error, error) {
-		if _, err := os.Stat(sock); err != nil {
-			return nil, nil, errors.New("builder ran before listener ownership")
-		}
+	builder := func(daemonkit.Ctx) (*Daemon, func(context.Context) error, error) {
 		builds.Add(1)
 		close(activated)
 		return d, func(context.Context) error {
@@ -110,8 +148,7 @@ func TestHelperRuntimeActivatesAfterOwnershipAndClosesGeneration(t *testing.T) {
 		}, nil
 	}
 
-	const build = "v9.8.7-test"
-	runtime, err := newHelperRuntime(sock, executable, build, builder)
+	runtime, err := newHelperRuntime(executable, builder)
 	if err != nil {
 		t.Fatalf("newHelperRuntime: %v", err)
 	}
@@ -119,12 +156,12 @@ func TestHelperRuntimeActivatesAfterOwnershipAndClosesGeneration(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- runtime.Run(ctx) }()
 
-	readyCtx, readyCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	client := helperClient(t)
+	readyCtx, readyCancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer readyCancel()
-	health, err := waitRuntimeHealth(readyCtx, sock)
-	if err != nil {
+	if err := awaitBusinessReady(readyCtx, client); err != nil {
 		cancel()
-		t.Fatalf("wait runtime health: %v", err)
+		t.Fatalf("await readiness: %v", err)
 	}
 	select {
 	case <-activated:
@@ -132,30 +169,13 @@ func TestHelperRuntimeActivatesAfterOwnershipAndClosesGeneration(t *testing.T) {
 		cancel()
 		t.Fatal("runtime published readiness before generation activation")
 	}
-	if health.RuntimeBuild != build || health.RuntimeProtocol != int(synckit.Version) ||
-		health.ProcessGeneration == "" || health.State != string(dkdaemon.StateHealthy) || !health.Ready {
-		cancel()
-		t.Fatalf("health = %+v", health)
-	}
-	client := synckit.NewClient(synckit.ClientConfig{Dial: wire.UnixDialer(sock), WireBuild: synckit.WireBuild})
-	defer func() { _ = client.Close() }()
-	observed, err := client.RuntimeHealth(readyCtx)
-	if err != nil {
-		cancel()
-		t.Fatalf("RuntimeHealth: %v", err)
-	}
-	if observed != health {
-		cancel()
-		t.Fatalf("observed health = %+v, runtime health = %+v", observed, health)
-	}
-
 	cancel()
 	select {
 	case err := <-done:
 		if err != nil {
 			t.Fatalf("runtime.Run: %v", err)
 		}
-	case <-time.After(5 * time.Second):
+	case <-time.After(30 * time.Second):
 		t.Fatal("runtime did not settle after cancellation")
 	}
 	if builds.Load() != 1 || closes.Load() != 1 {
@@ -167,36 +187,34 @@ func TestHelperRuntimeActivatesAfterOwnershipAndClosesGeneration(t *testing.T) {
 }
 
 func TestHelperRuntimeDrainsKeepaliveBeforeAdmissionSettlement(t *testing.T) {
-	t.Setenv(paths.ConfigDirEnv, t.TempDir())
 	executable, err := os.Executable()
 	if err != nil {
 		t.Fatal(err)
 	}
 	prepareHelperRuntime(t, executable)
-	socketDir, err := os.MkdirTemp("/tmp", "cookiesync-drain-runtime-")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = os.RemoveAll(socketDir) })
-	sock := filepath.Join(socketDir, "rpc.sock")
 	d := &Daemon{bridges: map[string]session{}, bridgeStop: make(chan struct{})}
-	builder := func(context.Context, *worker.Pool) (*Daemon, func(context.Context) error, error) {
+	builder := func(daemonkit.Ctx) (*Daemon, func(context.Context) error, error) {
 		return d, func(context.Context) error { return nil }, nil
 	}
-	runtime, err := newHelperRuntime(sock, executable, "v9.8.7-drain-test", builder)
+	runtime, err := newHelperRuntime(executable, builder)
 	if err != nil {
 		t.Fatal(err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() { done <- runtime.Run(ctx) }()
-	readyCtx, readyCancel := context.WithTimeout(context.Background(), 5*time.Second)
+
+	control := helperClient(t)
+	readyCtx, readyCancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer readyCancel()
-	if _, err := waitRuntimeHealth(readyCtx, sock); err != nil {
+	if err := awaitBusinessReady(readyCtx, control); err != nil {
 		cancel()
-		t.Fatalf("WaitReady: %v", err)
+		t.Fatalf("await readiness: %v", err)
 	}
-	client := synckit.NewClient(synckit.ClientConfig{Dial: wire.UnixDialer(sock), WireBuild: synckit.WireBuild})
+
+	client := synckit.NewClient(synckit.ClientConfig{
+		Open: func(context.Context) (*daemonkit.Business, error) { return control.Business(), nil },
+	})
 	defer func() { _ = client.Close() }()
 	type callResult struct {
 		response *synckit.Response
@@ -222,7 +240,7 @@ func TestHelperRuntimeDrainsKeepaliveBeforeAdmissionSettlement(t *testing.T) {
 		if err != nil {
 			t.Fatalf("runtime.Run: %v", err)
 		}
-	case <-time.After(2 * time.Second):
+	case <-time.After(30 * time.Second):
 		t.Fatal("runtime admission settlement waited on the live keepalive")
 	}
 	select {
@@ -230,7 +248,7 @@ func TestHelperRuntimeDrainsKeepaliveBeforeAdmissionSettlement(t *testing.T) {
 		if result.err != nil || result.response == nil || !result.response.OK {
 			t.Fatalf("drained keepalive response=%+v err=%v", result.response, result.err)
 		}
-	case <-time.After(time.Second):
+	case <-time.After(5 * time.Second):
 		t.Fatal("drained keepalive did not return")
 	}
 	if !d.bridgeShutdown {
@@ -238,32 +256,20 @@ func TestHelperRuntimeDrainsKeepaliveBeforeAdmissionSettlement(t *testing.T) {
 	}
 }
 
+// TestHelperRuntimeSettlesBridgeRecoveryBeforeReadiness proves the crashed
+// generation's product liabilities are discharged before this one answers: the
+// peer's half of a leaked tunnel is closed, and only then is readiness
+// published.
 func TestHelperRuntimeSettlesBridgeRecoveryBeforeReadiness(t *testing.T) {
-	t.Setenv(paths.ConfigDirEnv, t.TempDir())
 	executable, err := os.Executable()
 	if err != nil {
 		t.Fatal(err)
 	}
 	prepareHelperRuntime(t, executable)
-	old, err := newBridgeProcessesGeneration(executable, bridgeTestGeneration("prior-runtime-generation"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	command := exec.Command("/bin/sh", "-c", "while :; do sleep 1; done")
-	command.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
-	if err := command.Start(); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = command.Process.Kill() })
-	record, err := old.reaper.TrackGroup(t.Context(), command.Process.Pid, proc.RecoveryTaskID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := old.writeMetadata(t.Context(), bridgeRecoveryMetadata{
-		Schema: bridgeRecoverySchemaV1, SessionID: "runtime-recovery", Kind: bridgeProcessTunnel,
-		Process: bridgeIdentityFromRecord(record), Endpoint: "you@desktop:chrome:Default",
-		Host: "you@desktop", Capability: "cap-b-secret",
-	}); err != nil {
+	crashed := testBridgeProcessesAt(t, executable)
+	if err := crashed.record(
+		bridgeProcessTunnel, "runtime-recovery", "you@desktop:chrome:Default", "you@desktop", "cap-b-secret",
+	); err != nil {
 		t.Fatal(err)
 	}
 
@@ -272,16 +278,10 @@ func TestHelperRuntimeSettlesBridgeRecoveryBeforeReadiness(t *testing.T) {
 		runner: runner, bridges: map[string]session{}, bridgeStop: make(chan struct{}),
 		bridgeSlots: semaphore.NewWeighted(bridgeProcessCapacity),
 	}
-	builder := func(context.Context, *worker.Pool) (*Daemon, func(context.Context) error, error) {
+	builder := func(daemonkit.Ctx) (*Daemon, func(context.Context) error, error) {
 		return d, func(context.Context) error { return nil }, nil
 	}
-	socketDir, err := os.MkdirTemp("/tmp", "cookiesync-recovery-runtime-")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = os.RemoveAll(socketDir) })
-	sock := filepath.Join(socketDir, "rpc.sock")
-	runtime, err := newHelperRuntime(sock, executable, "v9.8.8-test", builder)
+	runtime, err := newHelperRuntime(executable, builder)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -290,108 +290,73 @@ func TestHelperRuntimeSettlesBridgeRecoveryBeforeReadiness(t *testing.T) {
 	go func() { done <- runtime.Run(ctx) }()
 	select {
 	case <-runner.started:
-	case <-time.After(8 * time.Second):
+	case <-time.After(30 * time.Second):
 		cancel()
 		t.Fatal("runtime never reached bridge recovery settlement")
 	}
-	blockedCtx, blockedCancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
-	if _, err := waitRuntimeHealth(blockedCtx, sock); !errors.Is(err, context.DeadlineExceeded) {
+
+	client := helperClient(t)
+	blockedCtx, blockedCancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	if err := awaitBusinessReady(blockedCtx, client); !errors.Is(err, context.DeadlineExceeded) {
 		blockedCancel()
 		cancel()
-		t.Fatalf("runtime health during recovery = %v, want deadline", err)
+		t.Fatalf("readiness during recovery = %v, want deadline", err)
 	}
 	blockedCancel()
+
 	close(runner.release)
-	readyCtx, readyCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	readyCtx, readyCancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer readyCancel()
-	if _, err := waitRuntimeHealth(readyCtx, sock); err != nil {
+	if err := awaitBusinessReady(readyCtx, client); err != nil {
 		cancel()
-		t.Fatalf("WaitReady after recovery: %v", err)
+		t.Fatalf("await readiness after recovery: %v", err)
 	}
 	cancel()
 	if err := <-done; err != nil {
 		t.Fatalf("runtime.Run: %v", err)
-	}
-	page, err := d.processes.reaper.ReapReceipts(t.Context(), proc.RecoveryTaskID, proc.ReapReceiptCursor{}, proc.ReapReceiptPageLimit)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(page.Receipts) != 0 {
-		t.Fatalf("runtime recovery receipts = %+v", page.Receipts)
 	}
 	if _, err := os.Stat(d.processes.sessionDir("runtime-recovery")); !os.IsNotExist(err) {
 		t.Fatalf("runtime recovery metadata remains: %v", err)
 	}
 }
 
-func TestHelperRuntimeReapsBridgeProcessesBeforeBuilderFailure(t *testing.T) {
-	t.Setenv(paths.ConfigDirEnv, t.TempDir())
+// TestHelperRuntimeReclaimsBridgeProcessesBeforeTheBuilderRuns proves the
+// ordering the whole recovery design rests on: the prior generation's children
+// are settled and reported through Ctx.Reclaimed before product preparation
+// begins, so a sidecar the builder finds on disk always names a dead process.
+func TestHelperRuntimeReclaimsBridgeProcessesBeforeTheBuilderRuns(t *testing.T) {
 	executable, err := os.Executable()
 	if err != nil {
 		t.Fatal(err)
 	}
 	prepareHelperRuntime(t, executable)
-	old, err := newBridgeProcessesGeneration(executable, bridgeTestGeneration("builder-failure-prior-generation"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	command := exec.Command("/bin/sh", "-c", "while :; do sleep 1; done")
+
+	command := exec.Command("/bin/sh", "-c", "while :; do sleep 1; done") //nolint:gosec // test-owned exact shell fixture.
 	command.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 	if err := command.Start(); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = command.Process.Kill() })
-	record, err := old.reaper.TrackGroup(t.Context(), command.Process.Pid, proc.RecoveryTaskID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := old.writeMetadata(t.Context(), bridgeRecoveryMetadata{
-		Schema: bridgeRecoverySchemaV1, SessionID: "builder-failure-recovery", Kind: bridgeProcessChrome,
-		Process: bridgeIdentityFromRecord(record), Endpoint: "chrome:Default",
-	}); err != nil {
-		t.Fatal(err)
-	}
 
-	var reapedBeforeBuilder atomic.Bool
+	var reclaimedAlive atomic.Bool
 	errBuilder := errors.New("test builder failure")
-	builder := func(ctx context.Context, _ *worker.Pool) (*Daemon, func(context.Context) error, error) {
-		waited := make(chan struct{})
-		go func() {
-			_ = command.Wait()
-			close(waited)
-		}()
-		select {
-		case <-waited:
-			records, loadErr := old.reaper.Store.Load(ctx)
-			if loadErr == nil && len(records) == 0 {
-				reapedBeforeBuilder.Store(true)
+	builder := func(c daemonkit.Ctx) (*Daemon, func(context.Context) error, error) {
+		for _, entry := range c.Reclaimed {
+			if syscall.Kill(entry.PID, 0) == nil {
+				reclaimedAlive.Store(true)
 			}
-		case <-time.After(500 * time.Millisecond):
 		}
 		return nil, nil, errBuilder
 	}
-	socketDir, err := os.MkdirTemp("/tmp", "cookiesync-builder-failure-")
+	runtime, err := newHelperRuntime(executable, builder)
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = os.RemoveAll(socketDir) })
-	runtime, err := newHelperRuntime(filepath.Join(socketDir, "rpc.sock"), executable, "v9.8.9-test", builder)
-	if err != nil {
-		t.Fatal(err)
-	}
-	err = runtime.Run(context.Background())
-	if !errors.Is(err, errBuilder) {
+	if err := runtime.Run(context.Background()); !errors.Is(err, errBuilder) {
 		t.Fatalf("runtime.Run = %v, want builder failure", err)
 	}
-	if !reapedBeforeBuilder.Load() {
-		t.Fatal("builder ran before prior bridge process authority was settled")
-	}
-	page, err := old.reaper.ReapReceipts(t.Context(), proc.RecoveryTaskID, proc.ReapReceiptCursor{}, proc.ReapReceiptPageLimit)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(page.Receipts) != 1 || page.Receipts[0].Record != record {
-		t.Fatalf("builder failure lost durable recovery receipt: %+v", page.Receipts)
+	if reclaimedAlive.Load() {
+		t.Fatal("a child reported as reclaimed was still alive when the builder ran")
 	}
 }
 

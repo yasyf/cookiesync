@@ -15,8 +15,7 @@ import (
 	"strings"
 	"time"
 
-	dkdaemon "github.com/yasyf/daemonkit/daemon"
-	"github.com/yasyf/daemonkit/proc"
+	"github.com/yasyf/daemonkit/durable"
 	"github.com/yasyf/synckit/cregistry"
 	"github.com/yasyf/synckit/hostregistry"
 	"github.com/yasyf/synckit/syncservice"
@@ -33,6 +32,8 @@ const (
 		"receipt:{origin:string,change_id:sha256,revision:uint64,payload_digest:sha256}"
 	ledgerFile = "transfer-v1.json"
 	lockFile   = "transfer-v1.lock"
+	// ledgerLockDeadline bounds one contended ledger acquisition.
+	ledgerLockDeadline = 30 * time.Second
 )
 
 // Fingerprint binds the manifest and every delivery to the exact v1 schema.
@@ -201,9 +202,9 @@ func withLedger(ctx context.Context, apply func(*ledger) error) error {
 	if err := os.MkdirAll(directory, 0o700); err != nil {
 		return err
 	}
-	lock, err := (proc.FileLockSpec{
-		Path: filepath.Join(directory, lockFile), Mode: proc.FileLockExclusive, Deadline: 30 * time.Second,
-	}).Acquire(ctx)
+	lockCtx, cancel := context.WithTimeout(ctx, ledgerLockDeadline)
+	defer cancel()
+	lock, err := durable.AcquireLock(lockCtx, filepath.Join(directory, lockFile))
 	if err != nil {
 		return err
 	}
@@ -221,7 +222,7 @@ func withLedger(ctx context.Context, apply func(*ledger) error) error {
 	if err != nil {
 		return err
 	}
-	return dkdaemon.WriteFileDurable(path, append(raw, '\n'), 0o600)
+	return durable.WriteFile(path, append(raw, '\n'), 0o600)
 }
 
 func readLedger(path string) (*ledger, error) {

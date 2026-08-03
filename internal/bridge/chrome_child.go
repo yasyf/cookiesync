@@ -6,7 +6,7 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/yasyf/daemonkit/proc"
+	"github.com/yasyf/daemonkit"
 	"golang.org/x/sys/unix"
 )
 
@@ -18,7 +18,7 @@ func RunChromeChild(binary, dataDir string, headed bool) error {
 	if !filepath.IsAbs(dataDir) || filepath.Clean(dataDir) != dataDir {
 		return errors.New("bridge: chrome data dir must be an exact absolute path")
 	}
-	if err := proc.CloseInheritedFDs(); err != nil {
+	if err := daemonkit.CloseInheritedFDs(); err != nil {
 		return err
 	}
 	if err := unix.Dup2(int(os.Stdin.Fd()), 3); err != nil {

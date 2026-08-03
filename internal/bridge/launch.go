@@ -12,14 +12,14 @@ import (
 	"crypto/rand"
 	"errors"
 	"fmt"
-	"io"
+	"net"
 	"os"
 	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/yasyf/daemonkit/proc"
+	"github.com/yasyf/daemonkit"
 )
 
 const chromeHostBinary = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
@@ -35,7 +35,6 @@ type LaunchSpec struct {
 	RoleArgs   []string
 	DataDir    string // private 0700 throwaway --user-data-dir (caller-owned)
 	Headed     bool   // default true for fidelity; false => --headless=new
-	Recorded   func(context.Context, proc.ProcessReceipt) error
 }
 
 // Proc is a running Chrome child whose SOLE CDP transport is the inherited
@@ -43,10 +42,8 @@ type LaunchSpec struct {
 // both seeding (Conn) and the later WS relay (Server) multiplex over this one
 // pipe.
 type Proc struct {
-	process    *proc.PreparedChild
-	receipt    proc.ProcessReceipt
-	transport  *pipeTransport
-	stderrDone <-chan error
+	child     *daemonkit.Child
+	transport net.Conn
 
 	dataDir     string
 	browserUUID string
@@ -65,8 +62,9 @@ type Proc struct {
 }
 
 // Launch starts Chrome with --remote-debugging-pipe on an isolated
-// user-data-dir and completes the pipe handshake.
-func Launch(ctx context.Context, manager *proc.Manager, spec LaunchSpec) (*Proc, error) {
+// user-data-dir and completes the pipe handshake. The child takes its own
+// session so Chrome's helper processes settle with it.
+func Launch(ctx context.Context, spawner Spawner, spec LaunchSpec) (*Proc, error) {
 	stderr := &lockedBuffer{}
 	uuid, err := newBrowserUUID()
 	if err != nil {
@@ -80,51 +78,29 @@ func Launch(ctx context.Context, manager *proc.Manager, spec LaunchSpec) (*Proc,
 	}
 	readyCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
-	child, receipt, err := prepareChild(readyCtx, manager, proc.SpawnConfig{
-		RecoveryID: proc.RecoveryTaskID,
-		Executable: spec.RolePath,
+	child, err := spawner.Spawn(readyCtx, daemonkit.Cmd{
+		Path: spec.RolePath,
 		Args: append(append([]string{}, spec.RoleArgs...),
 			"_bridge-chrome-child", spec.HostBinary, spec.DataDir, strconv.FormatBool(spec.Headed)),
-		Env:   bridgeEnvironment(),
-		Stdin: proc.StdioPipe, Stdout: proc.StdioPipe, Stderr: proc.StdioPipe,
-	}, spec.Recorded)
+		Env:     bridgeEnvironment(),
+		Session: true,
+		Exec:    daemonkit.ServingSameUser(),
+	}, daemonkit.ChannelStdio, stderr)
 	if err != nil {
-		return nil, fmt.Errorf("prepare chrome session: %w", err)
+		return nil, fmt.Errorf("start chrome session: %w", err)
 	}
-	stdin, err := child.TakeStdin()
+	transport, err := child.Conn()
 	if err != nil {
-		return nil, stopPreparedChild(ctx, child, fmt.Errorf("bridge: take chrome command pipe: %w", err))
+		return nil, stopChild(ctx, child, fmt.Errorf("bridge: take chrome cdp pipe: %w", err))
 	}
-	stdout, err := child.TakeStdout()
-	if err != nil {
-		_ = stdin.Close()
-		return nil, stopPreparedChild(ctx, child, fmt.Errorf("bridge: take chrome event pipe: %w", err))
-	}
-	stderrPipe, err := child.TakeStderr()
-	if err != nil {
-		_ = stdin.Close()
-		_ = stdout.Close()
-		return nil, stopPreparedChild(ctx, child, fmt.Errorf("bridge: take chrome stderr: %w", err))
-	}
-	stderrDone := make(chan error, 1)
-	go func() {
-		_, copyErr := io.Copy(stderr, stderrPipe)
-		stderrDone <- errors.Join(copyErr, stderrPipe.Close())
-	}()
-	p.process = child
-	p.receipt = receipt
-	p.transport = &pipeTransport{reader: stdout, writer: stdin}
-	p.stderrDone = stderrDone
-	if err := child.Start(readyCtx); err != nil {
-		_ = p.transport.Close()
-		return nil, errors.Join(fmt.Errorf("start chrome session: %w", err), stopPreparedChild(ctx, child, nil), <-stderrDone)
-	}
+	p.child = child
+	p.transport = transport
 	go p.readLoop()
 	if _, err := (&Conn{proc: p}).Call(readyCtx, "", "Browser.getVersion", nil); err != nil {
-		_ = p.transport.Close()
 		return nil, errors.Join(
 			fmt.Errorf("cdp handshake (chrome stderr: %q): %w", stderr.String(), err),
-			stopPreparedChild(ctx, child, nil), <-stderrDone,
+			transport.Close(),
+			stopChild(ctx, child, nil),
 		)
 	}
 	return p, nil
@@ -138,42 +114,23 @@ func (p *Proc) BrowserUUID() string {
 
 // Pid returns the exact daemonkit-managed Chrome process id.
 func (p *Proc) Pid() int {
-	return p.receipt.ProcessIdentity().PID
+	return p.child.PID()
 }
 
 // Close settles the managed Chrome process and removes the data dir.
 func (p *Proc) Close() error {
-	return p.CloseContext(context.Background())
+	ctx, cancel := context.WithTimeout(context.Background(), childSettlementTimeout)
+	defer cancel()
+	return p.CloseContext(ctx)
 }
 
 // CloseContext settles the managed Chrome process within ctx and removes the data dir.
 func (p *Proc) CloseContext(ctx context.Context) error {
 	p.closeOnce.Do(func() {
-		p.closeErr = errors.Join(p.transport.Close(), p.process.Stop(ctx), os.RemoveAll(p.dataDir))
-		if p.stderrDone != nil {
-			select {
-			case err := <-p.stderrDone:
-				p.closeErr = errors.Join(p.closeErr, err)
-			case <-ctx.Done():
-				p.closeErr = errors.Join(p.closeErr, ctx.Err())
-			}
-		}
+		_, stopErr := p.child.Stop(ctx)
+		p.closeErr = errors.Join(p.transport.Close(), stopErr, p.child.StderrErr(), os.RemoveAll(p.dataDir))
 	})
 	return p.closeErr
-}
-
-type pipeTransport struct {
-	reader *os.File
-	writer *os.File
-	once   sync.Once
-	err    error
-}
-
-func (p *pipeTransport) Read(payload []byte) (int, error)  { return p.reader.Read(payload) }
-func (p *pipeTransport) Write(payload []byte) (int, error) { return p.writer.Write(payload) }
-func (p *pipeTransport) Close() error {
-	p.once.Do(func() { p.err = errors.Join(p.reader.Close(), p.writer.Close()) })
-	return p.err
 }
 
 // ResolveHostBinary returns the Google Chrome executable path, erroring if

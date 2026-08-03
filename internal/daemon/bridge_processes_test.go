@@ -3,94 +3,49 @@ package daemon
 import (
 	"context"
 	"crypto/sha256"
-	"errors"
+	"encoding/json"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"testing"
 	"time"
 
-	"github.com/yasyf/daemonkit/proc"
+	"github.com/yasyf/daemonkit"
 	"golang.org/x/sync/semaphore"
 
 	"github.com/yasyf/cookiesync/internal/paths"
 )
 
-func bridgeTestGeneration(label string) proc.OwnerGeneration {
-	digest := sha256.Sum256([]byte(label))
-	var generation proc.OwnerGeneration
-	copy(generation[:], digest[:])
-	return generation
-}
-
-func activateBridgeChildren(t *testing.T, processes *bridgeProcesses) {
+// bridgeTestScope opens a real daemonkit ownership scope over a per-test record
+// and returns the Ctx the bridge spawns through — the same value Serve hands
+// Prepare, so product code runs unchanged under a test.
+func bridgeTestScope(t *testing.T) daemonkit.Ctx {
 	t.Helper()
-	if err := processes.children.ClaimRuntime(); err != nil {
-		t.Fatal(err)
-	}
-	if err := processes.children.Recover(t.Context()); err != nil {
-		t.Fatal(err)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	t.Cleanup(cancel)
+	owned, err := daemonkit.OwnProcesses(ctx, filepath.Join(t.TempDir(), "children.db"))
+	if err != nil {
+		t.Fatalf("OwnProcesses: %v", err)
 	}
 	t.Cleanup(func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		if err := processes.children.Shutdown(ctx); err != nil {
-			t.Errorf("shutdown children: %v", err)
+		closeCtx, closeCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer closeCancel()
+		if err := owned.Close(closeCtx); err != nil {
+			t.Errorf("close ownership scope: %v", err)
 		}
 	})
+	return owned.Ctx(ctx)
 }
 
-func waitBridgeUntracked(t *testing.T, processes *bridgeProcesses, what string) {
+func testBridgeProcessesAt(t *testing.T, rolePath string) *bridgeProcesses {
 	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
-	for {
-		records, err := processes.reaper.Store.Load(t.Context())
-		if err != nil {
-			t.Fatal(err)
-		}
-		if len(records) == 0 {
-			return
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("%s: %+v", what, records)
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-}
-
-func startBridgeTestChild(
-	t *testing.T,
-	processes *bridgeProcesses,
-	path string,
-	args []string,
-	recorded func(context.Context, proc.ProcessReceipt) error,
-) (*proc.PreparedChild, error) {
-	t.Helper()
-	request, err := proc.NewSpawnRequest(proc.SpawnConfig{
-		RecoveryID: proc.RecoveryTaskID, Executable: path, Args: args,
-		Stdin: proc.StdioNull, Stdout: proc.StdioNull, Stderr: proc.StdioNull,
-	})
+	processes, err := newBridgeProcesses(rolePath, bridgeTestScope(t))
 	if err != nil {
-		return nil, err
+		t.Fatalf("newBridgeProcesses: %v", err)
 	}
-	child, receipt, err := processes.children.Prepare(t.Context(), request)
-	if err != nil {
-		return nil, err
-	}
-	if recorded != nil {
-		if err := recorded(t.Context(), receipt); err != nil {
-			return nil, errors.Join(err, child.Stop(context.Background()))
-		}
-	}
-	if err := child.Start(t.Context()); err != nil {
-		return nil, errors.Join(err, child.Stop(context.Background()))
-	}
-	return child, nil
+	return processes
 }
 
 type blockingRecoveryRunner struct {
@@ -117,126 +72,25 @@ func (r *blockingRecoveryRunner) Run(ctx context.Context, target, cmd string, st
 	}
 }
 
-func TestBridgeRecoveryReapsLeaderlessGroupBeforeReceiptAcknowledgement(t *testing.T) {
+// TestBridgeRecoverySettlesTheCrashedGenerationsRemoteAuthority proves the
+// recovery contract end to end: a tunnel sidecar left by a dead generation is
+// discharged by closing the peer's half — with the capability off argv — and the
+// sidecar is then removed, taking the empty session with it.
+func TestBridgeRecoverySettlesTheCrashedGenerationsRemoteAuthority(t *testing.T) {
 	t.Setenv(paths.ConfigDirEnv, t.TempDir())
-	executable, err := os.Executable()
-	if err != nil {
-		t.Fatal(err)
-	}
-	old, err := newBridgeProcessesGeneration(executable, bridgeTestGeneration("old-generation"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	old.reaper.Grace = 50 * time.Millisecond
-	old.reaper.Settlement = time.Second
-
-	releaseLeader := filepath.Join(t.TempDir(), "release")
-	descendantFile := filepath.Join(t.TempDir(), "descendant")
-	script := fmt.Sprintf(
-		"while [ ! -f %s ]; do sleep 0.01; done; (trap '' TERM; exec sleep 30) & echo $! > %s; exit 0",
-		releaseLeader, descendantFile,
-	)
-	command := exec.Command("/bin/sh", "-c", script) //nolint:gosec // test-owned exact shell fixture.
-	command.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
-	if err := command.Start(); err != nil {
-		t.Fatal(err)
-	}
-	record, err := old.reaper.TrackGroup(t.Context(), command.Process.Pid, proc.RecoveryTaskID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	const sessionID = "leaderless-session"
-	if err := old.writeMetadata(t.Context(), bridgeRecoveryMetadata{
-		Schema: bridgeRecoverySchemaV1, SessionID: sessionID, Kind: bridgeProcessTunnel,
-		Process: bridgeIdentityFromRecord(record), Endpoint: "you@desktop:chrome:Default",
-		Host: "you@desktop", Capability: "cap-b-secret",
-	}); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(releaseLeader, []byte("go"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := command.Wait(); err != nil {
-		t.Fatal(err)
-	}
-	descendantRaw, err := os.ReadFile(descendantFile) //nolint:gosec // test-owned exact path.
-	if err != nil {
-		t.Fatal(err)
-	}
-	descendant, err := strconv.Atoi(strings.TrimSpace(string(descendantRaw)))
-	if err != nil {
-		t.Fatal(err)
+	crashed := testBridgeProcessesAt(t, "/bin/sh")
+	const sessionID = "crashed-session"
+	if err := crashed.record(bridgeProcessTunnel, sessionID, "you@desktop:chrome:Default", "you@desktop", "cap-b-secret"); err != nil {
+		t.Fatalf("record tunnel liability: %v", err)
 	}
 
-	next, err := newBridgeProcessesGeneration(executable, bridgeTestGeneration("next-generation"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	next.reaper.Grace = 50 * time.Millisecond
-	next.reaper.Settlement = time.Second
-	activateBridgeChildren(t, next)
-	deletionStarted := make(chan struct{})
-	deletionRelease := make(chan struct{})
-	var deletionOnce sync.Once
-	next.syncDir = func(path string) error {
-		if path == next.sessionsRoot {
-			deletionOnce.Do(func() { close(deletionStarted) })
-			<-deletionRelease
-		}
-		return syncDirectory(path)
-	}
+	next := testBridgeProcessesAt(t, "/bin/sh")
 	runner := &blockingRecoveryRunner{started: make(chan struct{}), release: make(chan struct{})}
-	done := make(chan error, 1)
-	go func() { done <- next.settleRecovery(context.Background(), runner) }()
-	select {
-	case <-runner.started:
-	case <-time.After(5 * time.Second):
-		t.Fatal("recovery did not reach remote-close settlement")
-	}
-
-	page, err := next.reaper.ReapReceipts(t.Context(), proc.RecoveryTaskID, proc.ReapReceiptCursor{}, proc.ReapReceiptPageLimit)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(page.Receipts) != 1 || page.Receipts[0].Record != record {
-		t.Fatalf("receipt before product settlement = %+v", page.Receipts)
-	}
-	metadataName, err := bridgeRecoveryFileName(bridgeProcessTunnel, bridgeIdentityFromRecord(record))
-	if err != nil {
-		t.Fatal(err)
-	}
-	metadataPath := filepath.Join(next.sessionDir(sessionID), metadataName)
-	if _, err := os.Stat(metadataPath); err != nil {
-		t.Fatalf("product liability disappeared before receipt ack: %v", err)
-	}
 	close(runner.release)
-	select {
-	case <-deletionStarted:
-	case <-time.After(5 * time.Second):
-		t.Fatal("recovery did not durably remove product metadata")
-	}
-	page, err = next.reaper.ReapReceipts(t.Context(), proc.RecoveryTaskID, proc.ReapReceiptCursor{}, proc.ReapReceiptPageLimit)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(page.Receipts) != 1 || page.Receipts[0].Record != record {
-		t.Fatalf("receipt acknowledged before parent directory sync = %+v", page.Receipts)
-	}
-	close(deletionRelease)
-	if err := <-done; err != nil {
-		t.Fatalf("recover: %v", err)
+	if err := next.settleRecovery(t.Context(), runner); err != nil {
+		t.Fatalf("settleRecovery: %v", err)
 	}
 
-	page, err = next.reaper.ReapReceipts(t.Context(), proc.RecoveryTaskID, proc.ReapReceiptCursor{}, proc.ReapReceiptPageLimit)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(page.Receipts) != 0 {
-		t.Fatalf("receipt remained after product settlement: %+v", page.Receipts)
-	}
-	if _, err := os.Stat(next.sessionDir(sessionID)); !os.IsNotExist(err) {
-		t.Fatalf("recovered session residue remains: %v", err)
-	}
 	runner.mu.Lock()
 	target, cmd, stdin := runner.target, runner.cmd, runner.stdin
 	runner.mu.Unlock()
@@ -246,119 +100,276 @@ func TestBridgeRecoveryReapsLeaderlessGroupBeforeReceiptAcknowledgement(t *testi
 	if strings.Contains(cmd, "cap-b-secret") {
 		t.Fatalf("capability leaked into argv: %q", cmd)
 	}
-	deadline := time.Now().Add(5 * time.Second)
-	for syscall.Kill(descendant, 0) == nil && time.Now().Before(deadline) {
-		time.Sleep(10 * time.Millisecond)
-	}
-	if syscall.Kill(descendant, 0) == nil {
-		t.Fatalf("leaderless descendant %d survived recovery", descendant)
+	if _, err := os.Stat(next.sessionDir(sessionID)); !os.IsNotExist(err) {
+		t.Fatalf("recovered session residue remains: %v", err)
 	}
 }
 
-func TestBridgeRecordedFailsClosedWhenSessionParentSyncFails(t *testing.T) {
+// TestBridgeRecoveryLeavesNoLiabilityUnsettled proves every surviving sidecar is
+// discharged, not just the first, and that a local kind settles without reaching
+// for a peer.
+func TestBridgeRecoveryLeavesNoLiabilityUnsettled(t *testing.T) {
 	t.Setenv(paths.ConfigDirEnv, t.TempDir())
-	processes, err := newBridgeProcessesGeneration("/bin/sh", bridgeTestGeneration("recorded-sync-generation"))
+	crashed := testBridgeProcessesAt(t, "/bin/sh")
+	if err := crashed.record(bridgeProcessTunnel, "proxy-session", "you@desktop:chrome:Default", "you@desktop", "cap-b"); err != nil {
+		t.Fatal(err)
+	}
+	if err := crashed.record(bridgeProcessKeepalive, "proxy-session", "you@desktop:chrome:Default", "", ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := crashed.record(bridgeProcessChrome, "local-session", "chrome:Default", "", ""); err != nil {
+		t.Fatal(err)
+	}
+
+	next := testBridgeProcessesAt(t, "/bin/sh")
+	if err := next.settleRecovery(t.Context(), &recordingRunner{}); err != nil {
+		t.Fatalf("settleRecovery: %v", err)
+	}
+	matches, err := filepath.Glob(filepath.Join(next.sessionsRoot, "*", "*"+bridgeProcessSuffix))
 	if err != nil {
 		t.Fatal(err)
 	}
-	activateBridgeChildren(t, processes)
-	if err := processes.prepareRecoveryRoots(); err != nil {
+	if len(matches) != 0 {
+		t.Fatalf("sidecars left unsettled: %v", matches)
+	}
+	entries, err := os.ReadDir(next.sessionsRoot)
+	if err != nil {
 		t.Fatal(err)
 	}
-	errSync := errors.New("test session parent sync failure")
-	processes.syncDir = func(path string) error {
-		if path == processes.sessionsRoot {
-			return errSync
-		}
-		return syncDirectory(path)
+	if len(entries) != 0 {
+		t.Fatalf("empty sessions remain after recovery: %v", entries)
 	}
-	marker := filepath.Join(t.TempDir(), "executed")
-	_, err = startBridgeTestChild(t, processes, "/bin/sh", []string{"-c", "printf executed > " + marker},
-		processes.recorded(
-			bridgeProcessChrome, "recorded-sync", "chrome:Default", "", "",
-		),
-	)
-	if !errors.Is(err, errSync) {
-		t.Fatalf("Start = %v, want parent sync failure", err)
-	}
-	if _, err := os.Stat(marker); !os.IsNotExist(err) {
-		t.Fatalf("child crossed execution gate after sync failure: %v", err)
-	}
-	waitBridgeUntracked(t, processes, "rejected record remains tracked")
 }
 
-func TestBridgeRecoveryKeepsOneSidecarPerProcessAttempt(t *testing.T) {
+// TestBridgeRecordKeepsOneSidecarPerSessionKind proves the sidecar is keyed on
+// session and kind alone: a re-attempt within one session overwrites rather than
+// accumulating, so recovery discharges each liability exactly once.
+func TestBridgeRecordKeepsOneSidecarPerSessionKind(t *testing.T) {
 	t.Setenv(paths.ConfigDirEnv, t.TempDir())
-	processes, err := newBridgeProcessesGeneration("/bin/sh", bridgeTestGeneration("attempt-sidecar-generation"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	activateBridgeChildren(t, processes)
+	processes := testBridgeProcessesAt(t, "/bin/sh")
 	const sessionID = "multi-attempt-session"
 	for range 2 {
-		process, err := startBridgeTestChild(t, processes, "/bin/sleep", []string{"30"},
-			processes.recorded(
-				bridgeProcessTunnel, sessionID, "you@desktop:chrome:Default", "you@desktop", "cap-b-secret",
-			),
-		)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if err := process.Stop(t.Context()); err != nil {
+		if err := processes.record(bridgeProcessTunnel, sessionID, "you@desktop:chrome:Default", "you@desktop", "cap-b-secret"); err != nil {
 			t.Fatal(err)
 		}
 	}
-	matches, err := filepath.Glob(filepath.Join(
-		processes.sessionDir(sessionID), string(bridgeProcessTunnel)+"-*"+bridgeProcessSuffix,
-	))
+	matches, err := filepath.Glob(filepath.Join(processes.sessionDir(sessionID), "*"+bridgeProcessSuffix))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(matches) != 2 {
-		t.Fatalf("sidecars after two process attempts = %v, want two exact liabilities", matches)
+	if len(matches) != 1 {
+		t.Fatalf("sidecars after two attempts = %v, want one liability per session kind", matches)
 	}
 	metadata, err := processes.loadMetadata()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(metadata) != 2 || metadata[0].Process == metadata[1].Process {
-		t.Fatalf("recovery metadata = %+v, want two distinct process records", metadata)
+	if len(metadata) != 1 || metadata[0].Kind != bridgeProcessTunnel || metadata[0].Capability != "cap-b-secret" {
+		t.Fatalf("recovery metadata = %+v, want one exact tunnel liability", metadata)
 	}
 }
 
-func TestBridgeProcessShutdownLeavesNoAuthorityOrMetadata(t *testing.T) {
+// TestBridgeRecordRefusesMisdeclaredAuthority proves the sidecar cannot record a
+// local kind carrying remote authority, nor a tunnel without it, so a malformed
+// liability never reaches disk.
+func TestBridgeRecordRefusesMisdeclaredAuthority(t *testing.T) {
 	t.Setenv(paths.ConfigDirEnv, t.TempDir())
-	processes, err := newBridgeProcessesGeneration("/bin/sh", bridgeTestGeneration("shutdown-generation"))
-	if err != nil {
-		t.Fatal(err)
+	processes := testBridgeProcessesAt(t, "/bin/sh")
+	tests := []struct {
+		name       string
+		kind       bridgeProcessKind
+		host       string
+		capability string
+	}{
+		{name: "chrome with remote authority", kind: bridgeProcessChrome, host: "you@desktop", capability: "cap-b"},
+		{name: "keepalive with remote authority", kind: bridgeProcessKeepalive, host: "you@desktop", capability: "cap-b"},
+		{name: "tunnel without host", kind: bridgeProcessTunnel, capability: "cap-b"},
+		{name: "tunnel without capability", kind: bridgeProcessTunnel, host: "you@desktop"},
 	}
-	const sessionID = "shutdown-session"
-	activateBridgeChildren(t, processes)
-	process, err := startBridgeTestChild(t, processes, "/bin/sh", []string{"-c", "trap '' TERM; while :; do sleep 1; done"},
-		processes.recorded(
-			bridgeProcessChrome, sessionID, "chrome:Default", "", "",
-		),
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := process.Stop(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.RemoveAll(processes.sessionDir(sessionID)); err != nil {
-		t.Fatal(err)
-	}
-	waitBridgeUntracked(t, processes, "shutdown records")
-	page, err := processes.reaper.ReapReceipts(t.Context(), proc.RecoveryTaskID, proc.ReapReceiptCursor{}, proc.ReapReceiptPageLimit)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(page.Receipts) != 0 {
-		t.Fatalf("shutdown receipts = %+v", page.Receipts)
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := processes.record(tc.kind, "session", "chrome:Default", tc.host, tc.capability); err == nil {
+				t.Fatal("record accepted misdeclared authority")
+			}
+		})
 	}
 	matches, err := filepath.Glob(filepath.Join(processes.sessionsRoot, "*", "*"+bridgeProcessSuffix))
 	if err != nil || len(matches) != 0 {
-		t.Fatalf("shutdown metadata = %v, err %v", matches, err)
+		t.Fatalf("refused records reached disk = %v, err %v", matches, err)
+	}
+}
+
+// TestBridgeRecoveryRefusesMetadataFromAForeignSession proves a sidecar whose
+// payload names a different session than its path is refused rather than
+// settled, so a moved or forged file cannot redirect a peer close.
+func TestBridgeRecoveryRefusesMetadataFromAForeignSession(t *testing.T) {
+	t.Setenv(paths.ConfigDirEnv, t.TempDir())
+	processes := testBridgeProcessesAt(t, "/bin/sh")
+	if err := processes.record(bridgeProcessTunnel, "real-session", "you@desktop:chrome:Default", "you@desktop", "cap-b"); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(filepath.Join(processes.sessionDir("real-session"), bridgeRecoveryFileName(bridgeProcessTunnel)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	foreign, err := processes.prepareSessionDir("foreign-session")
+	if err != nil {
+		t.Fatal(err)
+	}
+	forged := filepath.Join(foreign, bridgeRecoveryFileName(bridgeProcessTunnel))
+	if err := os.WriteFile(forged, raw, 0o600); err != nil { //nolint:gosec // fixed name under the test's own session root.
+		t.Fatal(err)
+	}
+	if _, err := processes.loadMetadata(); err == nil {
+		t.Fatal("loadMetadata accepted a sidecar whose path contradicts its payload")
+	}
+}
+
+// writeLegacySidecar writes one v0.20-format sidecar: the payload carried a
+// process-identity tuple, and the file name appended that tuple's digest, so a
+// session could hold several per kind.
+func writeLegacySidecar(t *testing.T, p *bridgeProcesses, sessionID string, kind bridgeProcessKind, host, capability, salt string) string {
+	t.Helper()
+	dir, err := p.prepareSessionDir(sessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := map[string]any{
+		"schema": bridgeRecoverySchemaV1, "session_id": sessionID, "kind": kind,
+		"process":  map[string]any{"pid": 4242, "start_time": "1000", "boot": "b", "generation": salt},
+		"endpoint": "you@desktop:chrome:Default",
+	}
+	if host != "" {
+		payload["host"], payload["capability"] = host, capability
+	}
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest := sha256.Sum256([]byte(salt))
+	path := filepath.Join(dir, fmt.Sprintf("%s-%x%s", kind, digest, bridgeProcessSuffix))
+	if err := os.WriteFile(path, raw, 0o600); err != nil { //nolint:gosec // fixed name under the test's own session root.
+		t.Fatal(err)
+	}
+	return path
+}
+
+// TestBridgeRecoverySettlesLegacySidecars proves a v0.20 sidecar left by a
+// pre-upgrade generation is settled rather than dropped: it can name a bridge
+// still open on the peer, and the old payload already carried the host and
+// capability the close needs. The identity tuple it also carried is ignored.
+func TestBridgeRecoverySettlesLegacySidecars(t *testing.T) {
+	t.Setenv(paths.ConfigDirEnv, t.TempDir())
+	crashed := testBridgeProcessesAt(t, "/bin/sh")
+	writeLegacySidecar(t, crashed, "legacy-proxy", bridgeProcessTunnel, "you@desktop", "cap-b-secret", "one")
+	writeLegacySidecar(t, crashed, "legacy-local", bridgeProcessChrome, "", "", "two")
+
+	next := testBridgeProcessesAt(t, "/bin/sh")
+	runner := &blockingRecoveryRunner{started: make(chan struct{}), release: make(chan struct{})}
+	close(runner.release)
+	if err := next.settleRecovery(t.Context(), runner); err != nil {
+		t.Fatalf("settleRecovery over legacy sidecars: %v", err)
+	}
+	runner.mu.Lock()
+	target, cmd, stdin := runner.target, runner.cmd, runner.stdin
+	runner.mu.Unlock()
+	if target != "you@desktop" || !strings.Contains(cmd, "bridge_close") || !strings.Contains(stdin, "cap-b-secret") {
+		t.Fatalf("legacy remote close = target %q cmd %q stdin %q", target, cmd, stdin)
+	}
+	matches, err := filepath.Glob(filepath.Join(next.sessionsRoot, "*", "*"+bridgeProcessSuffix))
+	if err != nil || len(matches) != 0 {
+		t.Fatalf("legacy sidecars survived recovery = %v, err %v", matches, err)
+	}
+}
+
+// TestBridgeRecoverySettlesEveryLegacyAttempt proves the per-attempt multiplicity
+// the old format allowed is preserved through recovery: a session that recorded
+// several tunnel attempts has every one of them discharged.
+func TestBridgeRecoverySettlesEveryLegacyAttempt(t *testing.T) {
+	t.Setenv(paths.ConfigDirEnv, t.TempDir())
+	crashed := testBridgeProcessesAt(t, "/bin/sh")
+	for _, salt := range []string{"attempt-one", "attempt-two", "attempt-three"} {
+		writeLegacySidecar(t, crashed, "legacy-retries", bridgeProcessTunnel, "you@desktop", "cap-"+salt, salt)
+	}
+	next := testBridgeProcessesAt(t, "/bin/sh")
+	metadata, err := next.loadMetadata()
+	if err != nil {
+		t.Fatalf("loadMetadata over legacy attempts: %v", err)
+	}
+	if len(metadata) != 3 {
+		t.Fatalf("legacy attempts loaded = %d, want 3", len(metadata))
+	}
+	runner := &recordingRunner{}
+	if err := next.settleRecovery(t.Context(), runner); err != nil {
+		t.Fatalf("settleRecovery: %v", err)
+	}
+	if _, err := os.Stat(next.sessionDir("legacy-retries")); !os.IsNotExist(err) {
+		t.Fatalf("legacy session residue remains: %v", err)
+	}
+}
+
+// TestParseSidecarNameSeparatesTheTwoFormats proves the name alone decides which
+// decoder reads a file, and that a name matching neither format is refused
+// rather than guessed at.
+func TestParseSidecarNameSeparatesTheTwoFormats(t *testing.T) {
+	digest := fmt.Sprintf("%x", sha256.Sum256([]byte("x")))
+	tests := []struct {
+		name       string
+		base       string
+		wantKind   bridgeProcessKind
+		wantLegacy bool
+		wantOK     bool
+	}{
+		{name: "current", base: "tunnel" + bridgeProcessSuffix, wantKind: bridgeProcessTunnel, wantOK: true},
+		{name: "legacy", base: "tunnel-" + digest + bridgeProcessSuffix, wantKind: bridgeProcessTunnel, wantLegacy: true, wantOK: true},
+		{name: "unknown kind", base: "wormhole" + bridgeProcessSuffix},
+		{name: "legacy short digest", base: "tunnel-abc" + bridgeProcessSuffix},
+		{name: "legacy non-hex digest", base: "tunnel-" + strings.Repeat("z", 64) + bridgeProcessSuffix},
+		{name: "wrong suffix", base: "tunnel.json"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, ok := parseSidecarName(tc.base)
+			if ok != tc.wantOK {
+				t.Fatalf("parseSidecarName(%q) ok = %v, want %v", tc.base, ok, tc.wantOK)
+			}
+			if ok && (got.kind != tc.wantKind || got.legacy != tc.wantLegacy) {
+				t.Fatalf("parseSidecarName(%q) = %+v, want kind %q legacy %v", tc.base, got, tc.wantKind, tc.wantLegacy)
+			}
+		})
+	}
+}
+
+// TestBridgeRecoveryRefusesUnknownLegacyFields proves the legacy decoder widens
+// for the retired identity tuple and nothing else, so a foreign field in an old
+// sidecar is still a loud failure.
+func TestBridgeRecoveryRefusesUnknownLegacyFields(t *testing.T) {
+	raw, err := json.Marshal(map[string]any{
+		"schema": bridgeRecoverySchemaV1, "session_id": "s", "kind": bridgeProcessChrome,
+		"process":  map[string]any{"pid": 1},
+		"endpoint": "chrome:Default", "unexpected": true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := decodeLegacyRecoveryMetadata(raw); err == nil {
+		t.Fatal("decodeLegacyRecoveryMetadata accepted an unknown field")
+	}
+}
+
+// TestBridgeRecoveryRefusesUnknownMetadataFields proves the sidecar decodes
+// strictly, so a field a newer generation added is a loud failure rather than a
+// silently dropped liability.
+func TestBridgeRecoveryRefusesUnknownMetadataFields(t *testing.T) {
+	raw, err := json.Marshal(map[string]any{
+		"schema": bridgeRecoverySchemaV1, "session_id": "s", "kind": bridgeProcessChrome,
+		"endpoint": "chrome:Default", "unexpected": true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := decodeRecoveryMetadata(raw); err == nil {
+		t.Fatal("decodeRecoveryMetadata accepted an unknown field")
 	}
 }
 

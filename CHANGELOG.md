@@ -4,7 +4,48 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.28.0] - 2026-08-03
+
+### Changed
+- Hard-cut to daemonkit v0.21.2 and Synckit v0.37.0. Ten daemonkit packages are
+  gone, so this is a refactor rather than a version bump: subprocess
+  supervision, the wire lanes, and durable writes all move to the new root
+  surface. Bridge children (Chrome, the ssh forward, the ssh keepalive) are
+  spawned through the daemon's own process-ownership scope, and the resident
+  helper is reached by name — the socket derives from its launchd label, so no
+  caller names a path.
+- **Re-run `cookiesync install` after upgrading.** The registered Synckit
+  manifest no longer carries a service socket, and manifest decoding is strict:
+  a manifest written by an earlier version now fails to decode rather than
+  being ignored.
+- Rebuild bridge crash recovery on daemonkit's reclaim-at-open guarantee. The
+  previous generation's children are settled before the product prepares, so a
+  recovery sidecar found on disk always names a process that is already gone.
+  Each sidecar is keyed on its session and kind, published before its child is
+  spawned, and discharged at the next start — closing the peer's half of a
+  leaked bridge — rather than correlated against a reap-receipt ledger.
+- Narrow the bridge crash window. A sidecar is now published *before* its child
+  is spawned, so a crash mid-open leaves a stale record whose cleanup is
+  idempotent, where it previously could leave a running process with nothing
+  recorded against it. Recovery settles a sidecar it cannot match to anything
+  rather than skipping it.
+- Settle sidecars written by pre-upgrade versions. Their payload already carried
+  the host and capability a peer-side close needs, so an upgrade discharges them
+  instead of dropping them: a bridge left open on a peer by the version you
+  upgraded from is still closed. The process-identity tuple they also carried is
+  ignored, and no manual cleanup is required.
+
+### Fixed
+- Settle the bridge stop signal when the drain begins rather than when the
+  product drains. daemonkit settles in-flight requests before it runs the
+  product's Drain, so a peer holding `bridge_keepalive` open — the normal state
+  for the life of a proxied bridge — stalled every shutdown for its whole share
+  of the shutdown budget.
+
+### Removed
+- The daemonkit verifier-child role. Peer code identity is now verified from
+  the kernel alone, so the role has no successor and the binary no longer
+  dispatches it before command parsing.
 
 ## [0.27.4] - 2026-07-27
 
@@ -413,7 +454,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `synckitd install` now owns the agents. The host mesh is read from the shared
   `~/.config/synckit`.
 
-[Unreleased]: https://github.com/yasyf/cookiesync/compare/v0.27.4...HEAD
+[0.28.0]: https://github.com/yasyf/cookiesync/compare/v0.27.4...v0.28.0
 [0.27.4]: https://github.com/yasyf/cookiesync/compare/v0.27.3...v0.27.4
 [0.27.3]: https://github.com/yasyf/cookiesync/compare/v0.27.2...v0.27.3
 [0.27.2]: https://github.com/yasyf/cookiesync/compare/v0.27.1...v0.27.2

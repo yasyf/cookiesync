@@ -266,19 +266,22 @@ func (d *Daemon) tryRemoteBridgeOpen(ctx context.Context, self, host, browser, p
 	if err != nil {
 		return nil, false, fmt.Errorf("create proxy bridge dir: %w", err)
 	}
+	if err := d.processes.record(bridgeProcessTunnel, sessionID, reply.Endpoint, host, reply.Capability); err != nil {
+		return nil, false, err
+	}
 	tunnel, err = d.openTunnel(sessionCtx, bridge.TunnelSpec{
 		Host: host, LocalPort: port, RemotePort: reply.ProxyPort, Token: token, WantWSURL: reply.URL,
-	}, d.processes.recorded(bridgeProcessTunnel, sessionID, reply.Endpoint, host, reply.Capability))
+	})
 	if err != nil {
 		// Only a local-bind collision re-opens; every other ssh exit is terminal,
 		// never re-tapping the peer's consent.
 		return nil, errors.Is(err, bridge.ErrTunnelBindCollision), fmt.Errorf("forward to %s bridge: %w", host, err)
 	}
 
-	keepalive, err = d.openKeepalive(
-		sessionCtx, host, tunnel.HostAddr(), reply.Capability,
-		d.processes.recorded(bridgeProcessKeepalive, sessionID, reply.Endpoint, "", ""),
-	)
+	if err := d.processes.record(bridgeProcessKeepalive, sessionID, reply.Endpoint, "", ""); err != nil {
+		return nil, false, err
+	}
+	keepalive, err = d.openKeepalive(sessionCtx, host, tunnel.HostAddr(), reply.Capability)
 	if err != nil {
 		return nil, false, fmt.Errorf("supervise %s bridge: %w", host, err)
 	}

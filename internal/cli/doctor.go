@@ -138,25 +138,21 @@ func checkHelper(ctx context.Context) check {
 	return check{label: "key helper", ok: true, detail: fmt.Sprintf("%s (Developer ID signed, key-helper contract supported)", binary)}
 }
 
-// checkSocket confirms the resident helper's RPC socket is bound AND speaks the typed
-// sync contract synckitd drives — the "is the helper up and serving svc.*?" check. It
-// dials the socket and round-trips svc.capabilities, the lightest typed call (no cookie
-// store read, no SE key), so a green line proves the contract is live end to end through
-// the same resident socket Synckit targets for export, apply, and reconciliation.
+// checkSocket confirms the resident helper is reachable AND speaks the typed sync
+// contract synckitd drives — the "is the helper up and serving svc.*?" check. It opens
+// the helper by name and round-trips svc.capabilities, the lightest typed call (no
+// cookie store read, no SE key), so a green line proves the contract is live end to end
+// through the same resident helper Synckit targets for export, apply, and
+// reconciliation.
 func checkSocket(ctx context.Context) check {
-	sock, err := paths.SockPath()
-	if err != nil {
-		return check{label: "helper socket", detail: err.Error()}
-	}
 	probeCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
-	client := syncservice.NewClient(syncservice.Socket(sock))
+	client := syncservice.NewClient(syncservice.Resident(paths.ToolName))
 	defer func() { _ = client.Close() }()
-	_, err = client.Capabilities(probeCtx)
-	if err != nil {
-		return check{label: "helper socket", detail: fmt.Sprintf("not serving the typed contract at %s; run 'synckitd install' to start the resident helper (cookiesync helper-serve): %v", sock, err)}
+	if _, err := client.Capabilities(probeCtx); err != nil {
+		return check{label: "helper socket", detail: fmt.Sprintf("not serving the typed contract; run 'synckitd install' to start the resident helper (cookiesync helper-serve): %v", err)}
 	}
-	return check{label: "helper socket", ok: true, detail: fmt.Sprintf("%s (typed svc contract)", sock)}
+	return check{label: "helper socket", ok: true, detail: "resident helper (typed svc contract)"}
 }
 
 // keyCacheStatus is the slice of the auth_status reply the key-cache check reads: the
@@ -240,7 +236,7 @@ func checkManifest(_ context.Context) check {
 	if err != nil {
 		return check{label: "manifest", detail: fmt.Sprintf("registered at %s but does not validate (stale schema); re-run 'cookiesync install': %v", path, err)}
 	}
-	if m.Service.Kind != "resident" || m.Service.Socket == "" || m.Service.SchemaFingerprint != transfer.Fingerprint {
+	if m.Service.Kind != "resident" || m.Service.SchemaFingerprint != transfer.Fingerprint {
 		return check{label: "manifest", detail: fmt.Sprintf("service contract = %+v at %s, want exact resident transfer contract; re-run 'cookiesync install'", m.Service, path)}
 	}
 	return check{label: "manifest", ok: true, detail: path}

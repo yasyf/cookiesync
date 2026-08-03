@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -11,11 +12,10 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"time"
 
-	"github.com/yasyf/daemonkit/proc"
-	"github.com/yasyf/daemonkit/worker"
+	"github.com/yasyf/daemonkit/durable"
 
+	"github.com/yasyf/cookiesync/internal/bridge"
 	"github.com/yasyf/cookiesync/internal/engine"
 	"github.com/yasyf/cookiesync/internal/paths"
 )
@@ -35,46 +35,22 @@ const (
 	bridgeProcessKeepalive bridgeProcessKind = "keepalive"
 )
 
+// bridgeRecoveryMetadata is the sidecar naming one bridge child's product
+// liability — what must still be settled if this daemon dies holding it. It is
+// published before the child is spawned and lives in the session directory a
+// clean close removes wholesale, so exactly the crashed generation's sidecars
+// survive into the next start. It carries no process identity: daemonkit
+// reclaims the prior generation's children before Prepare runs, so a sidecar
+// found at start names a process that is already gone.
 type bridgeRecoveryMetadata struct {
-	Schema     uint64                `json:"schema"`
-	SessionID  string                `json:"session_id"`
-	Kind       bridgeProcessKind     `json:"kind"`
-	Process    bridgeProcessIdentity `json:"process"`
-	Endpoint   string                `json:"endpoint"`
-	Host       string                `json:"host,omitempty"`
-	Capability string                `json:"capability,omitempty"`
+	Schema     uint64            `json:"schema"`
+	SessionID  string            `json:"session_id"`
+	Kind       bridgeProcessKind `json:"kind"`
+	Endpoint   string            `json:"endpoint"`
+	Host       string            `json:"host,omitempty"`
+	Capability string            `json:"capability,omitempty"`
 
 	path string
-}
-
-type bridgeProcessIdentity struct {
-	PID        int                  `json:"pid"`
-	StartTime  string               `json:"start_time"`
-	Boot       string               `json:"boot"`
-	Generation proc.OwnerGeneration `json:"generation"`
-}
-
-func bridgeIdentityFromReceipt(receipt proc.ProcessReceipt) bridgeProcessIdentity {
-	identity := receipt.ProcessIdentity()
-	return bridgeProcessIdentity{
-		PID: identity.PID, StartTime: identity.StartTime, Boot: identity.Boot,
-		Generation: receipt.OwnerGeneration(),
-	}
-}
-
-func bridgeIdentityFromRecord(record proc.Record) bridgeProcessIdentity {
-	return bridgeProcessIdentity{
-		PID: record.PID, StartTime: record.StartTime, Boot: record.Boot,
-		Generation: record.Generation,
-	}
-}
-
-func (i bridgeProcessIdentity) validate() error {
-	if i.PID <= 1 || i.StartTime == "" || i.Boot == "" ||
-		i.Generation == (proc.OwnerGeneration{}) {
-		return fmt.Errorf("bridge: recovery process identity is incomplete: pid=%d start=%q boot=%q generation=%q", i.PID, i.StartTime, i.Boot, i.Generation)
-	}
-	return nil
 }
 
 func (m bridgeRecoveryMetadata) validate() error {
@@ -83,9 +59,6 @@ func (m bridgeRecoveryMetadata) validate() error {
 	}
 	if m.SessionID == "" || filepath.Base(m.SessionID) != m.SessionID || m.Endpoint == "" {
 		return errors.New("bridge: recovery metadata has invalid session identity")
-	}
-	if err := m.Process.validate(); err != nil {
-		return err
 	}
 	switch m.Kind {
 	case bridgeProcessChrome, bridgeProcessKeepalive:
@@ -103,33 +76,14 @@ func (m bridgeRecoveryMetadata) validate() error {
 }
 
 type bridgeProcesses struct {
-	children     *proc.Manager
-	workers      *worker.Pool
-	reaper       *proc.Reaper
+	spawner      bridge.Spawner
 	recoveryRoot string
 	sessionsRoot string
 	rolePath     string
 	roleArgs     []string
-	syncDir      func(string) error
 }
 
-func newBridgeProcesses(rolePath string) (*bridgeProcesses, error) {
-	generation, err := proc.ProcessGeneration()
-	if err != nil {
-		return nil, err
-	}
-	return newBridgeProcessesGeneration(rolePath, generation)
-}
-
-func newBridgeProcessesGeneration(rolePath string, generation proc.OwnerGeneration) (*bridgeProcesses, error) {
-	childrenPath, err := paths.BridgeChildrenStorePath()
-	if err != nil {
-		return nil, err
-	}
-	workersPath, err := paths.BridgeWorkersStorePath()
-	if err != nil {
-		return nil, err
-	}
+func newBridgeProcesses(rolePath string, spawner bridge.Spawner) (*bridgeProcesses, error) {
 	sessionsRoot, err := paths.BridgeSessionsRoot()
 	if err != nil {
 		return nil, err
@@ -138,29 +92,8 @@ func newBridgeProcessesGeneration(rolePath string, generation proc.OwnerGenerati
 	if err != nil {
 		return nil, err
 	}
-	reaper := &proc.Reaper{
-		Store:      &proc.FileStore{Path: childrenPath, MaxOutstanding: 4 * bridgeProcessCapacity},
-		Generation: generation,
-		Grace:      500 * time.Millisecond,
-	}
-	children, err := proc.NewManager(bridgeProcessCapacity, reaper)
-	if err != nil {
-		return nil, err
-	}
-	workers, err := worker.NewPool(worker.Config{
-		Capacity: bridgeProcessCapacity, QueueCapacity: bridgeProcessCapacity,
-		MaxTotalRun: 12 * time.Minute, MaxStdinBytes: 16 << 20,
-		MaxStdoutBytes: 16 << 20, MaxStderrBytes: 1 << 20,
-	}, &proc.Reaper{
-		Store:      &proc.FileStore{Path: workersPath, MaxOutstanding: 4 * bridgeProcessCapacity},
-		Generation: generation, Grace: 500 * time.Millisecond,
-	})
-	if err != nil {
-		return nil, err
-	}
 	return &bridgeProcesses{
-		children: children, workers: workers, reaper: reaper, recoveryRoot: recoveryRoot, sessionsRoot: sessionsRoot,
-		rolePath: rolePath, syncDir: syncDirectory,
+		spawner: spawner, recoveryRoot: recoveryRoot, sessionsRoot: sessionsRoot, rolePath: rolePath,
 	}, nil
 }
 
@@ -169,17 +102,11 @@ func (p *bridgeProcesses) sessionDir(sessionID string) string {
 }
 
 func (p *bridgeProcesses) prepareRecoveryRoots() error {
-	if err := os.MkdirAll(p.recoveryRoot, 0o700); err != nil {
+	if err := durable.Mkdir(p.recoveryRoot, 0o700); err != nil {
 		return fmt.Errorf("bridge: create recovery root: %w", err)
 	}
-	if err := p.syncDir(filepath.Dir(p.recoveryRoot)); err != nil {
-		return fmt.Errorf("bridge: commit recovery root: %w", err)
-	}
-	if err := os.MkdirAll(p.sessionsRoot, 0o700); err != nil {
+	if err := durable.Mkdir(p.sessionsRoot, 0o700); err != nil {
 		return fmt.Errorf("bridge: create recovery sessions root: %w", err)
-	}
-	if err := p.syncDir(p.recoveryRoot); err != nil {
-		return fmt.Errorf("bridge: commit recovery sessions root: %w", err)
 	}
 	return nil
 }
@@ -192,34 +119,19 @@ func (p *bridgeProcesses) prepareSessionDir(sessionID string) (string, error) {
 		return "", err
 	}
 	dir := p.sessionDir(sessionID)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
+	if err := durable.Mkdir(dir, 0o700); err != nil {
 		return "", fmt.Errorf("bridge: create recovery session: %w", err)
-	}
-	if err := p.syncDir(p.sessionsRoot); err != nil {
-		return "", fmt.Errorf("bridge: commit recovery session: %w", err)
 	}
 	return dir, nil
 }
 
-func (p *bridgeProcesses) recorded(
-	kind bridgeProcessKind,
-	sessionID, endpoint, host, capability string,
-) func(context.Context, proc.ProcessReceipt) error {
-	return func(ctx context.Context, receipt proc.ProcessReceipt) error {
-		if !receipt.Prepared() {
-			return errors.New("bridge: process receipt is not live")
-		}
-		metadata := bridgeRecoveryMetadata{
-			Schema: bridgeRecoverySchemaV1, SessionID: sessionID, Kind: kind,
-			Process: bridgeIdentityFromReceipt(receipt), Endpoint: endpoint, Host: host, Capability: capability,
-		}
-		return p.writeMetadata(ctx, metadata)
-	}
-}
-
-func (p *bridgeProcesses) writeMetadata(ctx context.Context, metadata bridgeRecoveryMetadata) error {
-	if err := ctx.Err(); err != nil {
-		return err
+// record publishes one child's recovery sidecar. It runs before the spawn, so a
+// crash between the two leaves a settleable liability rather than an unrecorded
+// process.
+func (p *bridgeProcesses) record(kind bridgeProcessKind, sessionID, endpoint, host, capability string) error {
+	metadata := bridgeRecoveryMetadata{
+		Schema: bridgeRecoverySchemaV1, SessionID: sessionID, Kind: kind,
+		Endpoint: endpoint, Host: host, Capability: capability,
 	}
 	if err := metadata.validate(); err != nil {
 		return err
@@ -232,101 +144,27 @@ func (p *bridgeProcesses) writeMetadata(ctx context.Context, metadata bridgeReco
 	if err != nil {
 		return fmt.Errorf("bridge: encode recovery metadata: %w", err)
 	}
-	name, err := bridgeRecoveryFileName(metadata.Kind, metadata.Process)
-	if err != nil {
-		return err
+	if err := durable.WriteFile(filepath.Join(dir, bridgeRecoveryFileName(kind)), raw, 0o600); err != nil {
+		return fmt.Errorf("bridge: publish recovery metadata: %w", err)
 	}
-	final := filepath.Join(dir, name)
-	tmp := final + ".tmp"
-	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600) //nolint:gosec // fixed file below the private session root.
-	if err != nil {
-		return fmt.Errorf("bridge: create recovery metadata: %w", err)
-	}
-	_, writeErr := f.Write(raw)
-	syncErr := f.Sync()
-	closeErr := f.Close()
-	if err := errors.Join(writeErr, syncErr, closeErr); err != nil {
-		return fmt.Errorf("bridge: persist recovery metadata: %w", err)
-	}
-	if err := os.Rename(tmp, final); err != nil {
-		return fmt.Errorf("bridge: commit recovery metadata: %w", err)
-	}
-	return p.syncDir(dir)
+	return nil
 }
 
+// settleRecovery discharges every liability the previous generation left
+// behind. daemonkit reclaimed that generation's children before Prepare ran, so
+// each surviving sidecar names a process that is already gone and a product
+// cleanup that never ran.
 func (p *bridgeProcesses) settleRecovery(ctx context.Context, runner engine.SSHRunner) error {
-	if _, err := p.children.RecoveryReceipt(proc.RecoveryTaskID); err != nil {
-		return fmt.Errorf("bridge: require recovered child generation: %w", err)
-	}
 	if err := p.prepareRecoveryRoots(); err != nil {
-		return err
-	}
-	if err := p.removeUncommittedMetadata(); err != nil {
 		return err
 	}
 	metadata, err := p.loadMetadata()
 	if err != nil {
 		return err
 	}
-	byProcess := make(map[bridgeProcessIdentity]bridgeRecoveryMetadata, len(metadata))
 	for _, item := range metadata {
-		byProcess[item.Process] = item
-	}
-	var cursor proc.ReapReceiptCursor
-	for {
-		page, err := p.reaper.ReapReceipts(ctx, proc.RecoveryTaskID, cursor, proc.ReapReceiptPageLimit)
-		if err != nil {
-			return err
-		}
-		for _, receipt := range page.Receipts {
-			identity := bridgeIdentityFromRecord(receipt.Record)
-			item, ok := byProcess[identity]
-			if ok {
-				p.settleProduct(ctx, runner, item)
-				if err := p.removeMetadata(item); err != nil {
-					return err
-				}
-				delete(byProcess, identity)
-			}
-			if _, err := p.reaper.AcknowledgeReap(ctx, receipt); err != nil {
-				return err
-			}
-			cursor = proc.ReapReceiptCursor{LedgerID: receipt.LedgerID, Sequence: receipt.Sequence}
-		}
-		if !page.More {
-			break
-		}
-	}
-	active, err := p.reaper.Store.Load(ctx)
-	if err != nil {
-		return err
-	}
-	activeProcesses := make(map[bridgeProcessIdentity]struct{}, len(active))
-	for _, record := range active {
-		activeProcesses[bridgeIdentityFromRecord(record)] = struct{}{}
-	}
-	for identity, item := range byProcess {
-		if _, ok := activeProcesses[identity]; ok {
-			continue
-		}
 		p.settleProduct(ctx, runner, item)
 		if err := p.removeMetadata(item); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func (p *bridgeProcesses) removeUncommittedMetadata() error {
-	matches, err := filepath.Glob(filepath.Join(p.sessionsRoot, "*", "*"+bridgeProcessSuffix+".tmp"))
-	if err != nil {
-		return fmt.Errorf("bridge: scan uncommitted recovery metadata: %w", err)
-	}
-	for _, path := range matches {
-		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
-			return fmt.Errorf("bridge: remove uncommitted recovery metadata: %w", err)
-		}
-		if err := p.syncDir(filepath.Dir(path)); err != nil {
 			return err
 		}
 	}
@@ -340,27 +178,23 @@ func (p *bridgeProcesses) loadMetadata() ([]bridgeRecoveryMetadata, error) {
 	}
 	items := make([]bridgeRecoveryMetadata, 0, len(matches))
 	for _, path := range matches {
+		name, ok := parseSidecarName(filepath.Base(path))
+		if !ok {
+			return nil, fmt.Errorf("bridge: recovery metadata %s is not a sidecar name", path)
+		}
 		raw, err := os.ReadFile(path) //nolint:gosec // glob is rooted under the exact private recovery root.
 		if err != nil {
 			return nil, fmt.Errorf("bridge: read recovery metadata: %w", err)
 		}
-		var item bridgeRecoveryMetadata
-		decoder := json.NewDecoder(bytes.NewReader(raw))
-		decoder.DisallowUnknownFields()
-		if err := decoder.Decode(&item); err != nil {
+		decode := decodeRecoveryMetadata
+		if name.legacy {
+			decode = decodeLegacyRecoveryMetadata
+		}
+		item, err := decode(raw)
+		if err != nil {
 			return nil, fmt.Errorf("bridge: decode recovery metadata %s: %w", path, err)
 		}
-		if err := decoder.Decode(&struct{}{}); err != io.EOF {
-			return nil, fmt.Errorf("bridge: recovery metadata %s has trailing content", path)
-		}
-		if err := item.validate(); err != nil {
-			return nil, fmt.Errorf("bridge: validate recovery metadata %s: %w", path, err)
-		}
-		name, err := bridgeRecoveryFileName(item.Kind, item.Process)
-		if err != nil {
-			return nil, err
-		}
-		if want := filepath.Join(p.sessionDir(item.SessionID), name); path != want {
+		if item.Kind != name.kind || filepath.Dir(path) != p.sessionDir(item.SessionID) {
 			return nil, fmt.Errorf("bridge: recovery metadata path %s does not match payload", path)
 		}
 		item.path = path
@@ -369,13 +203,94 @@ func (p *bridgeProcesses) loadMetadata() ([]bridgeRecoveryMetadata, error) {
 	return items, nil
 }
 
-func bridgeRecoveryFileName(kind bridgeProcessKind, process bridgeProcessIdentity) (string, error) {
-	raw, err := json.Marshal(process)
-	if err != nil {
-		return "", fmt.Errorf("bridge: encode recovery record identity: %w", err)
+// sidecarName is one sidecar file's name, decomposed. The current format keys on
+// kind alone; v0.20 appended a digest of the process-identity tuple, so one
+// session could hold several sidecars per kind.
+type sidecarName struct {
+	kind   bridgeProcessKind
+	legacy bool
+}
+
+func parseSidecarName(base string) (sidecarName, bool) {
+	stem, ok := strings.CutSuffix(base, bridgeProcessSuffix)
+	if !ok {
+		return sidecarName{}, false
 	}
-	digest := sha256.Sum256(raw)
-	return fmt.Sprintf("%s-%x%s", kind, digest, bridgeProcessSuffix), nil
+	kind, digest, hyphenated := strings.Cut(stem, "-")
+	switch bridgeProcessKind(kind) {
+	case bridgeProcessChrome, bridgeProcessTunnel, bridgeProcessKeepalive:
+	default:
+		return sidecarName{}, false
+	}
+	if !hyphenated {
+		return sidecarName{kind: bridgeProcessKind(kind)}, true
+	}
+	if len(digest) != hex.EncodedLen(sha256.Size) {
+		return sidecarName{}, false
+	}
+	if _, err := hex.DecodeString(digest); err != nil {
+		return sidecarName{}, false
+	}
+	return sidecarName{kind: bridgeProcessKind(kind), legacy: true}, true
+}
+
+func decodeRecoveryMetadata(raw []byte) (bridgeRecoveryMetadata, error) {
+	var item bridgeRecoveryMetadata
+	if err := decodeExact(raw, &item); err != nil {
+		return bridgeRecoveryMetadata{}, err
+	}
+	if err := item.validate(); err != nil {
+		return bridgeRecoveryMetadata{}, err
+	}
+	return item, nil
+}
+
+// decodeLegacyRecoveryMetadata reads a v0.20 sidecar. Its payload carried a
+// process-identity tuple this version has no use for — daemonkit settles the
+// prior generation's children before Prepare runs, so a surviving sidecar is
+// matched by nothing but its own presence. Everything the cleanup needs was
+// already there, so a legacy sidecar is settled rather than dropped: it can name
+// a bridge still open on the peer. Every other unknown field is still refused.
+func decodeLegacyRecoveryMetadata(raw []byte) (bridgeRecoveryMetadata, error) {
+	var legacy struct {
+		Schema     uint64            `json:"schema"`
+		SessionID  string            `json:"session_id"`
+		Kind       bridgeProcessKind `json:"kind"`
+		Process    json.RawMessage   `json:"process"`
+		Endpoint   string            `json:"endpoint"`
+		Host       string            `json:"host,omitempty"`
+		Capability string            `json:"capability,omitempty"`
+	}
+	if err := decodeExact(raw, &legacy); err != nil {
+		return bridgeRecoveryMetadata{}, err
+	}
+	item := bridgeRecoveryMetadata{
+		Schema: legacy.Schema, SessionID: legacy.SessionID, Kind: legacy.Kind,
+		Endpoint: legacy.Endpoint, Host: legacy.Host, Capability: legacy.Capability,
+	}
+	if err := item.validate(); err != nil {
+		return bridgeRecoveryMetadata{}, err
+	}
+	return item, nil
+}
+
+func decodeExact(raw []byte, into any) error {
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(into); err != nil {
+		return err
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		return errors.New("trailing content")
+	}
+	return nil
+}
+
+// bridgeRecoveryFileName keys the sidecar on its kind. A session holds at most
+// one child of each kind — a local session one chrome, a proxy session one
+// tunnel and one keepalive — so kind alone is unique within the session dir.
+func bridgeRecoveryFileName(kind bridgeProcessKind) string {
+	return string(kind) + bridgeProcessSuffix
 }
 
 func (p *bridgeProcesses) settleProduct(ctx context.Context, runner engine.SSHRunner, item bridgeRecoveryMetadata) {
@@ -384,19 +299,16 @@ func (p *bridgeProcesses) settleProduct(ctx context.Context, runner engine.SSHRu
 	}
 }
 
+// removeMetadata discharges one sidecar. A chrome session owns its whole
+// directory, so settling it removes the directory; a proxy session's tunnel and
+// keepalive share one, so the last sidecar out removes it.
 func (p *bridgeProcesses) removeMetadata(item bridgeRecoveryMetadata) error {
 	dir := p.sessionDir(item.SessionID)
 	if item.Kind == bridgeProcessChrome {
-		if err := os.RemoveAll(dir); err != nil {
-			return fmt.Errorf("bridge: remove recovery session: %w", err)
-		}
-		return p.syncDir(p.sessionsRoot)
+		return durable.RemoveTree(dir)
 	}
-	if err := os.Remove(item.path); err != nil && !errors.Is(err, os.ErrNotExist) {
+	if err := durable.Remove(item.path); err != nil {
 		return fmt.Errorf("bridge: remove recovery metadata: %w", err)
-	}
-	if err := p.syncDir(dir); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return err
 	}
 	entries, err := os.ReadDir(dir)
 	if errors.Is(err, os.ErrNotExist) {
@@ -410,16 +322,5 @@ func (p *bridgeProcesses) removeMetadata(item bridgeRecoveryMetadata) error {
 			return nil
 		}
 	}
-	if err := os.RemoveAll(dir); err != nil {
-		return fmt.Errorf("bridge: remove recovery session: %w", err)
-	}
-	return p.syncDir(p.sessionsRoot)
-}
-
-func syncDirectory(path string) error {
-	dir, err := os.Open(path) //nolint:gosec // internal exact recovery path.
-	if err != nil {
-		return err
-	}
-	return errors.Join(dir.Sync(), dir.Close())
+	return durable.RemoveTree(dir)
 }
