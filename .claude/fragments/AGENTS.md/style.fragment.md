@@ -32,6 +32,6 @@
 
 **Mechanical linting.** CI and hooks handle formatting and import order; fix only what needs human judgment. When reviewing code, don't flag mechanical lint violations (line length, whitespace, import order, trailing commas).
 
-**Testing.** Tests live beside the code they cover as `*_test.go` files. Run the whole suite with `go test ./...` (CI runs it with `-race`). Cookie-store tests run against a real ephemeral SQLite file in `t.TempDir()` rather than mocking the driver.
+**Testing.** Tests live beside the code they cover as `*_test.go` files. Run the whole suite with `./scripts/test.sh -race -count=1 ./...` (or `task test`) — **never bare `go test` on a real machine**. `internal/bridge`'s `TestMain` re-execs the test binary as a fake Chrome; a branch that fails to fire — a dropped env var, a renamed marker — makes the child re-run the whole suite and re-enter the spawn, which exhausts the process table and freezes the machine. The harness caps the per-UID process count so a runaway fails fast with `EAGAIN` instead. CI runs through it too. Cookie-store tests run against a real ephemeral SQLite file in `t.TempDir()` rather than mocking the driver.
 
 **Writing docs.** When writing or revising docs, a README, a tutorial, a how-to, or reference, use the `writing-docs` skill (Diataxis modes, voice rules, and runnable code-sample rules) and run `slop-cop check <file> --lang=markdown` before you finish.

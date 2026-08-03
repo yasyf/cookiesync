@@ -14,9 +14,9 @@ tasks:
       - go run . {{.CLI_ARGS}}
 
   test:
-    desc: Run the test suite with the race detector
+    desc: Run the Go suite with the race detector, via the process-cap harness
     cmds:
-      - bash scripts/test.sh -race -count=1 ./...
+      - ./scripts/test.sh -race -count=1 ./...
 
   vet:
     desc: Vet the module
