@@ -6,16 +6,18 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
 
-// TestCloseContextBudgetsADeadlinelessCaller proves the teardown states its own
-// budget rather than passing the caller's context straight through: daemonkit's
-// Stop refuses a context carrying no deadline, and the daemon's failure-path
-// teardown hands over exactly that — context.WithoutCancel drops the deadline
-// along with the cancellation — which would turn every such teardown into a
-// no-op that leaves Chrome running and latches the refusal into closeErr.
+// TestCloseContextBudgetsADeadlinelessCaller proves the daemon's failed-open
+// cleanup actually terminates Chrome. That path hands the teardown
+// context.WithoutCancel(ctx), which drops the deadline along with the
+// cancellation, and daemonkit's Stop refuses a context carrying none — refusing
+// before it ever demands termination, while closeOnce still consumed the guard
+// and os.RemoveAll still took the data dir. The child was left running against
+// a deleted user-data-dir, and no later Close could settle it.
 func TestCloseContextBudgetsADeadlinelessCaller(t *testing.T) {
 	executable, err := os.Executable()
 	if err != nil {
@@ -28,8 +30,13 @@ func TestCloseContextBudgetsADeadlinelessCaller(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Launch: %v", err)
 	}
+	pid := p.Pid()
 	if err := p.CloseContext(context.WithoutCancel(launchCtx)); err != nil {
 		t.Fatalf("CloseContext on a deadline-less caller: %v", err)
+	}
+	// Stop returns only once the exit is proven, so the pid is reaped by here.
+	if syscall.Kill(pid, 0) == nil {
+		t.Fatalf("chrome pid %d survived a teardown that reported success", pid)
 	}
 }
 
