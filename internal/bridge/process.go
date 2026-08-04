@@ -12,7 +12,22 @@ import (
 	"github.com/yasyf/daemonkit"
 )
 
+// childSettlementTimeout is the whole budget one child teardown is worth. Every
+// daemonkit verb these teardowns reach refuses a context carrying no deadline,
+// and the callers that reach them carry none — a CLI's context, or a daemon's
+// stripped by context.WithoutCancel — so each teardown states this budget
+// itself rather than passing the caller's context through.
 const childSettlementTimeout = 10 * time.Second
+
+// budgeted states budget as ctx's deadline when ctx carries none. A caller that
+// stated its own keeps it: the budget is this package's default, never an
+// override of a deadline the caller chose.
+func budgeted(ctx context.Context, budget time.Duration) (context.Context, context.CancelFunc) {
+	if _, stated := ctx.Deadline(); stated {
+		return context.WithCancel(ctx)
+	}
+	return context.WithTimeout(ctx, budget)
+}
 
 // Spawner starts one long-lived owned child under a durable process-ownership
 // scope. Both daemonkit.Ctx (a daemon's scope) and *daemonkit.Owned (a CLI's)

@@ -58,6 +58,53 @@ func fakeChromeMain() {
 	}
 }
 
+// TestBudgetedAlwaysStatesADeadlineAndDefersToAStatedOne pins both halves of the
+// contract every teardown reaching a daemonkit verb depends on: a caller that
+// stated no deadline still gets one, and a caller that stated its own keeps it
+// exactly.
+func TestBudgetedAlwaysStatesADeadlineAndDefersToAStatedOne(t *testing.T) {
+	const budget = 10 * time.Second
+	stricter, cancelStricter := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancelStricter()
+	looser, cancelLooser := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancelLooser()
+
+	tests := []struct {
+		name   string
+		parent context.Context
+		want   time.Duration // 0 => the budget, otherwise the parent's own deadline
+	}{
+		{"deadline-less", context.Background(), 0},
+		{"cancellation stripped", context.WithoutCancel(stricter), 0},
+		{"stricter caller deadline", stricter, 5 * time.Second},
+		{"looser caller deadline", looser, 30 * time.Second},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx, cancel := budgeted(tt.parent, budget)
+			defer cancel()
+			deadline, stated := ctx.Deadline()
+			if !stated {
+				t.Fatal("budgeted returned a deadline-less context; every daemonkit verb refuses one")
+			}
+			want := tt.want
+			if want == 0 {
+				want = budget
+			}
+			if got := time.Until(deadline); got <= 0 || got > want {
+				t.Fatalf("budget = %v, want (0, %v]", got, want)
+			}
+			if tt.want == 0 {
+				return
+			}
+			parentDeadline, _ := tt.parent.Deadline()
+			if !deadline.Equal(parentDeadline) {
+				t.Fatalf("deadline = %v, want the caller's own %v", deadline, parentDeadline)
+			}
+		})
+	}
+}
+
 func TestChromeChildRole(t *testing.T) {
 	for i, arg := range os.Args {
 		if arg != chromeChildTestMarker {

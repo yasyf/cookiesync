@@ -3,10 +3,35 @@ package bridge
 import (
 	"context"
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 )
+
+// TestCloseContextBudgetsADeadlinelessCaller proves the teardown states its own
+// budget rather than passing the caller's context straight through: daemonkit's
+// Stop refuses a context carrying no deadline, and the daemon's failure-path
+// teardown hands over exactly that — context.WithoutCancel drops the deadline
+// along with the cancellation — which would turn every such teardown into a
+// no-op that leaves Chrome running and latches the refusal into closeErr.
+func TestCloseContextBudgetsADeadlinelessCaller(t *testing.T) {
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(fakeChromeEnv, filepath.Join(t.TempDir(), "chrome-exec"))
+	launchCtx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+	p, err := launchTestChrome(launchCtx, t, executable, filepath.Join(t.TempDir(), "profile"), false)
+	if err != nil {
+		t.Fatalf("Launch: %v", err)
+	}
+	if err := p.CloseContext(context.WithoutCancel(launchCtx)); err != nil {
+		t.Fatalf("CloseContext on a deadline-less caller: %v", err)
+	}
+}
 
 func TestLaunch(t *testing.T) {
 	if testing.Short() {

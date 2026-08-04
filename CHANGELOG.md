@@ -4,6 +4,17 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- Settle the bridge's Chrome child when the daemon tears it down on a failure
+  path. daemonkit's `Stop` refuses a context that states no deadline, and that
+  teardown handed it one — `context.WithoutCancel` drops the deadline along with
+  the cancellation — so the stop was refused outright, the refusal was latched
+  into the process's terminal error, and Chrome kept running with its data dir
+  on disk. The teardown now states its own settlement budget, deferring to a
+  deadline the caller already stated.
+
 ## [0.28.0] - 2026-08-03
 
 ### Changed

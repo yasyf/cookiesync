@@ -119,14 +119,16 @@ func (p *Proc) Pid() int {
 
 // Close settles the managed Chrome process and removes the data dir.
 func (p *Proc) Close() error {
-	ctx, cancel := context.WithTimeout(context.Background(), childSettlementTimeout)
-	defer cancel()
-	return p.CloseContext(ctx)
+	return p.CloseContext(context.Background())
 }
 
-// CloseContext settles the managed Chrome process within ctx and removes the data dir.
+// CloseContext settles the managed Chrome process within ctx and removes the
+// data dir. A ctx carrying no deadline gets childSettlementTimeout, since
+// daemonkit's Stop refuses one that states no budget.
 func (p *Proc) CloseContext(ctx context.Context) error {
 	p.closeOnce.Do(func() {
+		ctx, cancel := budgeted(ctx, childSettlementTimeout)
+		defer cancel()
 		_, stopErr := p.child.Stop(ctx)
 		p.closeErr = errors.Join(p.transport.Close(), stopErr, p.child.StderrErr(), os.RemoveAll(p.dataDir))
 	})
