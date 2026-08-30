@@ -6,6 +6,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.29.0] - 2026-08-29
+
+### Changed
+- **Daemon state moves to `~/.daemonkit/a/<label>`.** Pin daemonkit v0.23.0.
+  The resident helper's state root shortens from `~/.daemonkit/agents/<label>`;
+  daemonkit reads nothing from the old root, by design, so the daemon starts
+  fresh there. Remove `~/.daemonkit/agents/` by hand once every daemon on the
+  machine has upgraded past this release.
+
 ### Fixed
 - Settle the bridge's Chrome child when the daemon tears it down on a failure
   path. daemonkit's `Stop` refuses a context that states no deadline, and that
@@ -465,6 +474,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `synckitd install` now owns the agents. The host mesh is read from the shared
   `~/.config/synckit`.
 
+[0.29.0]: https://github.com/yasyf/cookiesync/compare/v0.28.0...v0.29.0
 [0.28.0]: https://github.com/yasyf/cookiesync/compare/v0.27.4...v0.28.0
 [0.27.4]: https://github.com/yasyf/cookiesync/compare/v0.27.3...v0.27.4
 [0.27.3]: https://github.com/yasyf/cookiesync/compare/v0.27.2...v0.27.3
