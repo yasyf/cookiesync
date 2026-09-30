@@ -19,7 +19,7 @@ func newLinuxStore(t *testing.T, metaVersion int) (Browser, string) {
 	browser := makeBrowser(t, t.TempDir(), "Default")
 	path := browser.CookiesDB("Default")
 	initDB(t, path, v24SQL)
-	if metaVersion > 0 {
+	if metaVersion != 0 {
 		setMetaVersion(t, path, metaVersion)
 	}
 	return browser, path

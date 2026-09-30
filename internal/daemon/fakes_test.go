@@ -2,27 +2,88 @@ package daemon
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/yasyf/daemonkit"
+	consentkit "github.com/yasyf/synckit/consent"
+	"github.com/yasyf/synckit/cregistry"
+	"github.com/yasyf/synckit/hostregistry"
+	synckit "github.com/yasyf/synckit/rpc"
+	"golang.org/x/sys/unix"
+
 	"github.com/yasyf/cookiesync/internal/auth"
 	"github.com/yasyf/cookiesync/internal/cache"
 	"github.com/yasyf/cookiesync/internal/cookie"
 	"github.com/yasyf/cookiesync/internal/paths"
 	"github.com/yasyf/cookiesync/internal/state"
-	consentkit "github.com/yasyf/synckit/consent"
-	"github.com/yasyf/synckit/cregistry"
-	"github.com/yasyf/synckit/hostregistry"
 )
 
 // releaseLocal keeps the pre-broker release-mode name these tests exercise.
 const releaseLocal = auth.ModeLocal
+
+// callOp is synckit's business-lane op; Dispatcher.Handle rejects any other.
+const callOp = "synckit.rpc.call"
+
+// dispatchAs handles one business request as a synthetic socket caller with pid.
+func dispatchAs(t *testing.T, dispatcher *synckit.Dispatcher, pid int, method string, params map[string]any) *synckit.Response {
+	t.Helper()
+	body, err := synckit.EncodeRequest(&synckit.Request{Method: method, Params: params})
+	if err != nil {
+		t.Fatalf("encode request: %v", err)
+	}
+	reply, err := dispatcher.Handle(context.Background(), daemonkit.Request{
+		Op: callOp, Body: body, Caller: daemonkit.Caller{PID: pid},
+	})
+	if err != nil {
+		t.Fatalf("handle: %v", err)
+	}
+	resp, err := synckit.DecodeResponse(reply.Body)
+	if err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	return resp
+}
+
+func dispatchSelf(t *testing.T, d *Daemon, method string, params map[string]any) (json.RawMessage, error) {
+	t.Helper()
+	resp := dispatchAs(t, d.Dispatcher(), os.Getpid(), method, params)
+	if !resp.OK {
+		return nil, errors.New(resp.Error)
+	}
+	return resp.Result, nil
+}
+
+func resultMap(t *testing.T, raw json.RawMessage) map[string]any {
+	t.Helper()
+	var out map[string]any
+	if err := json.Unmarshal(raw, &out); err != nil {
+		t.Fatalf("decode result %s: %v", raw, err)
+	}
+	return out
+}
+
+func ownSessionPrincipal(t *testing.T) string {
+	t.Helper()
+	sid, err := unix.Getsid(os.Getpid())
+	if err != nil {
+		t.Fatalf("getsid: %v", err)
+	}
+	return "sid:" + strconv.Itoa(sid)
+}
+
+func reasonForSelf(t *testing.T, reason string) string {
+	t.Helper()
+	return reason + " for " + ownProcessName(t)
+}
 
 // AuthRequired keeps the pre-broker error name resolvable in these tests; it is
 // now the generic consent fail-closed error.
@@ -185,56 +246,6 @@ func (c *gateConsent) ObtainKeyUnprompted(_ context.Context, _ cookie.Browser) (
 
 func (c *gateConsent) ObtainKeyBiometric(_ context.Context, _ cookie.Browser, _ string) (cookie.AesKey, error) {
 	panic("gateConsent: unexpected biometric release")
-}
-
-// partialGateConsent gates the batch like gateConsent — each ObtainKeys parks
-// until release closes — and reports one named browser as failed (Missing, or
-// Err when failErr is set) while every other browser releases OK. batches
-// counts ObtainKeys invocations, so a test asserts exactly how many flights
-// evaluated consent. A canceled flight ctx is a whole-batch failure, returned
-// as ctx.Err().
-type partialGateConsent struct {
-	key     cookie.AesKey
-	failFor cookie.BrowserName
-	failErr error
-
-	entered chan struct{}
-	release chan struct{}
-	batches atomic.Int32
-}
-
-func (c *partialGateConsent) ObtainKey(_ context.Context, _ cookie.Browser, _ string) (cookie.AesKey, error) {
-	panic("partialGateConsent: unexpected single ObtainKey")
-}
-
-func (c *partialGateConsent) ObtainKeys(ctx context.Context, browsers []cookie.Browser, _ string) ([]cookie.KeyOutcome, error) {
-	c.batches.Add(1)
-	c.entered <- struct{}{}
-	select {
-	case <-c.release:
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	}
-	outcomes := make([]cookie.KeyOutcome, len(browsers))
-	for i, b := range browsers {
-		switch {
-		case b.Name != c.failFor:
-			outcomes[i] = cookie.KeyOutcome{Browser: b, Key: c.key}
-		case c.failErr != nil:
-			outcomes[i] = cookie.KeyOutcome{Browser: b, Err: c.failErr}
-		default:
-			outcomes[i] = cookie.KeyOutcome{Browser: b, Missing: true}
-		}
-	}
-	return outcomes, nil
-}
-
-func (c *partialGateConsent) ObtainKeyUnprompted(_ context.Context, _ cookie.Browser) (cookie.AesKey, error) {
-	panic("partialGateConsent: unexpected unprompted release")
-}
-
-func (c *partialGateConsent) ObtainKeyBiometric(_ context.Context, _ cookie.Browser, _ string) (cookie.AesKey, error) {
-	panic("partialGateConsent: unexpected biometric release")
 }
 
 // countingConsent tracks the peak number of concurrent ObtainKey prompts, holding
@@ -464,18 +475,6 @@ func (r *forbiddenRunner) Run(_ context.Context, target, cmd string, _ []byte) (
 // staticProbe returns a fixed session snapshot.
 func staticProbe(snap SessionSnapshot) Probe {
 	return func(_ context.Context) (SessionSnapshot, error) { return snap, nil }
-}
-
-// flipProbe returns first on the initial probe call and rest on every later one — the
-// session double for a console whose presence flips mid-call.
-func flipProbe(first, rest SessionSnapshot) Probe {
-	var calls atomic.Int32
-	return func(_ context.Context) (SessionSnapshot, error) {
-		if calls.Add(1) == 1 {
-			return first, nil
-		}
-		return rest, nil
-	}
 }
 
 // fakeStore satisfies engine.Store with an injected WithLock, so a dispatcher test

@@ -62,7 +62,7 @@ func TestPrimeAuthGrantsArePerRequestor(t *testing.T) {
 // the calling peer's identity into the grant table end-to-end: a peer's first pull
 // prompts once and grants "host:<origin>", its repeat is silent, a different origin
 // over the same warm cache prompts anew, and a call with no origin falls back to the
-// local requestor ladder ("local" on a bare test context).
+// local requestor ladder (the dialing process's own session).
 func TestExtractOriginThreadsRequestorIdentity(t *testing.T) {
 	ctx := context.Background()
 	chromeStoreUnderHome(t)
@@ -99,14 +99,14 @@ func TestExtractOriginThreadsRequestorIdentity(t *testing.T) {
 		t.Fatalf("the second pull must grant host:them@mini chrome")
 	}
 
-	if _, err := d.handleExtract(ctx, map[string]any{"browser": "chrome"}); err != nil {
+	if _, err := dispatchSelf(t, d, "extract", map[string]any{"browser": "chrome"}); err != nil {
 		t.Fatalf("extract without origin: %v", err)
 	}
 	if len(consent.batchCalls) != 3 {
 		t.Fatalf("originless extract = %d evaluations, want 3 (an old peer falls back to the local ladder)", len(consent.batchCalls))
 	}
-	if !d.granted("local", "chrome") {
-		t.Fatalf("an originless extract on a bare context must grant local chrome")
+	if principal := ownSessionPrincipal(t); !d.granted(principal, "chrome") {
+		t.Fatalf("an originless extract must grant %s chrome", principal)
 	}
 }
 
@@ -131,7 +131,7 @@ func TestGetCookiesUngrantedRequestorPromptsThenSilent(t *testing.T) {
 	d := New(consent, cache, nil, staticProbe(liveSession(currentUser(t))), &recordingRunner{}, fixedState{st: st}, fixedState{st: st})
 	_, _ = cache.Put(ctx, endpointID(self, "chrome", "Default"), []byte(key), 0)
 
-	got, err := d.handleGetCookies(ctx, map[string]any{"browser": "chrome", "urls": []any{"https://x.com/"}})
+	got, err := dispatchSelf(t, d, "get_cookies", map[string]any{"browser": "chrome", "urls": []any{"https://x.com/"}})
 	if err != nil {
 		t.Fatalf("handleGetCookies: %v", err)
 	}
@@ -142,7 +142,7 @@ func TestGetCookiesUngrantedRequestorPromptsThenSilent(t *testing.T) {
 		t.Fatalf("ungranted get_cookies over a warm cache = %d evaluations, want 1 (warmth alone must not serve)", len(consent.batchCalls))
 	}
 
-	if _, err := d.handleGetCookies(ctx, map[string]any{"browser": "chrome", "urls": []any{"https://x.com/"}}); err != nil {
+	if _, err := dispatchSelf(t, d, "get_cookies", map[string]any{"browser": "chrome", "urls": []any{"https://x.com/"}}); err != nil {
 		t.Fatalf("repeat handleGetCookies: %v", err)
 	}
 	if len(consent.batchCalls) != 1 {
@@ -150,12 +150,12 @@ func TestGetCookiesUngrantedRequestorPromptsThenSilent(t *testing.T) {
 	}
 }
 
-// TestRequestorID proves the local requestor ladder: an explicit requestor token wins
-// ("req:" + token) and a bare context with no token and no socket peer is "local".
-// requestorID never reads origin — that is the forgery guard, pinned here by the
-// "forged origin is ignored" case. The socket peer's "sid:" rung is proven end-to-end
-// over a real transport in TestPeerSIDRequestorOverSocket, since a session-carrying
-// ctx can only come from Serve.
+// TestRequestorID proves the local requestor ladder's token rung: an explicit requestor
+// token wins ("req:" + token). requestorID never reads origin — that is the forgery
+// guard, pinned here by the "forged origin never displaces the token" case. The rungs
+// below the token depend on the platform's transport: the no-caller outcome is pinned in
+// the linux- and darwin-tagged tests, and the socket peer's session rung end-to-end
+// over a real transport, since a session-carrying ctx can only come from Serve.
 func TestRequestorID(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -163,14 +163,12 @@ func TestRequestorID(t *testing.T) {
 		want   string
 	}{
 		{"requestor token wins", map[string]any{"requestor": "claude"}, "req:claude"},
-		{"forged origin is ignored", map[string]any{"origin": "you@desktop"}, "local"},
-		{"empty requestor falls through", map[string]any{"requestor": ""}, "local"},
-		{"no requestor no sid is local", map[string]any{}, "local"},
+		{"forged origin never displaces the token", map[string]any{"requestor": "claude", "origin": "you@desktop"}, "req:claude"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := requestorID(context.Background(), tc.params); got != tc.want {
-				t.Fatalf("requestorID(%v) = %q, want %q", tc.params, got, tc.want)
+			if got, err := requestorID(context.Background(), tc.params); err != nil || got != tc.want {
+				t.Fatalf("requestorID(%v) = %q, %v, want %q", tc.params, got, err, tc.want)
 			}
 		})
 	}
@@ -178,7 +176,7 @@ func TestRequestorID(t *testing.T) {
 
 // TestPeerRequestor proves the origin-honoring requestor for the one method a peer
 // drives (extract): a forwarded origin wins ("host:" + origin), and with no origin it
-// falls back to the local requestorID ladder — a requestor token, else "local".
+// falls back to the local requestorID ladder — a requestor token first.
 func TestPeerRequestor(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -186,14 +184,14 @@ func TestPeerRequestor(t *testing.T) {
 		want   string
 	}{
 		{"origin wins", map[string]any{"origin": "you@desktop"}, "host:you@desktop"},
-		{"empty origin falls to the local ladder", map[string]any{"origin": ""}, "local"},
+		{"origin wins over a requestor token", map[string]any{"origin": "you@desktop", "requestor": "claude"}, "host:you@desktop"},
+		{"empty origin falls to the requestor token", map[string]any{"origin": "", "requestor": "claude"}, "req:claude"},
 		{"no origin uses the requestor token", map[string]any{"requestor": "claude"}, "req:claude"},
-		{"no origin no token is local", map[string]any{}, "local"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := peerRequestor(context.Background(), tc.params); got != tc.want {
-				t.Fatalf("peerRequestor(%v) = %q, want %q", tc.params, got, tc.want)
+			if got, err := peerRequestor(context.Background(), tc.params); err != nil || got != tc.want {
+				t.Fatalf("peerRequestor(%v) = %q, %v, want %q", tc.params, got, err, tc.want)
 			}
 		})
 	}
@@ -216,14 +214,14 @@ func TestPrimeAuthForgedOriginCannotRideHostGrant(t *testing.T) {
 	_, _ = cache.Put(ctx, endpointID(self, "chrome", "Default"), []byte(key), 0)
 	d.grant("host:evil", []cookie.BrowserName{"chrome"}, time.Hour)
 
-	if _, err := d.handlePrimeAuth(ctx, map[string]any{"browser": "chrome", "origin": "evil"}); err != nil {
+	if _, err := dispatchSelf(t, d, "prime_auth", map[string]any{"browser": "chrome", "origin": "evil"}); err != nil {
 		t.Fatalf("handlePrimeAuth forged origin: %v", err)
 	}
 	if len(consent.batchCalls) != 1 {
 		t.Fatalf("forged-origin prime = %d evaluations, want 1 (a warm cache and a host:evil grant must not serve a forged origin)", len(consent.batchCalls))
 	}
-	if !d.granted("local", "chrome") {
-		t.Fatalf("the forged-origin prime must resolve to the local requestor and grant local:chrome")
+	if principal := ownSessionPrincipal(t); !d.granted(principal, "chrome") {
+		t.Fatalf("the forged-origin prime must resolve to the caller's own session and grant %s:chrome", principal)
 	}
 }
 
@@ -255,7 +253,7 @@ func TestGetCookiesUnionForgedOriginCannotRideHostGrant(t *testing.T) {
 	_, _ = cache.Put(ctx, endpointID(self, "chrome", "Default"), []byte(key), 0)
 	d.grant("host:evil", []cookie.BrowserName{"chrome"}, time.Hour)
 
-	got, err := d.handleGetCookies(ctx, map[string]any{"urls": []any{"https://x.com/"}, "origin": "evil"})
+	got, err := dispatchSelf(t, d, "get_cookies", map[string]any{"urls": []any{"https://x.com/"}, "origin": "evil"})
 	if err != nil {
 		t.Fatalf("handleGetCookies union forged origin: %v", err)
 	}
@@ -265,7 +263,7 @@ func TestGetCookiesUnionForgedOriginCannotRideHostGrant(t *testing.T) {
 	if len(consent.batchCalls) != 1 {
 		t.Fatalf("forged-origin union get_cookies = %d evaluations, want 1 (a warm cache and a host:evil grant must not serve a forged origin)", len(consent.batchCalls))
 	}
-	if !d.granted("local", "chrome") {
-		t.Fatalf("the forged-origin union get_cookies must resolve to the local requestor and grant local:chrome")
+	if principal := ownSessionPrincipal(t); !d.granted(principal, "chrome") {
+		t.Fatalf("the forged-origin union get_cookies must resolve to the caller's own session and grant %s:chrome", principal)
 	}
 }

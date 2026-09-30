@@ -7,12 +7,12 @@ import (
 	"testing"
 )
 
-// TestBrowserProfilesJSONLinux proves `browser profiles chromium --json` scans the XDG
+// TestBrowserProfilesJSONLinux proves `browser profiles chrome --json` scans the XDG
 // data root on Linux and emits the exported [{Dir,Name,Email}] array.
 func TestBrowserProfilesJSONLinux(t *testing.T) {
 	xdg := t.TempDir()
 	t.Setenv("XDG_CONFIG_HOME", xdg)
-	dataRoot := filepath.Join(xdg, "chromium")
+	dataRoot := filepath.Join(xdg, "google-chrome")
 	if err := os.MkdirAll(filepath.Join(dataRoot, "Default"), 0o700); err != nil {
 		t.Fatalf("mkdir profile: %v", err)
 	}
@@ -24,7 +24,7 @@ func TestBrowserProfilesJSONLinux(t *testing.T) {
 		t.Fatalf("write Local State: %v", err)
 	}
 
-	out := runBrowserCmd(t, "profiles", "chromium", "--json")
+	out := runBrowserCmd(t, "profiles", "chrome", "--json")
 	var got []struct{ Dir, Name, Email string }
 	if err := json.Unmarshal([]byte(out), &got); err != nil {
 		t.Fatalf("profiles --json is not valid JSON: %v\n%s", err, out)

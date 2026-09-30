@@ -8,7 +8,8 @@ import (
 
 // Registry maps every supported browser to its on-disk layout under the XDG config
 // home ("$XDG_CONFIG_HOME" or "~/.config"), the base Chromium resolves its user
-// data directory against.
+// data directory against. Only browsers a Mac approver also registers are
+// ConsentRoutable; Chromium returns once the Mac side can approve it.
 func Registry() (map[BrowserName]Browser, error) {
 	configHome, err := xdgConfigHome()
 	if err != nil {
@@ -20,12 +21,7 @@ func Registry() (map[BrowserName]Browser, error) {
 			Display:                  "Chrome",
 			DataRoot:                 filepath.Join(configHome, "google-chrome"),
 			SecretServiceApplication: "chrome",
-		},
-		BrowserName("chromium"): {
-			Name:                     BrowserName("chromium"),
-			Display:                  "Chromium",
-			DataRoot:                 filepath.Join(configHome, "chromium"),
-			SecretServiceApplication: "chromium",
+			ConsentRoutable:          true,
 		},
 	}, nil
 }

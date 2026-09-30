@@ -17,6 +17,36 @@ import (
 	synckit "github.com/yasyf/synckit/rpc"
 )
 
+func ownProcessName(t *testing.T) string {
+	t.Helper()
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatalf("executable: %v", err)
+	}
+	return filepath.Base(executable)
+}
+
+func TestRequestorIDWithoutACallerIsLocal(t *testing.T) {
+	tests := []struct {
+		name    string
+		resolve func(context.Context, map[string]any) (string, error)
+		params  map[string]any
+	}{
+		{"a forged origin is ignored", requestorID, map[string]any{"origin": "you@desktop"}},
+		{"an empty requestor token falls through", requestorID, map[string]any{"requestor": ""}},
+		{"no token is local", requestorID, map[string]any{}},
+		{"an empty origin falls through", peerRequestor, map[string]any{"origin": ""}},
+		{"no origin and no token is local", peerRequestor, map[string]any{}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got, err := tc.resolve(context.Background(), tc.params); err != nil || got != "local" {
+				t.Fatalf("resolve(%v) = %q, %v, want \"local\"", tc.params, got, err)
+			}
+		})
+	}
+}
+
 // TestPeerSIDRequestorOverSocket proves the session-id rule over a real unix socket: a
 // prime_auth dialed through the synckit transport grants the dialing process's login
 // session (sid), never its origin, and weaves the dialing process's name — resolved

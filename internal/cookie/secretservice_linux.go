@@ -12,21 +12,25 @@ import (
 )
 
 const (
-	secretServiceName     = "org.freedesktop.secrets"
-	secretServicePath     = dbus.ObjectPath("/org/freedesktop/secrets")
-	secretServiceIface    = "org.freedesktop.Secret.Service"
-	secretItemIface       = "org.freedesktop.Secret.Item"
-	secretSchemaAttribute = "xdg:schema"
-	chromiumSecretSchema  = "chrome_libsecret_os_crypt_password_v2"
-	plainSessionAlgorithm = "plain"
-	noPromptPath          = dbus.ObjectPath("/")
-	basicStorePassword    = SafeStorageKey("peanuts")
+	secretServiceName      = "org.freedesktop.secrets"
+	secretServicePath      = dbus.ObjectPath("/org/freedesktop/secrets")
+	secretServiceIface     = "org.freedesktop.Secret.Service"
+	secretCollectionIface  = "org.freedesktop.Secret.Collection"
+	secretItemIface        = "org.freedesktop.Secret.Item"
+	secretSchemaAttribute  = "xdg:schema"
+	chromiumSecretSchema   = "chrome_libsecret_os_crypt_password_v2"
+	defaultCollectionAlias = "default"
+	plainSessionAlgorithm  = "plain"
+	noPromptPath           = dbus.ObjectPath("/")
+	noCollectionPath       = dbus.ObjectPath("/")
+	basicStorePassword     = SafeStorageKey("peanuts")
 )
 
-// ErrSecretServiceLocked reports that the browser's Safe Storage item exists but
-// its collection is locked and unlocking it needs an interactive prompt, which
-// this host never shows. The basic-store password is no substitute for it.
-var ErrSecretServiceLocked = errors.New("secret service collection is locked and needs a prompt to unlock")
+// ErrSecretServiceLocked reports that the default Secret Service collection is
+// locked and unlocking it needs an interactive prompt, which this host never
+// shows; whether it holds the browser's Safe Storage item is unknowable, so the
+// basic-store password is no substitute.
+var ErrSecretServiceLocked = errors.New("secret service default collection is locked and needs a prompt to unlock")
 
 // errNoSecretService: no session bus, or nobody owns org.freedesktop.secrets on
 // it. Chromium then encrypts with the basic-store password.
@@ -46,9 +50,10 @@ func (e *SecretServiceError) Unwrap() error { return e.Err }
 // secretService is the slice of the freedesktop Secret Service API the Linux Safe
 // Storage read consumes; dbusSecretService satisfies it over the session bus.
 type secretService interface {
-	searchItems(ctx context.Context, attributes map[string]string) (unlocked, locked []dbus.ObjectPath, err error)
+	readAlias(ctx context.Context, name string) (dbus.ObjectPath, error)
 	unlock(ctx context.Context, objects []dbus.ObjectPath) (unlocked []dbus.ObjectPath, prompt dbus.ObjectPath, err error)
 	openSession(ctx context.Context) (dbus.ObjectPath, error)
+	searchItems(ctx context.Context, collection dbus.ObjectPath, attributes map[string]string) ([]dbus.ObjectPath, error)
 	getSecret(ctx context.Context, item, session dbus.ObjectPath) ([]byte, error)
 	close()
 }
@@ -71,9 +76,10 @@ type dbusSecretService struct {
 }
 
 // lookupSafeStorage reads the Safe Storage password Chromium keyed application's
-// cookies with: the Secret Service item's secret when one exists, the basic-store
-// password when there is no Secret Service or no item. A locked collection or any
-// bus failure is an error, never the basic-store password.
+// cookies with, the way Chrome's FreedesktopSecretKeyProvider does: the item in
+// the "default" collection, or the basic-store password when there is no Secret
+// Service, no default collection, or no item there. Other collections are never
+// read. A locked default collection or any bus failure is an error.
 func lookupSafeStorage(ctx context.Context, dial secretServiceDialer, application string) (SafeStorageKey, error) {
 	svc, err := dial(ctx)
 	if errors.Is(err, errNoSecretService) {
@@ -83,25 +89,29 @@ func lookupSafeStorage(ctx context.Context, dial secretServiceDialer, applicatio
 		return "", err
 	}
 	defer svc.close()
-	attributes := map[string]string{"application": application, secretSchemaAttribute: chromiumSecretSchema}
-	unlocked, locked, err := svc.searchItems(ctx, attributes)
+	collection, err := svc.readAlias(ctx, defaultCollectionAlias)
 	if err != nil {
 		return "", err
 	}
-	if len(unlocked) == 0 && len(locked) == 0 {
+	if collection == noCollectionPath {
 		return basicStorePassword, nil
 	}
-	if len(unlocked) == 0 {
-		unlocked, err = unlockWithoutPrompt(ctx, svc, locked)
-		if err != nil {
-			return "", err
-		}
+	if _, err := unlockWithoutPrompt(ctx, svc, []dbus.ObjectPath{collection}); err != nil {
+		return "", err
 	}
 	session, err := svc.openSession(ctx)
 	if err != nil {
 		return "", err
 	}
-	secret, err := svc.getSecret(ctx, unlocked[0], session)
+	attributes := map[string]string{"application": application, secretSchemaAttribute: chromiumSecretSchema}
+	items, err := svc.searchItems(ctx, collection, attributes)
+	if err != nil {
+		return "", err
+	}
+	if len(items) == 0 {
+		return basicStorePassword, nil
+	}
+	secret, err := svc.getSecret(ctx, items[0], session)
 	if err != nil {
 		return "", err
 	}
@@ -165,12 +175,20 @@ func sessionBusAddress() (string, bool) {
 	return "unix:path=" + dbus.EscapeBusAddressValue(socket), true
 }
 
-func (s *dbusSecretService) searchItems(ctx context.Context, attributes map[string]string) ([]dbus.ObjectPath, []dbus.ObjectPath, error) {
-	var unlocked, locked []dbus.ObjectPath
-	if err := s.service.CallWithContext(ctx, secretServiceIface+".SearchItems", dbus.FlagNoAutoStart, attributes).Store(&unlocked, &locked); err != nil {
-		return nil, nil, &SecretServiceError{Op: "SearchItems", Err: err}
+func (s *dbusSecretService) readAlias(ctx context.Context, name string) (dbus.ObjectPath, error) {
+	var collection dbus.ObjectPath
+	if err := s.service.CallWithContext(ctx, secretServiceIface+".ReadAlias", dbus.FlagNoAutoStart, name).Store(&collection); err != nil {
+		return "", &SecretServiceError{Op: "ReadAlias", Err: err}
 	}
-	return unlocked, locked, nil
+	return collection, nil
+}
+
+func (s *dbusSecretService) searchItems(ctx context.Context, collection dbus.ObjectPath, attributes map[string]string) ([]dbus.ObjectPath, error) {
+	var items []dbus.ObjectPath
+	if err := s.conn.Object(secretServiceName, collection).CallWithContext(ctx, secretCollectionIface+".SearchItems", dbus.FlagNoAutoStart, attributes).Store(&items); err != nil {
+		return nil, &SecretServiceError{Op: "SearchItems", Err: err}
+	}
+	return items, nil
 }
 
 func (s *dbusSecretService) unlock(ctx context.Context, objects []dbus.ObjectPath) ([]dbus.ObjectPath, dbus.ObjectPath, error) {

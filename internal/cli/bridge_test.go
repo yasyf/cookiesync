@@ -121,6 +121,8 @@ func TestBareBridgeOpenAndStopShareTheDefaultTarget(t *testing.T) {
 }
 
 func TestParseBridgeTarget(t *testing.T) {
+	t.Setenv("HOME", "")
+	t.Setenv("XDG_CONFIG_HOME", "")
 	tests := []struct {
 		name                    string
 		target, browser, prof   string
@@ -132,6 +134,7 @@ func TestParseBridgeTarget(t *testing.T) {
 		{name: "browser only", target: "chrome", wantBr: "chrome", wantP: "Default"},
 		{name: "browser and profile", target: "chrome:Profile 1", wantBr: "chrome", wantP: "Profile 1"},
 		{name: "browser and empty profile", target: "chrome:", wantBr: "chrome", wantP: "Default"},
+		{name: "another platform's browser and profile", target: "arc:Work", wantBr: "arc", wantP: "Work"},
 		{name: "host and browser", target: "desk:chrome", wantHost: "desk", wantBr: "chrome", wantP: "Default"},
 		{name: "host named like a browser keeps host:browser", target: "chrome:chrome", wantHost: "chrome", wantBr: "chrome", wantP: "Default"},
 		{name: "neither part a browser keeps host:browser", target: "desk:nosuch", wantHost: "desk", wantBr: "nosuch", wantP: "Default"},

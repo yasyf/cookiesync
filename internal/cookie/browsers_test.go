@@ -56,6 +56,25 @@ func TestBrowserProfiles(t *testing.T) {
 	}
 }
 
+func TestBrowserNamesCoverThisPlatformsRegistry(t *testing.T) {
+	want := map[BrowserName]struct{}{"arc": {}, "chrome": {}}
+	if !reflect.DeepEqual(BrowserNames, want) {
+		t.Fatalf("BrowserNames = %v, want %v", BrowserNames, want)
+	}
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+	registry, err := Registry()
+	if err != nil {
+		t.Fatalf("Registry: %v", err)
+	}
+	for name := range registry {
+		if _, ok := BrowserNames[name]; !ok {
+			t.Fatalf("Registry browser %q is missing from BrowserNames", name)
+		}
+	}
+}
+
 func TestBrowserProfilesMissingRoot(t *testing.T) {
 	b := Browser{Name: BrowserName("test"), DataRoot: filepath.Join(t.TempDir(), "absent")}
 	got, err := b.Profiles()

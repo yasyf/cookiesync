@@ -7,40 +7,90 @@ import (
 	"context"
 	"errors"
 	"os"
+	"sort"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/godbus/dbus/v5"
 )
 
 const (
-	fakeSecret     = "synthetic-safe-storage-secret"
-	fakeItemPath   = dbus.ObjectPath("/org/freedesktop/secrets/collection/login/1")
-	fakeLockedPath = dbus.ObjectPath("/org/freedesktop/secrets/collection/locked/1")
-	fakeSession    = dbus.ObjectPath("/org/freedesktop/secrets/session/1")
-	fakePrompt     = dbus.ObjectPath("/org/freedesktop/secrets/prompt/1")
+	fakeSecret            = "synthetic-safe-storage-secret"
+	fakeStaleSecret       = "stale-secret-from-another-collection"
+	fakeDefaultCollection = dbus.ObjectPath("/org/freedesktop/secrets/collection/login")
+	fakeOtherCollection   = dbus.ObjectPath("/org/freedesktop/secrets/collection/session")
+	fakeItemPath          = fakeDefaultCollection + "/1"
+	fakeOtherItemPath     = fakeOtherCollection + "/1"
+	fakeSession           = dbus.ObjectPath("/org/freedesktop/secrets/session/1")
+	fakePrompt            = dbus.ObjectPath("/org/freedesktop/secrets/prompt/1")
 )
 
-// fakeSecretService scripts one Secret Service conversation and records every
-// call it received, in order.
+// fakeSecretService scripts one Secret Service holding named collections and
+// records every call it received, in order.
 type fakeSecretService struct {
-	calls      []string
-	attributes map[string]string
-	unlocked   []dbus.ObjectPath
-	locked     []dbus.ObjectPath
-	searchErr  error
-	unlockErr  error
-	prompt     dbus.ObjectPath
-	sessionErr error
-	secret     []byte
-	secretErr  error
-	closed     bool
+	calls       []string
+	alias       dbus.ObjectPath
+	aliasErr    error
+	collections map[dbus.ObjectPath]*fakeCollection
+	unlockErr   error
+	prompt      dbus.ObjectPath
+	sessionErr  error
+	searchErr   error
+	secretErr   error
+	searched    dbus.ObjectPath
+	attributes  map[string]string
+	closed      bool
 }
 
-func (f *fakeSecretService) searchItems(_ context.Context, attributes map[string]string) ([]dbus.ObjectPath, []dbus.ObjectPath, error) {
-	f.calls = append(f.calls, "searchItems")
-	f.attributes = attributes
-	return f.unlocked, f.locked, f.searchErr
+type fakeCollection struct {
+	locked bool
+	items  map[dbus.ObjectPath]fakeItem
+}
+
+type fakeItem struct {
+	application string
+	secret      []byte
+}
+
+// unlockedDefault is a service whose "default" alias names an unlocked
+// collection holding items, and no other collection.
+func unlockedDefault(items map[dbus.ObjectPath]fakeItem) *fakeSecretService {
+	return &fakeSecretService{
+		alias:       fakeDefaultCollection,
+		prompt:      noPromptPath,
+		collections: map[dbus.ObjectPath]*fakeCollection{fakeDefaultCollection: {items: items}},
+	}
+}
+
+// lockedDefault is unlockedDefault with the default collection locked; prompt is
+// what Unlock answers, noPromptPath unlocking it in place.
+func lockedDefault(prompt dbus.ObjectPath, items map[dbus.ObjectPath]fakeItem) *fakeSecretService {
+	f := unlockedDefault(items)
+	f.collections[fakeDefaultCollection].locked = true
+	f.prompt = prompt
+	return f
+}
+
+// withOther adds an unlocked non-default collection holding items.
+func (f *fakeSecretService) withOther(items map[dbus.ObjectPath]fakeItem) *fakeSecretService {
+	if f.collections == nil {
+		f.collections = map[dbus.ObjectPath]*fakeCollection{}
+	}
+	f.collections[fakeOtherCollection] = &fakeCollection{items: items}
+	return f
+}
+
+func chromeItem(path dbus.ObjectPath, secret string) map[dbus.ObjectPath]fakeItem {
+	return map[dbus.ObjectPath]fakeItem{path: {application: "chrome", secret: []byte(secret)}}
+}
+
+func (f *fakeSecretService) readAlias(_ context.Context, name string) (dbus.ObjectPath, error) {
+	f.calls = append(f.calls, "readAlias")
+	if name != defaultCollectionAlias {
+		return "", errors.New("readAlias asked for an alias other than default")
+	}
+	return f.alias, f.aliasErr
 }
 
 func (f *fakeSecretService) unlock(_ context.Context, objects []dbus.ObjectPath) ([]dbus.ObjectPath, dbus.ObjectPath, error) {
@@ -48,10 +98,21 @@ func (f *fakeSecretService) unlock(_ context.Context, objects []dbus.ObjectPath)
 	if f.unlockErr != nil {
 		return nil, "", f.unlockErr
 	}
-	if f.prompt != noPromptPath {
-		return nil, f.prompt, nil
+	unlocked := make([]dbus.ObjectPath, 0, len(objects))
+	for _, object := range objects {
+		c, ok := f.collections[object]
+		if !ok {
+			return nil, "", errors.New("unlock asked for a collection the fake never advertised")
+		}
+		if c.locked {
+			if f.prompt != noPromptPath {
+				return nil, f.prompt, nil
+			}
+			c.locked = false
+		}
+		unlocked = append(unlocked, object)
 	}
-	return objects, noPromptPath, nil
+	return unlocked, noPromptPath, nil
 }
 
 func (f *fakeSecretService) openSession(context.Context) (dbus.ObjectPath, error) {
@@ -59,15 +120,43 @@ func (f *fakeSecretService) openSession(context.Context) (dbus.ObjectPath, error
 	return fakeSession, f.sessionErr
 }
 
+func (f *fakeSecretService) searchItems(_ context.Context, collection dbus.ObjectPath, attributes map[string]string) ([]dbus.ObjectPath, error) {
+	f.calls = append(f.calls, "searchItems")
+	f.searched = collection
+	f.attributes = attributes
+	c, ok := f.collections[collection]
+	if !ok {
+		return nil, errors.New("searchItems asked for a collection the fake never advertised")
+	}
+	if f.searchErr != nil {
+		return nil, f.searchErr
+	}
+	var items []dbus.ObjectPath
+	for path, item := range c.items {
+		if item.application == attributes["application"] && attributes[secretSchemaAttribute] == chromiumSecretSchema {
+			items = append(items, path)
+		}
+	}
+	sort.Slice(items, func(i, j int) bool { return items[i] < items[j] })
+	return items, nil
+}
+
 func (f *fakeSecretService) getSecret(_ context.Context, item, session dbus.ObjectPath) ([]byte, error) {
 	f.calls = append(f.calls, "getSecret")
 	if session != fakeSession {
 		return nil, errors.New("getSecret used a session the fake never opened")
 	}
-	if item != fakeItemPath && item != fakeLockedPath {
-		return nil, errors.New("getSecret asked for an item the fake never returned")
+	for _, c := range f.collections {
+		secret, ok := c.items[item]
+		if !ok {
+			continue
+		}
+		if c.locked {
+			return nil, errors.New("getSecret read an item in a locked collection")
+		}
+		return secret.secret, f.secretErr
 	}
-	return f.secret, f.secretErr
+	return nil, errors.New("getSecret asked for an item the fake never returned")
 }
 
 func (f *fakeSecretService) close() {
@@ -85,6 +174,17 @@ func dialFailing(err error) secretServiceDialer {
 
 func TestLookupSafeStorageOutcomes(t *testing.T) {
 	busDown := &SecretServiceError{Op: "connect to the session bus", Err: errors.New("dial unix: connection refused")}
+	busErr := func(op string) *SecretServiceError {
+		return &SecretServiceError{Op: op, Err: errors.New("org.freedesktop.DBus.Error.Failed")}
+	}
+	staleChrome := chromeItem(fakeOtherItemPath, fakeStaleSecret)
+	failing := func(set func(*fakeSecretService)) *fakeSecretService {
+		f := unlockedDefault(chromeItem(fakeItemPath, fakeSecret))
+		set(f)
+		return f
+	}
+	full := []string{"readAlias", "unlock", "openSession", "searchItems", "getSecret", "close"}
+	searchedEmpty := []string{"readAlias", "unlock", "openSession", "searchItems", "close"}
 	cases := []struct {
 		name         string
 		dial         func(*fakeSecretService) secretServiceDialer
@@ -106,72 +206,117 @@ func TestLookupSafeStorageOutcomes(t *testing.T) {
 			wantErr: busDown,
 		},
 		{
-			name:         "service present with no matching item is the basic store",
+			name:         "no default collection is the basic store even beside another collection's Chrome item",
 			dial:         dialFake,
-			fake:         &fakeSecretService{prompt: noPromptPath},
+			fake:         (&fakeSecretService{alias: noCollectionPath, prompt: noPromptPath}).withOther(staleChrome),
 			wantPassword: basicStorePassword,
-			wantCalls:    []string{"searchItems", "close"},
+			wantCalls:    []string{"readAlias", "close"},
 		},
 		{
-			name:         "unlocked item yields its secret",
+			name:         "unlocked default with no item is the basic store",
 			dial:         dialFake,
-			fake:         &fakeSecretService{unlocked: []dbus.ObjectPath{fakeItemPath}, prompt: noPromptPath, secret: []byte(fakeSecret)},
-			wantPassword: SafeStorageKey(fakeSecret),
-			wantCalls:    []string{"searchItems", "openSession", "getSecret", "close"},
+			fake:         unlockedDefault(nil),
+			wantPassword: basicStorePassword,
+			wantCalls:    searchedEmpty,
 		},
 		{
-			name:         "locked item the service unlocks without a prompt yields its secret",
+			name:         "default item for another application is the basic store",
 			dial:         dialFake,
-			fake:         &fakeSecretService{locked: []dbus.ObjectPath{fakeLockedPath}, prompt: noPromptPath, secret: []byte(fakeSecret)},
-			wantPassword: SafeStorageKey(fakeSecret),
-			wantCalls:    []string{"searchItems", "unlock", "openSession", "getSecret", "close"},
+			fake:         unlockedDefault(map[dbus.ObjectPath]fakeItem{fakeItemPath: {application: "other-app", secret: []byte(fakeStaleSecret)}}),
+			wantPassword: basicStorePassword,
+			wantCalls:    searchedEmpty,
 		},
 		{
-			name:      "locked item that needs a prompt is an error and the prompt is never run",
+			name:         "no default item is the basic store even when another unlocked collection holds a stale Chrome item",
+			dial:         dialFake,
+			fake:         unlockedDefault(nil).withOther(staleChrome),
+			wantPassword: basicStorePassword,
+			wantCalls:    searchedEmpty,
+		},
+		{
+			name:         "unlocked default item yields its secret",
+			dial:         dialFake,
+			fake:         unlockedDefault(chromeItem(fakeItemPath, fakeSecret)),
+			wantPassword: SafeStorageKey(fakeSecret),
+			wantCalls:    full,
+		},
+		{
+			name:         "default item wins over a stale item in another unlocked collection",
+			dial:         dialFake,
+			fake:         unlockedDefault(chromeItem(fakeItemPath, fakeSecret)).withOther(staleChrome),
+			wantPassword: SafeStorageKey(fakeSecret),
+			wantCalls:    full,
+		},
+		{
+			name:         "locked default the service unlocks without a prompt yields its secret",
+			dial:         dialFake,
+			fake:         lockedDefault(noPromptPath, chromeItem(fakeItemPath, fakeSecret)),
+			wantPassword: SafeStorageKey(fakeSecret),
+			wantCalls:    full,
+		},
+		{
+			name:      "locked default that needs a prompt is an error and an unlocked non-default is never read",
 			dial:      dialFake,
-			fake:      &fakeSecretService{locked: []dbus.ObjectPath{fakeLockedPath}, prompt: fakePrompt, secret: []byte(fakeSecret)},
+			fake:      lockedDefault(fakePrompt, chromeItem(fakeItemPath, fakeSecret)).withOther(staleChrome),
 			wantErr:   ErrSecretServiceLocked,
-			wantCalls: []string{"searchItems", "unlock", "close"},
+			wantCalls: []string{"readAlias", "unlock", "close"},
 		},
 		{
-			name:      "search failure is an error",
+			name:      "locked default with no item still needs the prompt and is an error",
 			dial:      dialFake,
-			fake:      &fakeSecretService{searchErr: &SecretServiceError{Op: "SearchItems", Err: errors.New("org.freedesktop.DBus.Error.ServiceUnknown")}, secret: []byte(fakeSecret)},
+			fake:      lockedDefault(fakePrompt, nil).withOther(staleChrome),
+			wantErr:   ErrSecretServiceLocked,
+			wantCalls: []string{"readAlias", "unlock", "close"},
+		},
+		{
+			name:      "alias read failure is an error",
+			dial:      dialFake,
+			fake:      &fakeSecretService{aliasErr: busErr("ReadAlias")},
 			wantErr:   &SecretServiceError{},
-			wantCalls: []string{"searchItems", "close"},
+			wantCalls: []string{"readAlias", "close"},
 		},
 		{
 			name:      "unlock failure is an error",
 			dial:      dialFake,
-			fake:      &fakeSecretService{locked: []dbus.ObjectPath{fakeLockedPath}, unlockErr: &SecretServiceError{Op: "Unlock", Err: errors.New("org.freedesktop.DBus.Error.Failed")}, secret: []byte(fakeSecret)},
+			fake:      failing(func(f *fakeSecretService) { f.unlockErr = busErr("Unlock") }),
 			wantErr:   &SecretServiceError{},
-			wantCalls: []string{"searchItems", "unlock", "close"},
+			wantCalls: []string{"readAlias", "unlock", "close"},
 		},
 		{
 			name:      "session failure is an error",
 			dial:      dialFake,
-			fake:      &fakeSecretService{unlocked: []dbus.ObjectPath{fakeItemPath}, prompt: noPromptPath, sessionErr: &SecretServiceError{Op: "OpenSession", Err: errors.New("org.freedesktop.DBus.Error.NotSupported")}, secret: []byte(fakeSecret)},
+			fake:      failing(func(f *fakeSecretService) { f.sessionErr = busErr("OpenSession") }),
 			wantErr:   &SecretServiceError{},
-			wantCalls: []string{"searchItems", "openSession", "close"},
+			wantCalls: []string{"readAlias", "unlock", "openSession", "close"},
+		},
+		{
+			name:      "search failure is an error",
+			dial:      dialFake,
+			fake:      failing(func(f *fakeSecretService) { f.searchErr = busErr("SearchItems") }),
+			wantErr:   &SecretServiceError{},
+			wantCalls: searchedEmpty,
 		},
 		{
 			name:      "secret read failure is an error",
 			dial:      dialFake,
-			fake:      &fakeSecretService{unlocked: []dbus.ObjectPath{fakeItemPath}, prompt: noPromptPath, secretErr: &SecretServiceError{Op: "GetSecret", Err: errors.New("org.freedesktop.Secret.Error.IsLocked")}, secret: []byte(fakeSecret)},
+			fake:      failing(func(f *fakeSecretService) { f.secretErr = busErr("GetSecret") }),
 			wantErr:   &SecretServiceError{},
-			wantCalls: []string{"searchItems", "openSession", "getSecret", "close"},
+			wantCalls: full,
 		},
 		{
 			name:      "empty secret is an error",
 			dial:      dialFake,
-			fake:      &fakeSecretService{unlocked: []dbus.ObjectPath{fakeItemPath}, prompt: noPromptPath},
+			fake:      unlockedDefault(chromeItem(fakeItemPath, "")),
 			wantErr:   &SecretServiceError{},
-			wantCalls: []string{"searchItems", "openSession", "getSecret", "close"},
+			wantCalls: full,
 		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			password, err := lookupSafeStorage(context.Background(), tc.dial(tc.fake), "chrome")
+			if password == SafeStorageKey(fakeStaleSecret) {
+				t.Fatal("password is the secret of a collection other than default")
+			}
 			if tc.wantErr != nil {
 				assertLookupError(t, err, tc.wantErr)
 				if password != "" {
@@ -191,15 +336,19 @@ func TestLookupSafeStorageOutcomes(t *testing.T) {
 			if len(tc.wantCalls) > 0 && !tc.fake.closed {
 				t.Fatalf("connection not closed")
 			}
-			if len(tc.wantCalls) > 0 {
-				wantAttributes := map[string]string{"application": "chrome", secretSchemaAttribute: chromiumSecretSchema}
-				if len(tc.fake.attributes) != len(wantAttributes) {
-					t.Fatalf("search attributes = %v, want %v", tc.fake.attributes, wantAttributes)
-				}
-				for k, v := range wantAttributes {
-					if tc.fake.attributes[k] != v {
-						t.Fatalf("search attribute %q = %q, want %q", k, tc.fake.attributes[k], v)
-					}
+			if !strings.Contains(strings.Join(tc.wantCalls, " "), "searchItems") {
+				return
+			}
+			if tc.fake.searched != fakeDefaultCollection {
+				t.Fatalf("searched collection %q, want the default %q", tc.fake.searched, fakeDefaultCollection)
+			}
+			wantAttributes := map[string]string{"application": "chrome", secretSchemaAttribute: chromiumSecretSchema}
+			if len(tc.fake.attributes) != len(wantAttributes) {
+				t.Fatalf("search attributes = %v, want %v", tc.fake.attributes, wantAttributes)
+			}
+			for k, v := range wantAttributes {
+				if tc.fake.attributes[k] != v {
+					t.Fatalf("search attribute %q = %q, want %q", k, tc.fake.attributes[k], v)
 				}
 			}
 		})
@@ -211,8 +360,8 @@ func assertLookupError(t *testing.T, err, want error) {
 	if err == nil {
 		t.Fatalf("err = nil, want %v", want)
 	}
-	if strings.Contains(err.Error(), fakeSecret) {
-		t.Fatalf("error text carries the secret: %q", err.Error())
+	if strings.Contains(err.Error(), fakeSecret) || strings.Contains(err.Error(), fakeStaleSecret) {
+		t.Fatalf("error text carries a secret: %q", err.Error())
 	}
 	var wantSvc, svcErr *SecretServiceError
 	if errors.As(want, &wantSvc) {
@@ -264,29 +413,24 @@ func TestSessionBusAddressNeverAutolaunches(t *testing.T) {
 }
 
 // busSecretService is a minimal org.freedesktop.Secret.Service exported on a real
-// session bus: one unlocked item per application in items, one locked item per
-// application in locked whose unlock always needs a prompt.
+// session bus: its "default" alias names fakeDefaultCollection, and Unlock needs
+// a prompt for every object while locked is set.
 type busSecretService struct {
-	items  map[string]dbus.ObjectPath
-	locked map[string]dbus.ObjectPath
+	locked atomic.Bool
 }
 
-func (s *busSecretService) SearchItems(attributes map[string]string) ([]dbus.ObjectPath, []dbus.ObjectPath, *dbus.Error) {
-	if attributes[secretSchemaAttribute] != chromiumSecretSchema {
-		return []dbus.ObjectPath{}, []dbus.ObjectPath{}, nil
+func (s *busSecretService) ReadAlias(name string) (dbus.ObjectPath, *dbus.Error) {
+	if name != defaultCollectionAlias {
+		return noCollectionPath, nil
 	}
-	unlocked, locked := []dbus.ObjectPath{}, []dbus.ObjectPath{}
-	if item, ok := s.items[attributes["application"]]; ok {
-		unlocked = append(unlocked, item)
-	}
-	if item, ok := s.locked[attributes["application"]]; ok {
-		locked = append(locked, item)
-	}
-	return unlocked, locked, nil
+	return fakeDefaultCollection, nil
 }
 
-func (s *busSecretService) Unlock([]dbus.ObjectPath) ([]dbus.ObjectPath, dbus.ObjectPath, *dbus.Error) {
-	return []dbus.ObjectPath{}, fakePrompt, nil
+func (s *busSecretService) Unlock(objects []dbus.ObjectPath) ([]dbus.ObjectPath, dbus.ObjectPath, *dbus.Error) {
+	if s.locked.Load() {
+		return []dbus.ObjectPath{}, fakePrompt, nil
+	}
+	return objects, noPromptPath, nil
 }
 
 func (s *busSecretService) OpenSession(algorithm string, _ dbus.Variant) (dbus.Variant, dbus.ObjectPath, *dbus.Error) {
@@ -294,6 +438,22 @@ func (s *busSecretService) OpenSession(algorithm string, _ dbus.Variant) (dbus.V
 		return dbus.Variant{}, "", dbus.MakeFailedError(errors.New("unsupported algorithm"))
 	}
 	return dbus.MakeVariant(""), fakeSession, nil
+}
+
+// busSecretCollection is one org.freedesktop.Secret.Collection exported on the
+// bus: one Chrome-schema item per application in items.
+type busSecretCollection struct {
+	items map[string]dbus.ObjectPath
+}
+
+func (c *busSecretCollection) SearchItems(attributes map[string]string) ([]dbus.ObjectPath, *dbus.Error) {
+	if attributes[secretSchemaAttribute] != chromiumSecretSchema {
+		return []dbus.ObjectPath{}, nil
+	}
+	if item, ok := c.items[attributes["application"]]; ok {
+		return []dbus.ObjectPath{item}, nil
+	}
+	return []dbus.ObjectPath{}, nil
 }
 
 type busSecretItem struct {
@@ -327,18 +487,24 @@ func TestSecretServiceOverRealSessionBus(t *testing.T) {
 	if reply != dbus.RequestNameReplyPrimaryOwner {
 		t.Fatalf("RequestName reply = %v, want primary owner (a real Secret Service is running on this bus)", reply)
 	}
-	svc := &busSecretService{
-		items:  map[string]dbus.ObjectPath{"chrome": fakeItemPath},
-		locked: map[string]dbus.ObjectPath{"locked-app": fakeLockedPath},
-	}
+	svc := &busSecretService{}
 	if err := conn.Export(svc, secretServicePath, secretServiceIface); err != nil {
 		t.Fatalf("export service: %v", err)
 	}
-	if err := conn.Export(&busSecretItem{value: []byte(fakeSecret)}, fakeItemPath, secretItemIface); err != nil {
-		t.Fatalf("export item: %v", err)
+	exports := []struct {
+		object any
+		path   dbus.ObjectPath
+		iface  string
+	}{
+		{&busSecretCollection{items: map[string]dbus.ObjectPath{"chrome": fakeItemPath}}, fakeDefaultCollection, secretCollectionIface},
+		{&busSecretCollection{items: map[string]dbus.ObjectPath{"chrome": fakeOtherItemPath, "chromium": fakeOtherItemPath}}, fakeOtherCollection, secretCollectionIface},
+		{&busSecretItem{value: []byte(fakeSecret)}, fakeItemPath, secretItemIface},
+		{&busSecretItem{value: []byte(fakeStaleSecret)}, fakeOtherItemPath, secretItemIface},
 	}
-	if err := conn.Export(&busSecretItem{value: []byte(fakeSecret)}, fakeLockedPath, secretItemIface); err != nil {
-		t.Fatalf("export locked item: %v", err)
+	for _, e := range exports {
+		if err := conn.Export(e.object, e.path, e.iface); err != nil {
+			t.Fatalf("export %s: %v", e.path, err)
+		}
 	}
 	ctx := context.Background()
 
@@ -347,7 +513,7 @@ func TestSecretServiceOverRealSessionBus(t *testing.T) {
 		t.Fatalf("ObtainKeyUnprompted(chrome): %v", err)
 	}
 	if want := DeriveKey(SafeStorageKey(fakeSecret)); !bytes.Equal(key, want) {
-		t.Fatalf("chrome key = %x, want the key derived from the exported secret", key)
+		t.Fatalf("chrome key = %x, want the key derived from the default collection's secret", key)
 	}
 
 	key, err = LinuxConsent{}.ObtainKeyUnprompted(ctx, Browser{SecretServiceApplication: "chromium"})
@@ -355,14 +521,15 @@ func TestSecretServiceOverRealSessionBus(t *testing.T) {
 		t.Fatalf("ObtainKeyUnprompted(chromium): %v", err)
 	}
 	if !bytes.Equal(key, linuxBasicKey) {
-		t.Fatalf("chromium key = %x, want the basic-store key (no item)", key)
+		t.Fatalf("chromium key = %x, want the basic-store key (no item in the default collection)", key)
 	}
 
-	key, err = LinuxConsent{}.ObtainKeyUnprompted(ctx, Browser{SecretServiceApplication: "locked-app"})
+	svc.locked.Store(true)
+	key, err = LinuxConsent{}.ObtainKeyUnprompted(ctx, Browser{SecretServiceApplication: "chrome"})
 	if !errors.Is(err, ErrSecretServiceLocked) {
-		t.Fatalf("ObtainKeyUnprompted(locked-app) = %x, %v; want ErrSecretServiceLocked", key, err)
+		t.Fatalf("ObtainKeyUnprompted(chrome) over a locked default = %x, %v; want ErrSecretServiceLocked", key, err)
 	}
 	if key != nil {
-		t.Fatalf("locked-app key = %x, want nil", key)
+		t.Fatalf("locked default key = %x, want nil", key)
 	}
 }

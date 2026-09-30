@@ -9,7 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - **Linux amd64 support for private single-user VMs.** Ship
   `cookiesync_linux_amd64.tar.gz` with `requestor`, `auth`, cookie output formats,
-  and the bridge commands. Chrome and Chromium profiles use `$XDG_CONFIG_HOME`.
+  and the bridge commands. Chrome profiles use `$XDG_CONFIG_HOME/google-chrome`;
+  Chromium is not registered until a Mac approver can resolve it.
   Chromium v10 cookies use a fixed key; v11 uses the Secret Service secret.
   Bridges run headless without a display. Every process running as the same user
   can control the daemon.

@@ -103,7 +103,7 @@ cookiesync doctor
 
 `install` initializes cookiesync state and starts the resident helper; it writes no synckit manifest. `doctor` checks the supervisor, socket, memory cache, mesh, browser roots, and Chrome binary.
 
-`requestor`, `auth --reason`, `bridge open --json`, and `bridge stop` keep their command contracts. `cookies` supports `playwright`, `webstorage`, `header`, `netscape`, and `json` output. Chrome and Chromium profiles live under `$XDG_CONFIG_HOME`, defaulting to `~/.config`. Chromium v10 cookies use a fixed key; v11 uses the Secret Service secret. The bridge runs headless when both `DISPLAY` and `WAYLAND_DISPLAY` are unset.
+`requestor`, `auth --reason`, `bridge open --json`, and `bridge stop` keep their command contracts. `cookies` supports `playwright`, `webstorage`, `header`, `netscape`, and `json` output. Chrome profiles live under `$XDG_CONFIG_HOME/google-chrome`, defaulting to `~/.config/google-chrome`; Chromium is not registered yet, because the Mac that approves consent must resolve the same browser name. Chromium v10 cookies use a fixed key; v11 uses the Secret Service secret. The bridge runs headless when both `DISPLAY` and `WAYLAND_DISPLAY` are unset.
 
 Linux never approves consent. Local key release routes to an already configured, attended Mac peer or fails closed. Cached keys and grants stay in process memory and expire within five minutes. There is no automatic pairing. A standalone host with no peers fails closed on `auth` and `cookies`.
 

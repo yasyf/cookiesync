@@ -15,6 +15,8 @@ import (
 	"github.com/yasyf/cookiesync/internal/rpc"
 )
 
+var rpcCall = rpc.Call
+
 func newRPCCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "rpc",
@@ -41,7 +43,7 @@ func newRPCCmd() *cobra.Command {
 // compact JSON line to the command's stdout — the frozen shape peers and the
 // agent-browser skill parse off ssh.
 func rpcPassthrough(cmd *cobra.Command, method string, params map[string]any) error {
-	result, err := rpc.Call(cmd.Context(), method, params)
+	result, err := rpcCall(cmd.Context(), method, params)
 	if err != nil {
 		return err
 	}
@@ -271,26 +273,28 @@ func newRPCBridgeConsentCmd() *cobra.Command {
 
 func newRPCBridgeOpenCmd() *cobra.Command {
 	var browser, profile, host, origin, advertise string
-	var headless bool
+	var headed, headless bool
 	cmd := &cobra.Command{
 		Use:   "bridge_open",
 		Short: "Ask the daemon to open a cookie-seeded CDP bridge and return its ws endpoint.",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			return rpcPassthrough(cmd, "bridge_open", map[string]any{
+			params := map[string]any{
 				"host":      host,
 				"browser":   browser,
 				"profile":   profile,
-				"headed":    !headless,
 				"origin":    origin,
 				"advertise": advertise,
-			})
+			}
+			setWindowParam(params, windowMode(cmd, headed, headless))
+			return rpcPassthrough(cmd, "bridge_open", params)
 		},
 	}
 	cmd.Flags().StringVar(&browser, "browser", "", "The browser to seed the bridge from.")
 	cmd.Flags().StringVar(&profile, "profile", "Default", "The profile to seed the bridge from.")
 	cmd.Flags().StringVar(&host, "host", "", "The host that owns the browser (empty = local).")
-	cmd.Flags().BoolVar(&headless, "headless", false, "Run Chrome headless.")
+	cmd.Flags().BoolVar(&headed, "headed", false, "Run Chrome headed (the default wherever the daemon has a display).")
+	cmd.Flags().BoolVar(&headless, "headless", false, "Run Chrome headless (the default where the daemon has no display).")
 	cmd.Flags().StringVar(&origin, "origin", "", "Originating host named in the bridge consent prompt (display only).")
 	cmd.Flags().StringVar(&advertise, "advertise", "", "host:port baked into /json/version for a cross-host ssh -L client.")
 	_ = cmd.MarkFlagRequired("browser")

@@ -8,8 +8,10 @@ import (
 
 	"github.com/yasyf/daemonkit"
 	"github.com/yasyf/daemonkit/supervise"
+	"github.com/yasyf/synckit/helperruntime"
 
 	"github.com/yasyf/cookiesync/internal/daemon"
+	"github.com/yasyf/cookiesync/internal/paths"
 )
 
 const lifecycleBudget = 30 * time.Second
@@ -39,9 +41,13 @@ func Ensure(ctx context.Context) (daemonkit.Ensured, error) {
 
 // Stop drains the resident helper and removes it from the supervisor, so a
 // restarted supervisor no longer resumes it. Stopping a helper that was never
-// applied succeeds.
+// applied succeeds, since Stop names no program for daemonkit to resolve.
 func Stop(ctx context.Context) error {
-	resident, err := helperClient()
+	spec, err := helperruntime.Spec(paths.ToolName, daemonkit.Program{}, 0)
+	if err != nil {
+		return err
+	}
+	resident, err := daemonkit.Open(spec)
 	if err != nil {
 		return err
 	}

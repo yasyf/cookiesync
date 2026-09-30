@@ -124,22 +124,22 @@ func writeLinuxWebStorage(t *testing.T, browser cookie.Browser, profile string) 
 	})
 }
 
-// TestLinuxChromiumProfileRendersEveryConsumerFormat drives a synthetic Linux Chromium
+// TestLinuxChromeProfileRendersEveryConsumerFormat drives a synthetic Linux Chrome
 // profile (v10 rows in a meta-24 store, Local and Session Storage LevelDBs) through the
 // in-process daemon with a warm key and a consent double, then renders the replies the
 // way the cookies command does and pins the exact bytes of each consumer format.
-func TestLinuxChromiumProfileRendersEveryConsumerFormat(t *testing.T) {
+func TestLinuxChromeProfileRendersEveryConsumerFormat(t *testing.T) {
 	ctx := context.Background()
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
 	t.Setenv("COOKIESYNC_CONFIG_DIR", filepath.Join(home, ".config", "cookiesync"))
-	browser, err := cookie.Lookup("chromium")
+	browser, err := cookie.Lookup("chrome")
 	if err != nil {
-		t.Fatalf("lookup chromium: %v", err)
+		t.Fatalf("lookup chrome: %v", err)
 	}
-	if want := filepath.Join(home, ".config", "chromium"); browser.DataRoot != want {
-		t.Fatalf("chromium data root = %q, want %q", browser.DataRoot, want)
+	if want := filepath.Join(home, ".config", "google-chrome"); browser.DataRoot != want {
+		t.Fatalf("chrome data root = %q, want %q", browser.DataRoot, want)
 	}
 	writeLinuxCookieStore(t, browser, "Default", []linuxRow{
 		{host: "app.example.test", name: "sid", value: "s3ss10n", secure: true, httpOnly: true, sameSite: 1},
@@ -151,17 +151,17 @@ func TestLinuxChromiumProfileRendersEveryConsumerFormat(t *testing.T) {
 	st := stateWith("me@vm", "")
 	cache := newFakeCache()
 	key := cookie.DeriveKey(cookie.SafeStorageKey("peanuts"))
-	_, _ = cache.Put(ctx, endpointID("me@vm", "chromium", "Default"), []byte(key), 0)
+	_, _ = cache.Put(ctx, endpointID("me@vm", "chrome", "Default"), []byte(key), 0)
 	consent := &fakeConsent{}
 	d := New(consent, cache, nil, staticProbe(SessionSnapshot{}), &recordingRunner{}, fixedState{st: st}, fixedState{st: st})
-	d.grant("local", []cookie.BrowserName{"chromium"}, time.Hour)
+	d.grant(ownSessionPrincipal(t), []cookie.BrowserName{"chrome"}, time.Hour)
 
-	params := map[string]any{"browser": "chromium", "profile": "Default", "urls": []any{"https://app.example.test/"}}
-	cookiesReply, err := d.handleGetCookies(ctx, params)
+	params := map[string]any{"browser": "chrome", "profile": "Default", "urls": []any{"https://app.example.test/"}}
+	cookiesReply, err := dispatchSelf(t, d, "get_cookies", params)
 	if err != nil {
 		t.Fatalf("get_cookies: %v", err)
 	}
-	storageReply, err := d.handleGetWebStorage(ctx, params)
+	storageReply, err := dispatchSelf(t, d, "get_web_storage", params)
 	if err != nil {
 		t.Fatalf("get_web_storage: %v", err)
 	}

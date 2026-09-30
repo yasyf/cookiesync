@@ -104,9 +104,7 @@ var openBridge = func(ctx context.Context, host, browser, profile string, window
 		"profile": profile,
 		"host":    host,
 	}
-	if window != bridge.WindowAuto {
-		params["headed"] = window == bridge.WindowHeaded
-	}
+	setWindowParam(params, window)
 	if r, ok := resolveRequestor(); ok {
 		params["requestor"] = r
 	}
@@ -292,6 +290,12 @@ func windowMode(cmd *cobra.Command, headed, headless bool) bridge.WindowMode {
 	}
 }
 
+func setWindowParam(params map[string]any, window bridge.WindowMode) {
+	if window != bridge.WindowAuto {
+		params["headed"] = window == bridge.WindowHeaded
+	}
+}
+
 // arg returns the single optional positional, or "".
 func arg(args []string) string {
 	if len(args) == 1 {
@@ -315,11 +319,7 @@ func parseBridgeTarget(target, browser, profile string) (host, br, prof string, 
 		case 1:
 			br = parts[0]
 		case 2:
-			profileForm, err := browserProfileForm(parts[0], parts[1])
-			if err != nil {
-				return "", "", "", err
-			}
-			if profileForm {
+			if browserProfileForm(parts[0], parts[1]) {
 				br, prof = parts[0], parts[1]
 			} else {
 				host, br = parts[0], parts[1]
@@ -337,14 +337,10 @@ func parseBridgeTarget(target, browser, profile string) (host, br, prof string, 
 	return host, br, prof, nil
 }
 
-func browserProfileForm(first, second string) (bool, error) {
-	registry, err := cookie.Registry()
-	if err != nil {
-		return false, err
-	}
-	_, firstIsBrowser := registry[cookie.BrowserName(first)]
-	_, secondIsBrowser := registry[cookie.BrowserName(second)]
-	return firstIsBrowser && !secondIsBrowser, nil
+func browserProfileForm(first, second string) bool {
+	_, firstIsBrowser := cookie.BrowserNames[cookie.BrowserName(first)]
+	_, secondIsBrowser := cookie.BrowserNames[cookie.BrowserName(second)]
+	return firstIsBrowser && !secondIsBrowser
 }
 
 // bridgeCapKey is the stable client-side lookup key for a target's capability.

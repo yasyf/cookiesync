@@ -27,6 +27,6 @@ func TestRegistryDarwinUsesApplicationSupport(t *testing.T) {
 		}
 	}
 	if _, err := Lookup("chromium"); err == nil {
-		t.Fatal("chromium is registered on Linux only")
+		t.Fatal("chromium is registered on no platform: Darwin holds chrome and arc, Linux holds chrome")
 	}
 }

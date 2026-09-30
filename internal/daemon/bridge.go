@@ -130,18 +130,16 @@ func (s *bridgeSession) Teardown() {
 // session, or silently re-attaches a caller that presents a live capability.
 // Phase A is LOCAL-only: another host fails with a not-yet-available error.
 func (d *Daemon) handleBridgeOpen(ctx context.Context, params map[string]any) (any, error) {
-	requestor := requestorID(ctx, params)
+	requestor, err := requestorID(ctx, params)
+	if err != nil {
+		return nil, err
+	}
 
 	browser, err := stringParam(params, "browser")
 	if err != nil {
 		return nil, err
 	}
-	registry, err := cookie.Registry()
-	if err != nil {
-		return nil, err
-	}
-	browserObj, ok := registry[cookie.BrowserName(browser)]
-	if !ok {
+	if _, ok := cookie.BrowserNames[cookie.BrowserName(browser)]; !ok {
 		return nil, fmt.Errorf("unknown browser %q", browser)
 	}
 
@@ -174,9 +172,13 @@ func (d *Daemon) handleBridgeOpen(ctx context.Context, params map[string]any) (a
 	}
 
 	if host != self {
-		return d.remoteBridgeOpen(ctx, self, host, browser, profile, window != bridge.WindowHeadless)
+		return d.remoteBridgeOpen(ctx, self, host, browser, profile, window)
 	}
 
+	browserObj, err := cookie.Lookup(cookie.BrowserName(browser))
+	if err != nil {
+		return nil, err
+	}
 	resolved, err := resolveBridgeProfile(browserObj, profile)
 	if err != nil {
 		return nil, err

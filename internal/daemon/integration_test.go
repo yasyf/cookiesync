@@ -9,7 +9,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -53,13 +52,14 @@ CREATE UNIQUE INDEX cookies_unique_index ON cookies(
 
 const liveExpiresUTC cookie.ChromeMicros = 15_746_918_400_000_000
 
-// chromeStoreUnderHome points HOME at a temp dir and creates an empty Chrome v24
-// cookie store for the Default profile there, so cookie.Lookup("chrome") resolves to
-// it. It returns the chrome Browser the handlers will resolve.
+// chromeStoreUnderHome points HOME and XDG_CONFIG_HOME at a temp dir and creates an
+// empty Chrome v24 cookie store for the Default profile there, so cookie.Lookup("chrome")
+// resolves to it. It returns the chrome Browser the handlers will resolve.
 func chromeStoreUnderHome(t *testing.T) cookie.Browser {
 	t.Helper()
 	home := t.TempDir()
 	t.Setenv("HOME", home)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
 	browser, err := cookie.Lookup("chrome")
 	if err != nil {
 		t.Fatalf("lookup chrome: %v", err)
@@ -69,7 +69,8 @@ func chromeStoreUnderHome(t *testing.T) cookie.Browser {
 }
 
 // addChromeProfileStore creates an empty Chrome v24 cookie store for profile under
-// the browser's (already HOME-redirected) profile root.
+// the browser's (already HOME-redirected) profile root, carrying whatever the host
+// codec needs to learn the store's encryption tag.
 func addChromeProfileStore(t *testing.T, browser cookie.Browser, profile string) {
 	t.Helper()
 	if err := os.MkdirAll(browser.ProfileDir(profile), 0o700); err != nil {
@@ -83,6 +84,7 @@ func addChromeProfileStore(t *testing.T, browser cookie.Browser, profile string)
 	if _, err := db.Exec(v24Schema); err != nil {
 		t.Fatalf("schema: %v", err)
 	}
+	plantStoreTagAnchor(t, db)
 }
 
 // TestGetCookiesMergesURLsFromCachedKey proves get_cookies, against a real store and a
@@ -108,9 +110,9 @@ func TestGetCookiesMergesURLsFromCachedKey(t *testing.T) {
 	fakeMesh(t, "me@laptop")
 	d := New(&fakeConsent{}, cache, nil, staticProbe(SessionSnapshot{}), &recordingRunner{}, fixedState{st: st}, fixedState{st: st})
 	_, _ = cache.Put(ctx, endpointID("me@laptop", "chrome", "Default"), []byte(key), 0)
-	d.grant("local", []cookie.BrowserName{"chrome"}, time.Hour)
+	d.grant(ownSessionPrincipal(t), []cookie.BrowserName{"chrome"}, time.Hour)
 
-	got, err := d.handleGetCookies(ctx, map[string]any{
+	got, err := dispatchSelf(t, d, "get_cookies", map[string]any{
 		"browser": "chrome",
 		"urls":    []any{"https://x.com/", "https://api.example.com/"},
 	})
@@ -143,9 +145,9 @@ func TestGetCookiesHostFilters(t *testing.T) {
 	fakeMesh(t, "me@laptop")
 	d := New(&fakeConsent{}, cache, nil, staticProbe(SessionSnapshot{}), &recordingRunner{}, fixedState{st: stateWith("me@laptop", "")}, fixedState{st: stateWith("me@laptop", "")})
 	_, _ = cache.Put(ctx, endpointID("me@laptop", "chrome", "Default"), []byte(key), 0)
-	d.grant("local", []cookie.BrowserName{"chrome"}, time.Hour)
+	d.grant(ownSessionPrincipal(t), []cookie.BrowserName{"chrome"}, time.Hour)
 
-	got, err := d.handleGetCookies(ctx, map[string]any{"browser": "chrome", "urls": []any{"https://x.com/"}})
+	got, err := dispatchSelf(t, d, "get_cookies", map[string]any{"browser": "chrome", "urls": []any{"https://x.com/"}})
 	if err != nil {
 		t.Fatalf("handleGetCookies: %v", err)
 	}
@@ -185,9 +187,9 @@ func TestGetCookiesUnionLocalAndRemote(t *testing.T) {
 	consent := &fakeConsent{key: key}
 	d := New(consent, cache, nil, staticProbe(SessionSnapshot{}), runner, fixedState{st: st}, fixedState{st: st})
 	_, _ = cache.Put(ctx, endpointID(self, "chrome", "Default"), []byte(key), 0)
-	d.grant("local", []cookie.BrowserName{"chrome"}, time.Hour)
+	d.grant(ownSessionPrincipal(t), []cookie.BrowserName{"chrome"}, time.Hour)
 
-	got, err := d.handleGetCookies(ctx, map[string]any{"urls": []any{"https://x.com/"}})
+	got, err := dispatchSelf(t, d, "get_cookies", map[string]any{"urls": []any{"https://x.com/"}})
 	if err != nil {
 		t.Fatalf("handleGetCookies union: %v", err)
 	}
@@ -249,10 +251,10 @@ func unionWarning(t *testing.T, peers []string, runner engine.SSHRunner, wantRem
 	cache := newFakeCache()
 	d := New(&fakeConsent{key: key}, cache, nil, staticProbe(SessionSnapshot{}), runner, fixedState{st: st}, fixedState{st: st})
 	_, _ = cache.Put(ctx, endpointID(self, "chrome", "Default"), []byte(key), 0)
-	d.grant("local", []cookie.BrowserName{"chrome"}, time.Hour)
+	d.grant(ownSessionPrincipal(t), []cookie.BrowserName{"chrome"}, time.Hour)
 
 	start := time.Now()
-	got, err := d.handleGetCookies(ctx, map[string]any{"urls": []any{"https://x.com/"}})
+	got, err := dispatchSelf(t, d, "get_cookies", map[string]any{"urls": []any{"https://x.com/"}})
 	if err != nil {
 		t.Fatalf("handleGetCookies union: %v", err)
 	}
@@ -392,9 +394,9 @@ func TestGetCookiesUnionLocalWinsTie(t *testing.T) {
 	cache := newFakeCache()
 	d := New(&fakeConsent{key: key}, cache, nil, staticProbe(SessionSnapshot{}), runner, fixedState{st: st}, fixedState{st: st})
 	_, _ = cache.Put(ctx, endpointID(self, "chrome", "Default"), []byte(key), 0)
-	d.grant("local", []cookie.BrowserName{"chrome"}, time.Hour)
+	d.grant(ownSessionPrincipal(t), []cookie.BrowserName{"chrome"}, time.Hour)
 
-	got, err := d.handleGetCookies(ctx, map[string]any{"urls": []any{"https://x.com/"}})
+	got, err := dispatchSelf(t, d, "get_cookies", map[string]any{"urls": []any{"https://x.com/"}})
 	if err != nil {
 		t.Fatalf("handleGetCookies union: %v", err)
 	}
@@ -438,7 +440,7 @@ func TestGetCookiesUnionColdLocalRoutesRemoteContributes(t *testing.T) {
 	d := New(consent, newFakeCache(), nil, staticProbe(SessionSnapshot{}), runner, fixedState{st: st}, fixedState{st: st})
 	pinnedNonce(d, nonce)
 
-	got, err := d.handleGetCookies(ctx, map[string]any{"urls": []any{"https://x.com/"}})
+	got, err := dispatchSelf(t, d, "get_cookies", map[string]any{"urls": []any{"https://x.com/"}})
 	if err != nil {
 		t.Fatalf("handleGetCookies union: %v", err)
 	}
@@ -467,7 +469,6 @@ func TestGetCookiesUnionColdLocalRoutesRemoteContributes(t *testing.T) {
 // cold local leg that tries to route but finds no live approver is skipped with a warning
 // naming the endpoint, the remote endpoint still contributes, and no key is released.
 func TestGetCookiesUnionColdLocalRouteDeniedRemoteContributes(t *testing.T) {
-	ctx := context.Background()
 	chromeStoreUnderHome(t)
 	self := "me@laptop"
 	peer := "you@desktop"
@@ -487,7 +488,7 @@ func TestGetCookiesUnionColdLocalRouteDeniedRemoteContributes(t *testing.T) {
 	consent := &fakeConsent{key: cookie.DeriveKey(cookie.SafeStorageKey("peanuts"))}
 	d := New(consent, newFakeCache(), nil, staticProbe(SessionSnapshot{}), runner, fixedState{st: st}, fixedState{st: st})
 
-	got, err := d.handleGetCookies(ctx, map[string]any{"urls": []any{"https://x.com/"}})
+	got, err := dispatchSelf(t, d, "get_cookies", map[string]any{"urls": []any{"https://x.com/"}})
 	if err != nil {
 		t.Fatalf("handleGetCookies union: %v", err)
 	}
@@ -531,9 +532,9 @@ func TestGetCookiesUnionBrokenLocalStoreSkipped(t *testing.T) {
 	cache := newFakeCache()
 	d := New(&fakeConsent{key: key}, cache, nil, staticProbe(SessionSnapshot{}), runner, fixedState{st: st}, fixedState{st: st})
 	_, _ = cache.Put(ctx, endpointID(self, "chrome", "Ghost"), []byte(key), 0)
-	d.grant("local", []cookie.BrowserName{"chrome"}, time.Hour)
+	d.grant(ownSessionPrincipal(t), []cookie.BrowserName{"chrome"}, time.Hour)
 
-	got, err := d.handleGetCookies(ctx, map[string]any{"urls": []any{"https://x.com/"}})
+	got, err := dispatchSelf(t, d, "get_cookies", map[string]any{"urls": []any{"https://x.com/"}})
 	if err != nil {
 		t.Fatalf("handleGetCookies union: %v", err)
 	}
@@ -566,7 +567,7 @@ func TestGetCookiesUnionLiveLocalOneEvaluation(t *testing.T) {
 	cache := newFakeCache()
 	d := New(consent, cache, nil, staticProbe(liveSession(currentUser(t))), &recordingRunner{}, fixedState{st: st}, fixedState{st: st})
 
-	got, err := d.handleGetCookies(ctx, map[string]any{"urls": []any{"https://x.com/"}})
+	got, err := dispatchSelf(t, d, "get_cookies", map[string]any{"urls": []any{"https://x.com/"}})
 	if err != nil {
 		t.Fatalf("handleGetCookies union: %v", err)
 	}
@@ -583,7 +584,6 @@ func TestGetCookiesUnionLiveLocalOneEvaluation(t *testing.T) {
 // remote ssh down — fails with an error that suggests cookiesync auth, rather than
 // serving an empty document.
 func TestGetCookiesUnionZeroContributorsErrors(t *testing.T) {
-	ctx := context.Background()
 	chromeStoreUnderHome(t)
 	self := "me@laptop"
 	fakeMesh(t, self, "you@desktop")
@@ -594,7 +594,7 @@ func TestGetCookiesUnionZeroContributorsErrors(t *testing.T) {
 	runner := &recordingRunner{err: errors.New("ssh down")}
 	d := New(&fakeConsent{}, newFakeCache(), nil, staticProbe(SessionSnapshot{}), runner, fixedState{st: st}, fixedState{st: st})
 
-	_, err := d.handleGetCookies(ctx, map[string]any{"urls": []any{"https://x.com/"}})
+	_, err := dispatchSelf(t, d, "get_cookies", map[string]any{"urls": []any{"https://x.com/"}})
 	if err == nil || !strings.Contains(err.Error(), "cookiesync auth") {
 		t.Fatalf("union with no contributors = %v, want an error suggesting cookiesync auth", err)
 	}
@@ -650,9 +650,9 @@ func TestUnionTotalShutoutErrorCarriesWarnings(t *testing.T) {
 			cache := newFakeCache()
 			d := New(&fakeConsent{key: key}, cache, nil, staticProbe(SessionSnapshot{}), tc.runner(), fixedState{st: st}, fixedState{st: st})
 			_, _ = cache.Put(ctx, endpointID(self, "chrome", "Ghost"), []byte(key), 0)
-			d.grant("local", []cookie.BrowserName{"chrome"}, time.Hour)
+			d.grant(ownSessionPrincipal(t), []cookie.BrowserName{"chrome"}, time.Hour)
 
-			_, err := d.handleGetCookies(ctx, map[string]any{"urls": []any{"https://x.com/"}})
+			_, err := dispatchSelf(t, d, "get_cookies", map[string]any{"urls": []any{"https://x.com/"}})
 			if err == nil {
 				t.Fatalf("total shutout must error")
 			}
@@ -806,7 +806,6 @@ func TestGetCookiesSinglePeerDrivenLivePromptsAndGrantsOrigin(t *testing.T) {
 // positional after "--", so it can neither flip the peer off its single path (the
 // recursion guard) nor override the origin the peer keys its grant on.
 func TestRemoteGetCookiesFencesFlagShapedURL(t *testing.T) {
-	ctx := context.Background()
 	chromeStoreUnderHome(t)
 	self := "me@laptop"
 	fakeMesh(t, self, "you@desktop")
@@ -816,7 +815,7 @@ func TestRemoteGetCookiesFencesFlagShapedURL(t *testing.T) {
 	}}
 	d := New(&fakeConsent{}, newFakeCache(), nil, staticProbe(SessionSnapshot{}), runner, fixedState{st: st}, fixedState{st: st})
 
-	if _, err := d.handleGetCookies(ctx, map[string]any{"urls": []any{"https://x.com/", "--browser="}}); err != nil {
+	if _, err := dispatchSelf(t, d, "get_cookies", map[string]any{"urls": []any{"https://x.com/", "--browser="}}); err != nil {
 		t.Fatalf("union with a flag-shaped url: %v", err)
 	}
 	remoteCmd := ""
@@ -868,7 +867,7 @@ func TestExtractApplyRoundTripWireContract(t *testing.T) {
 	st := stateWith("me@laptop", "")
 	fakeMesh(t, "me@laptop")
 	d := New(&fakeConsent{key: key}, cache, newRealEngine(t, cache), staticProbe(liveSession(currentUser(t))), &recordingRunner{}, fixedState{st: st}, fixedState{st: st})
-	d.grant("local", []cookie.BrowserName{"chrome"}, time.Hour)
+	d.grant(ownSessionPrincipal(t), []cookie.BrowserName{"chrome"}, time.Hour)
 
 	// Apply two cookies via the frozen wire array.
 	in := []cookie.WireCookie{
@@ -884,7 +883,7 @@ func TestExtractApplyRoundTripWireContract(t *testing.T) {
 	}
 
 	// Extract returns the whole profile (both hosts), undecorated by a url filter.
-	extractRes, err := d.handleExtract(ctx, map[string]any{"browser": "chrome"})
+	extractRes, err := dispatchSelf(t, d, "extract", map[string]any{"browser": "chrome"})
 	if err != nil {
 		t.Fatalf("handleExtract: %v", err)
 	}
@@ -963,6 +962,7 @@ func TestApplySyncableCookiesOnly(t *testing.T) {
 			if err != nil {
 				t.Fatalf("read store: %v", err)
 			}
+			rows = withoutTagAnchor(rows)
 			if len(rows) != 1 {
 				t.Fatalf("stored rows = %d, want 1", len(rows))
 			}
@@ -1217,7 +1217,6 @@ func TestConvergeLocalWriteOverlapsDistinctApply(t *testing.T) {
 // the rest join its flight, so exactly one prompt fires and one Put seeds the cache —
 // every caller extracts with the shared key.
 func TestColdExtractsSingleFlightOneConsent(t *testing.T) {
-	ctx := context.Background()
 	chromeStoreUnderHome(t)
 	fakeMesh(t, "me@laptop")
 	st := stateWith("me@laptop", "")
@@ -1235,7 +1234,7 @@ func TestColdExtractsSingleFlightOneConsent(t *testing.T) {
 	done := make(chan error, n)
 	for range n {
 		go func() {
-			_, err := d.handleExtract(ctx, map[string]any{"browser": "chrome"})
+			_, err := dispatchSelf(t, d, "extract", map[string]any{"browser": "chrome"})
 			done <- err
 		}()
 	}
@@ -1394,56 +1393,6 @@ func TestPrimeAuthCanceledWaiterReturnsWhileFlightContinues(t *testing.T) {
 	}
 }
 
-// TestColdPrimeWarmsAllLocalEndpointsInOneEvaluation proves the batch prime: one cold
-// prime for one endpoint runs ONE consent evaluation covering every tracked local
-// browser — the requested browser leading — and caches the released keys under every
-// tracked local endpoint id (each profile of a browser shares its Safe Storage key),
-// with the requested endpoint id put LAST. Peer endpoints never join the batch.
-func TestColdPrimeWarmsAllLocalEndpointsInOneEvaluation(t *testing.T) {
-	ctx := context.Background()
-	self := "me@laptop"
-	fakeMesh(t, self)
-	st := stateWith(self, "",
-		stateEndpoint(self, "chrome", "Default"),
-		stateEndpoint(self, "chrome", "Work"),
-		stateEndpoint(self, "arc", "Default"),
-		stateEndpoint("you@desktop", "chrome", "Default"),
-	)
-	consent := &fakeConsent{key: cookie.DeriveKey(cookie.SafeStorageKey("peanuts"))}
-	cache := newFakeCache()
-	d := New(consent, cache, nil, staticProbe(liveSession(currentUser(t))), &recordingRunner{}, fixedState{st: st}, fixedState{st: st})
-
-	got, err := d.handlePrimeAuth(ctx, map[string]any{"browser": "chrome"})
-	if err != nil {
-		t.Fatalf("handlePrimeAuth: %v", err)
-	}
-	if marshalResult(t, got) != `{"endpoint":"me@laptop:chrome:Default","primed":true}` {
-		t.Fatalf("prime_auth = %s", marshalResult(t, got))
-	}
-	if len(consent.batchCalls) != 1 {
-		t.Fatalf("consent evaluations = %d, want 1 batch for the whole local set", len(consent.batchCalls))
-	}
-	call := consent.batchCalls[0]
-	if call.reason != consentReason {
-		t.Fatalf("batch reason = %q, want %q", call.reason, consentReason)
-	}
-	if len(call.browsers) != 2 || call.browsers[0] != "chrome" || call.browsers[1] != "arc" {
-		t.Fatalf("batch browsers = %v, want the requested chrome leading arc", call.browsers)
-	}
-	requested := endpointID(self, "chrome", "Default")
-	for _, id := range []string{requested, endpointID(self, "chrome", "Work"), endpointID(self, "arc", "Default")} {
-		if _, ok, _ := cache.Get(ctx, id); !ok {
-			t.Errorf("local endpoint %s not warmed by the batch prime", id)
-		}
-	}
-	if _, ok, _ := cache.Get(ctx, endpointID("you@desktop", "chrome", "Default")); ok {
-		t.Errorf("a peer endpoint must never be cached by a local prime")
-	}
-	if len(cache.puts) != 3 || cache.puts[2] != requested {
-		t.Fatalf("cache puts = %v, want 3 with the requested endpoint %s last", cache.puts, requested)
-	}
-}
-
 // TestConcurrentDistinctEndpointPrimesCollapseToOneEvaluation proves batchFlight:
 // two concurrent cold primes for DISTINCT endpoints cost ONE Touch ID evaluation —
 // the second either joins the in-flight batch or finds its endpoint already warmed
@@ -1493,70 +1442,6 @@ func TestConcurrentDistinctEndpointPrimesCollapseToOneEvaluation(t *testing.T) {
 	}
 	if got := cache.putCalls(); got != 2 {
 		t.Errorf("cache puts = %d, want 2 (one per tracked local endpoint, no re-seeding)", got)
-	}
-}
-
-// TestConcurrentDistinctBrowserPrimesLeadOwnFlights pins the per-browser flight
-// key: one requestor primes two DISTINCT browsers concurrently, so each leads
-// its own flight — the leader's denial (chrome Missing) is its own outcome,
-// never delivered to the arc prime, which releases via its own evaluation once
-// promptGate serializes it behind the leader's sheet.
-func TestConcurrentDistinctBrowserPrimesLeadOwnFlights(t *testing.T) {
-	self := "me@laptop"
-	fakeMesh(t, self)
-	st := stateWith(self, "",
-		stateEndpoint(self, "chrome", "Default"),
-		stateEndpoint(self, "arc", "Default"),
-	)
-	consent := &partialGateConsent{
-		key:     cookie.DeriveKey(cookie.SafeStorageKey("peanuts")),
-		failFor: "chrome",
-		entered: make(chan struct{}, 2),
-		release: make(chan struct{}),
-	}
-	cache := newFakeCache()
-	var probes atomic.Int32
-	probe := func(_ context.Context) (SessionSnapshot, error) {
-		probes.Add(1)
-		return liveSession(currentUser(t)), nil
-	}
-	d := New(consent, cache, nil, probe, &recordingRunner{}, fixedState{st: st}, fixedState{st: st})
-
-	leaderDone := make(chan error, 1)
-	go func() {
-		_, _, err := d.primeAuth(context.Background(), "sid:1", "chrome", "Default", consentReason, releaseLocal)
-		leaderDone <- err
-	}()
-	<-consent.entered
-
-	waiterDone := make(chan error, 1)
-	go func() {
-		key, _, err := d.primeAuth(context.Background(), "sid:1", "arc", "Default", consentReason, releaseLocal)
-		if err == nil && string(key) != string(consent.key) {
-			err = errors.New("arc prime got the wrong key")
-		}
-		waiterDone <- err
-	}()
-	// The arc flight's routing probe fires after its grant re-probe, so once it
-	// lands the flight is committed to its own evaluation.
-	waitFor(t, func() bool { return probes.Load() >= 2 })
-	close(consent.release)
-
-	var declined *cookie.ConsentError
-	if leaderErr := <-leaderDone; !errors.As(leaderErr, &declined) {
-		t.Fatalf("leader prime for the denied browser = %v, want *cookie.ConsentError", leaderErr)
-	}
-	if err := <-waiterDone; err != nil {
-		t.Fatalf("concurrent prime for the released browser: %v", err)
-	}
-	if got := consent.batches.Load(); got != 2 {
-		t.Errorf("consent evaluations = %d, want 2 (distinct browsers lead their own flights)", got)
-	}
-	if _, ok, _ := cache.Get(context.Background(), endpointID(self, "arc", "Default")); !ok {
-		t.Errorf("the arc flight must warm its own browser")
-	}
-	if _, ok, _ := cache.Get(context.Background(), endpointID(self, "chrome", "Default")); ok {
-		t.Errorf("the denied browser must not be cached")
 	}
 }
 
@@ -1629,12 +1514,12 @@ func TestConcurrentCookiesAndPrimeShareOneSheet(t *testing.T) {
 	}
 	cookiesDone := make(chan outcome, 1)
 	go func() {
-		res, err := d.handleGetCookies(ctx, map[string]any{"urls": []any{"https://x.com/"}})
+		res, err := dispatchSelf(t, d, "get_cookies", map[string]any{"urls": []any{"https://x.com/"}})
 		cookiesDone <- outcome{res: res, err: err}
 	}()
 	primeDone := make(chan outcome, 1)
 	go func() {
-		res, err := d.handlePrimeAuth(ctx, map[string]any{"browser": "chrome"})
+		res, err := dispatchSelf(t, d, "prime_auth", map[string]any{"browser": "chrome"})
 		primeDone <- outcome{res: res, err: err}
 	}()
 

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 	"time"
 
@@ -142,6 +143,41 @@ func TestStartAddOpensHostPickerSelfFirst(t *testing.T) {
 	}
 	if got := items[0].(pickItem).value; got != "me@laptop" {
 		t.Fatalf("first host = %q, want me@laptop (self leads)", got)
+	}
+}
+
+func TestBrowserStepOffersTheChosenHostsBrowsers(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+	tests := []struct {
+		name string
+		host string
+		want []string
+	}{
+		{name: "self offers this platform's registry", host: "me@laptop", want: localBrowsers},
+		{name: "a peer offers every platform's browsers", host: "you@desktop", want: []string{"arc", "chrome"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			m := newBrowsersModel(&fakeRunner{})
+			m.loading = false
+			m.self = "me@laptop"
+			m.pick = &pickState{step: pickHost, list: newPickList(pickItems([]string{tt.host}), 80, 20)}
+
+			s, _ := m.advancePick()
+			bm := s.(*browsersModel)
+			if bm.pick == nil || bm.pick.step != pickBrowser {
+				t.Fatalf("advancePick on host %s did not enter the browser step: %+v (status %q)", tt.host, bm.pick, bm.status)
+			}
+			var got []string
+			for _, it := range bm.pick.list.Items() {
+				got = append(got, it.(pickItem).value)
+			}
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Fatalf("browser step on %s offers %v, want %v", tt.host, got, tt.want)
+			}
+		})
 	}
 }
 

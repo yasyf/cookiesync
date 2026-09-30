@@ -64,7 +64,7 @@ func TestNoEnclaveCacheStaysInMemoryTier(t *testing.T) {
 		t.Fatal("NoEnclave must never provision an Enclave key")
 	}
 
-	for _, id := range []string{"vm:chrome:Default", "vm:chromium:Default", "vm:chrome:Work"} {
+	for _, id := range []string{"vm:chrome:Default", "vm:chrome:Profile 1", "vm:chrome:Work"} {
 		degraded, err := c.Put(ctx, id, testKey(), time.Hour)
 		if err != nil {
 			t.Fatalf("Put %s: %v", id, err)

@@ -21,6 +21,7 @@ import (
 const (
 	smokeChromeEnv = "COOKIESYNC_SMOKE_CHROME"
 	smokeRunEnv    = "COOKIESYNC_SMOKE_RUN"
+	crashpadComm   = "chrome_crashpad"
 )
 
 type smokeProcess struct {
@@ -95,7 +96,8 @@ func TestSmokeRealChromeSeedsReadsBackAndLeavesNoProcess(t *testing.T) {
 		t.Fatalf("chrome pid %d missing from its own process set %+v", chromePID, running)
 	}
 	for _, p := range running {
-		if p.sid != chromePID {
+		// Crashpad's DoubleForkAndExec setsid()s its handler by design; the post-Close no-survivor loop below still proves it exits.
+		if p.sid != chromePID && p.comm != crashpadComm {
 			t.Errorf("chrome process %d (%s) runs in session %d, outside the daemonkit-owned session %d", p.pid, p.comm, p.sid, chromePID)
 		}
 	}

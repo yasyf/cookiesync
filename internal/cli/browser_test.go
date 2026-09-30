@@ -77,13 +77,13 @@ func TestBrowserAddLsRmRoundTrip(t *testing.T) {
 	if got := runBrowserCmd(t, "add", "me@laptop", "chrome"); strings.TrimSpace(got) != "Tracking me@laptop:chrome:Default" {
 		t.Fatalf("add = %q, want %q", got, "Tracking me@laptop:chrome:Default")
 	}
-	if got := runBrowserCmd(t, "add", "you@desktop", "arc", "--profile", "Work"); strings.TrimSpace(got) != "Tracking you@desktop:arc:Work" {
-		t.Fatalf("add peer = %q, want Tracking you@desktop:arc:Work", got)
+	if got := runBrowserCmd(t, "add", "you@desktop", "chrome", "--profile", "Work"); strings.TrimSpace(got) != "Tracking you@desktop:chrome:Work" {
+		t.Fatalf("add peer = %q, want Tracking you@desktop:chrome:Work", got)
 	}
 
 	// ls now lists both, sorted by id.
 	lines := strings.Split(strings.TrimSpace(runBrowserCmd(t, "ls")), "\n")
-	want := []string{"me@laptop:chrome:Default", "you@desktop:arc:Work"}
+	want := []string{"me@laptop:chrome:Default", "you@desktop:chrome:Work"}
 	if len(lines) != 2 || lines[0] != want[0] || lines[1] != want[1] {
 		t.Fatalf("ls = %v, want %v", lines, want)
 	}
@@ -93,8 +93,8 @@ func TestBrowserAddLsRmRoundTrip(t *testing.T) {
 		t.Fatalf("rm = %q, want Untracked me@laptop:chrome:Default", got)
 	}
 	lines = strings.Split(strings.TrimSpace(runBrowserCmd(t, "ls")), "\n")
-	if len(lines) != 1 || lines[0] != "you@desktop:arc:Work" {
-		t.Fatalf("ls after rm = %v, want [you@desktop:arc:Work]", lines)
+	if len(lines) != 1 || lines[0] != "you@desktop:chrome:Work" {
+		t.Fatalf("ls after rm = %v, want [you@desktop:chrome:Work]", lines)
 	}
 }
 

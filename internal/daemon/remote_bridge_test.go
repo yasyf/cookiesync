@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"strings"
 	"sync/atomic"
@@ -85,27 +86,36 @@ func TestRemoteBridgeOpenDispatch(t *testing.T) {
 	d, gotSpec, gotKeepaliveAddr := newProxyDaemon(t, runner)
 	t.Cleanup(func() { d.closeAllBridges(context.Background()) })
 
-	got, err := d.handleBridgeOpen(context.Background(), map[string]any{"browser": "chrome", "host": "you@desktop"})
+	got, err := dispatchSelf(t, d, "bridge_open", map[string]any{"browser": "chrome", "host": "you@desktop"})
 	if err != nil {
 		t.Fatalf("cross-host bridge_open: %v", err)
 	}
-	open := got.(map[string]any)
+	var open struct {
+		Capability string     `json:"capability"`
+		URL        string     `json:"url"`
+		Endpoint   string     `json:"endpoint"`
+		ProxyPort  int        `json:"proxy_port"`
+		Seed       seedReport `json:"seed"`
+	}
+	if err := json.Unmarshal(got, &open); err != nil {
+		t.Fatalf("decode bridge_open reply %s: %v", got, err)
+	}
 
-	capA, _ := open["capability"].(string)
+	capA := open.Capability
 	if capA == "" || capA == "cap-b-secret" {
 		t.Fatalf("proxy capability = %q, want a locally-minted secret, never the peer's", capA)
 	}
-	if url, _ := open["url"].(string); url != "ws://127.0.0.1:5555/tok-b/devtools/browser/uuid-b" {
-		t.Fatalf("proxy url = %q, want the peer's advertised ws url", url)
+	if open.URL != "ws://127.0.0.1:5555/tok-b/devtools/browser/uuid-b" {
+		t.Fatalf("proxy url = %q, want the peer's advertised ws url", open.URL)
 	}
-	if ep, _ := open["endpoint"].(string); ep != "you@desktop:chrome:Default" {
-		t.Fatalf("proxy endpoint = %q", ep)
+	if open.Endpoint != "you@desktop:chrome:Default" {
+		t.Fatalf("proxy endpoint = %q", open.Endpoint)
 	}
-	if pp, _ := open["proxy_port"].(int); pp == 0 {
-		t.Fatalf("proxy_port = %v, want the forwarded loopback port", open["proxy_port"])
+	if open.ProxyPort == 0 {
+		t.Fatalf("proxy_port = %v, want the forwarded loopback port", open.ProxyPort)
 	}
-	if sd, _ := open["seed"].(seedReport); sd.Skipped != 3 || sd.Attempted != 5 || sd.Seeded != 2 {
-		t.Fatalf("seed = %+v, want the peer's breakdown forwarded through", open["seed"])
+	if sd := open.Seed; sd.Skipped != 3 || sd.Attempted != 5 || sd.Seeded != 2 {
+		t.Fatalf("seed = %+v, want the peer's breakdown forwarded through", open.Seed)
 	}
 
 	// The forward got the peer's token, proxy port, and advertised ws url.
@@ -150,7 +160,7 @@ func TestRemoteBridgeOpenRejectsUnknownHost(t *testing.T) {
 	runner := &recordingRunner{byMethod: map[string]string{"bridge_open": cannedBridgeOpenReply}}
 	d, _, _ := newProxyDaemon(t, runner)
 
-	_, err := d.handleBridgeOpen(context.Background(), map[string]any{"browser": "chrome", "host": "stranger@host"})
+	_, err := dispatchSelf(t, d, "bridge_open", map[string]any{"browser": "chrome", "host": "stranger@host"})
 	if err == nil || !strings.Contains(err.Error(), "unknown host") {
 		t.Fatalf("open to a non-peer = %v, want an unknown-host reject", err)
 	}
@@ -186,13 +196,13 @@ func TestRemoteBridgeReattachPrecedesDispatch(t *testing.T) {
 	}
 	d.bridges["cap-a-live"] = sess
 
-	got, err := d.handleBridgeOpen(context.Background(), map[string]any{
+	got, err := dispatchSelf(t, d, "bridge_open", map[string]any{
 		"browser": "chrome", "host": "you@desktop", "capability": "cap-a-live",
 	})
 	if err != nil {
 		t.Fatalf("re-attach: %v", err)
 	}
-	if url, _ := got.(map[string]any)["url"].(string); url != sess.wsURL {
+	if url, _ := resultMap(t, got)["url"].(string); url != sess.wsURL {
 		t.Fatalf("re-attach url = %q, want %q", url, sess.wsURL)
 	}
 	runner.mu.Lock()
@@ -285,7 +295,7 @@ func TestRemoteBridgeOpenRetriesOnlyOnForwardExit(t *testing.T) {
 				return nil, tc.tunnelErr
 			}
 
-			_, err := d.handleBridgeOpen(context.Background(), map[string]any{"browser": "chrome", "host": "you@desktop"})
+			_, err := dispatchSelf(t, d, "bridge_open", map[string]any{"browser": "chrome", "host": "you@desktop"})
 			if err == nil {
 				t.Fatal("a forward that never comes up must fail the open")
 			}
@@ -310,7 +320,7 @@ func TestRemoteBridgeOpenClosesIncompleteReply(t *testing.T) {
 	runner := &recordingRunner{byMethod: map[string]string{"bridge_open": incomplete}}
 	d, _, _ := newProxyDaemon(t, runner)
 
-	_, err := d.handleBridgeOpen(context.Background(), map[string]any{"browser": "chrome", "host": "you@desktop"})
+	_, err := dispatchSelf(t, d, "bridge_open", map[string]any{"browser": "chrome", "host": "you@desktop"})
 	if err == nil {
 		t.Fatal("an incomplete reply must fail the open")
 	}

@@ -41,8 +41,12 @@ func (b *Broker) routedBridgeRelease(ctx context.Context, browser cookie.Browser
 // (RouteTo-first) is cookiesync's; the Router owns probe-gating, failover, and
 // the exact nonce+endpoint echo binding. A routed denial surfaces as the
 // Router's terminal *consentkit.Denied, an unbound approval as its fail-closed
-// *consentkit.AuthRequired; both propagate.
+// *consentkit.AuthRequired; both propagate. A browser no approver could
+// resolve is refused before any candidate is probed.
 func (b *Broker) routedConsent(ctx context.Context, method consentMethod, browser cookie.Browser, browserID, profile string) (cookie.AesKey, error) {
+	if err := routable(browser); err != nil {
+		return nil, err
+	}
 	st, err := b.state.Load(ctx)
 	if err != nil {
 		return nil, err

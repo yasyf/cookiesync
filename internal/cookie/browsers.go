@@ -16,6 +16,11 @@ const arcSystemProfile = "__ARC_SYSTEM_PROFILE"
 // BrowserName is a browser's CLI/config identity (e.g. "chrome", "arc").
 type BrowserName string
 
+// BrowserNames is every browser any platform's Registry holds. A target on a
+// peer is checked against it, since the peer's Registry may hold a browser this
+// host's lacks.
+var BrowserNames = map[BrowserName]struct{}{"arc": {}, "chrome": {}}
+
 // Profile is one tracked browser profile: its on-disk directory (the value that
 // keys the cookie store and is recorded in state) enriched with the display name
 // and account email read from the browser's Local State.
@@ -28,13 +33,15 @@ type Profile struct {
 // Browser is a Chromium-family browser and its on-disk layout: where one
 // profile keeps its cookie store and Local State, and where its Safe Storage
 // password lives — the Keychain service on macOS, the Secret Service item's
-// "application" attribute on Linux.
+// "application" attribute on Linux. ConsentRoutable marks a Linux browser a Mac
+// approver registers under the same Name, the only kind routed consent can name.
 type Browser struct {
 	Name                     BrowserName
 	Display                  string
 	DataRoot                 string
 	KeychainService          string
 	SecretServiceApplication string
+	ConsentRoutable          bool
 }
 
 // ProfileDir is the directory holding one profile's state under this browser's

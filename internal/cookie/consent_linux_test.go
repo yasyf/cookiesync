@@ -8,8 +8,6 @@ import (
 	"errors"
 	"strings"
 	"testing"
-
-	"github.com/godbus/dbus/v5"
 )
 
 func linuxChrome(t *testing.T) Browser {
@@ -91,13 +89,13 @@ func TestLinuxConsentUnpromptedReadDerivesFromSecretOrBasicStore(t *testing.T) {
 			wantKey: linuxBasicKey,
 		},
 		{
-			name:    "no item derives the basic-store key",
-			fake:    &fakeSecretService{prompt: noPromptPath},
+			name:    "no item in the default collection derives the basic-store key",
+			fake:    unlockedDefault(nil).withOther(chromeItem(fakeOtherItemPath, fakeStaleSecret)),
 			wantKey: linuxBasicKey,
 		},
 		{
-			name:    "an item derives the key from its secret",
-			fake:    &fakeSecretService{unlocked: []dbus.ObjectPath{fakeItemPath}, prompt: noPromptPath, secret: []byte(fakeSecret)},
+			name:    "a default-collection item derives the key from its secret",
+			fake:    unlockedDefault(chromeItem(fakeItemPath, fakeSecret)),
 			wantKey: DeriveKey(SafeStorageKey(fakeSecret)),
 		},
 	}
@@ -132,8 +130,8 @@ func TestLinuxConsentUnpromptedReadFailsOnLockedOrBrokenService(t *testing.T) {
 		wantErr error
 	}{
 		{
-			name:    "locked collection",
-			dial:    dialFake(&fakeSecretService{locked: []dbus.ObjectPath{fakeLockedPath}, prompt: fakePrompt, secret: []byte(fakeSecret)}),
+			name:    "locked default collection",
+			dial:    dialFake(lockedDefault(fakePrompt, chromeItem(fakeItemPath, fakeSecret))),
 			wantErr: ErrSecretServiceLocked,
 		},
 		{

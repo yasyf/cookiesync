@@ -78,36 +78,36 @@ func TestCheckSupervisorWithoutSupervisorFails(t *testing.T) {
 	}
 }
 
-// TestCheckBrowserRoots proves the browser-roots line lists every registry browser in
-// name order with its data root and profile count, and passes only when one is present.
+// TestCheckBrowserRoots proves the browser-roots line names the registry browser with
+// its data root and profile count, and passes only when its root is present.
 func TestCheckBrowserRoots(t *testing.T) {
 	tests := []struct {
 		name     string
 		profiles map[string][]string
 		wantOK   bool
-		want     func(chrome, chromium string) string
+		want     func(chrome string) string
 	}{
 		{
 			name:   "no browser installed",
 			wantOK: false,
-			want: func(chrome, chromium string) string {
-				return "chrome absent at " + chrome + "; chromium absent at " + chromium
+			want: func(chrome string) string {
+				return "chrome absent at " + chrome
 			},
 		},
 		{
 			name:     "chrome with two profiles",
 			profiles: map[string][]string{"chrome": {"Default", "Profile 1"}},
 			wantOK:   true,
-			want: func(chrome, chromium string) string {
-				return "chrome at " + chrome + " (2 profiles); chromium absent at " + chromium
+			want: func(chrome string) string {
+				return "chrome at " + chrome + " (2 profiles)"
 			},
 		},
 		{
-			name:     "chromium root without a cookie store",
-			profiles: map[string][]string{"chromium": {}},
+			name:     "chrome root without a cookie store",
+			profiles: map[string][]string{"chrome": {}},
 			wantOK:   true,
-			want: func(chrome, chromium string) string {
-				return "chrome absent at " + chrome + "; chromium at " + chromium + " (0 profiles)"
+			want: func(chrome string) string {
+				return "chrome at " + chrome + " (0 profiles)"
 			},
 		},
 	}
@@ -136,7 +136,7 @@ func TestCheckBrowserRoots(t *testing.T) {
 			want := check{
 				label:  "browser roots",
 				ok:     tc.wantOK,
-				detail: tc.want(registry["chrome"].DataRoot, registry["chromium"].DataRoot),
+				detail: tc.want(registry["chrome"].DataRoot),
 			}
 			if got != want {
 				t.Fatalf("checkBrowserRoots = %+v, want %+v", got, want)

@@ -12,15 +12,15 @@ import (
 )
 
 // TestEnsureLocalEndpointsRegistersInstalledLinuxBrowsers proves the auto-register reads
-// the XDG layout on Linux: Chrome with no Default but a "Profile 3" store registers
-// chrome:Profile 3, and Chromium with a Default store registers chromium:Default.
+// the XDG layout on Linux: every Chrome profile directory holding a cookie store
+// registers, Default and "Profile 3" alike, under the google-chrome data root.
 func TestEnsureLocalEndpointsRegistersInstalledLinuxBrowsers(t *testing.T) {
 	testutil.IsolateHostConfig(t, paths.Config)
 	seedRegistry(t, "me@vm")
 
 	xdg := os.Getenv("XDG_CONFIG_HOME")
 	writeCookieStore(t, filepath.Join(xdg, "google-chrome", "Profile 3", "Cookies"))
-	writeCookieStore(t, filepath.Join(xdg, "chromium", "Default", "Cookies"))
+	writeCookieStore(t, filepath.Join(xdg, "google-chrome", "Default", "Cookies"))
 
 	if err := ensureLocalEndpoints(context.Background()); err != nil {
 		t.Fatalf("ensureLocalEndpoints: %v", err)
@@ -33,7 +33,7 @@ func TestEnsureLocalEndpointsRegistersInstalledLinuxBrowsers(t *testing.T) {
 	for _, ep := range st.Endpoints() {
 		got[string(ep.ID())] = true
 	}
-	want := map[string]bool{"me@vm:chrome:Profile 3": true, "me@vm:chromium:Default": true}
+	want := map[string]bool{"me@vm:chrome:Profile 3": true, "me@vm:chrome:Default": true}
 	if len(got) != len(want) {
 		t.Fatalf("registered %v, want %v", got, want)
 	}
