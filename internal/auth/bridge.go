@@ -16,6 +16,10 @@ import (
 // be.
 const bridgeAuthTTL = 10 * time.Minute
 
+// BridgeTTL is the lease a bridge session registers under: the bridge grant lifetime,
+// capped at the degraded window while the key cache runs in memory.
+func (b *Broker) BridgeTTL() time.Duration { return effectiveTTL(bridgeAuthTTL, b.cache.Degraded()) }
+
 // ReleaseBridge gates the live CDP bridge behind a strict biometrics-only tap
 // (ObtainKeyBiometric: no passcode, no non-interactive fallback), returning the
 // key, its consent surface, and the lease TTL the daemon session registry caps
@@ -38,7 +42,7 @@ func (b *Broker) ReleaseBridge(ctx context.Context, st *state.State, req Req) (c
 		if err != nil {
 			return nil, SurfaceNone, 0, err
 		}
-		return key, SurfaceRouted, effectiveTTL(bridgeAuthTTL, b.cache.Degraded()), nil
+		return key, SurfaceRouted, b.BridgeTTL(), nil
 	}
 	pid, hasPID := synckit.PeerPID(ctx)
 	reason := "open a live browser bridge"
@@ -52,7 +56,7 @@ func (b *Broker) ReleaseBridge(ctx context.Context, st *state.State, req Req) (c
 	if err != nil {
 		return nil, SurfaceNone, 0, err
 	}
-	return key, SurfaceLocal, effectiveTTL(bridgeAuthTTL, b.cache.Degraded()), nil
+	return key, SurfaceLocal, b.BridgeTTL(), nil
 }
 
 // ApproveBridge is the approver terminus of a routed bridge consent: it verifies

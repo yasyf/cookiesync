@@ -213,3 +213,38 @@ func TestReleaseBridge(t *testing.T) {
 		})
 	}
 }
+
+// TestBridgeTTL pins the bridge lease to the bridge grant lifetime, capped at the
+// degraded window, and proves ReleaseBridge leases its session under that same value.
+func TestBridgeTTL(t *testing.T) {
+	tests := []struct {
+		name     string
+		degraded bool
+		want     time.Duration
+	}{
+		{"healthy cache", false, 10 * time.Minute},
+		{"degraded cache", true, 5 * time.Minute},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			self := "me@laptop"
+			fakeMesh(t, self)
+			st := stateWith(self, "", stateEndpoint(self, "chrome", "Default"))
+			fc := newFakeCache()
+			fc.degraded = tt.degraded
+			consent := &fakeConsent{key: cookieTestKey, biometricKey: bridgeTestKey}
+			b := newTestBroker(consent, fc, staticProbe(liveSession(currentUser(t))), &recordingRunner{}, st)
+			if got := b.BridgeTTL(); got != tt.want {
+				t.Fatalf("BridgeTTL() = %v, want %v", got, tt.want)
+			}
+			req := Req{Requestor: "req:claude", Browser: "chrome", Profile: "Default", Reason: testConsentReason, Mode: ModeLocal}
+			_, _, ttl, err := b.ReleaseBridge(context.Background(), st, req)
+			if err != nil {
+				t.Fatalf("ReleaseBridge: %v", err)
+			}
+			if ttl != tt.want {
+				t.Fatalf("ReleaseBridge ttl = %v, want BridgeTTL() %v", ttl, tt.want)
+			}
+		})
+	}
+}

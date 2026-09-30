@@ -3,6 +3,11 @@ set -euo pipefail
 
 bin="${1:-${COOKIESYNC_BIN:?pass the cookiesync binary path or set COOKIESYNC_BIN}}"
 [[ -x "$bin" ]] || { echo "FAIL binary: $bin is not executable" >&2; exit 1; }
+fixtures="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/internal/cookie/testdata"
+if [[ -n "${COOKIESYNC_SMOKE_CHROME+set}" ]]; then
+  [[ -x "$COOKIESYNC_SMOKE_CHROME" ]] || { echo "FAIL chrome: COOKIESYNC_SMOKE_CHROME='$COOKIESYNC_SMOKE_CHROME' is not executable" >&2; exit 1; }
+  PATH="$(dirname "$COOKIESYNC_SMOKE_CHROME"):$PATH"
+fi
 
 root="$(mktemp -d /tmp/cs-smoke.XXXXXX)"
 export HOME="$root/home"
@@ -66,6 +71,22 @@ expect_closed() {
     fail "$name: exited $status but wrote $(wc -c <"$root/stdout") bytes to stdout, want none"
   else
     pass "$name: exit $status, empty stdout ($(head -c 200 "$root/stderr" | tr '\n' ' '))"
+  fi
+}
+
+expect_served() {
+  local name="$1" want="$2" status
+  shift 2
+  set +e
+  "$bin" "$@" >"$root/stdout" 2>"$root/stderr"
+  status=$?
+  set -e
+  if [[ $status -ne 0 ]]; then
+    fail "$name: exit $status, want 0 ($(head -c 200 "$root/stderr" | tr '\n' ' '))"
+  elif [[ "$(<"$root/stdout")" != "$want" ]]; then
+    fail "$name: stdout '$(head -c 300 "$root/stdout")', want '$want'"
+  else
+    pass "$name"
   fi
 }
 
@@ -147,6 +168,74 @@ if absent "$chrome_pattern"; then
 else
   fail "bridge: Chrome still running: $(pgrep -a -f -- "$chrome_pattern" | cut -c1-120 | tr '\n' ';')"
 fi
+
+pw="$fixtures/import_playwright.json"
+ws="$fixtures/import_webstorage.json"
+flags=(--browser chrome --profile Default)
+
+expect_closed "import: refuses a document reaching past the named hosts" import --format playwright --ttl 2m "${flags[@]}" -- app.example.test <"$pw"
+if grep -qF "is sent to none of the named hosts" "$root/stderr"; then
+  pass "import: refusal names a cookie sent to none of the named hosts"
+else
+  fail "import: stderr '$(tr '\n' ' ' <"$root/stderr")' does not say 'is sent to none of the named hosts'"
+fi
+expect_closed "import: --ttl 25h is refused" import --format playwright --ttl 25h "${flags[@]}" -- app.example.test www.other.test api.third.test <"$pw"
+if grep -qF "outside 1s..24h" "$root/stderr"; then
+  pass "import: refusal names the 1s..24h ttl bound"
+else
+  fail "import: stderr '$(tr '\n' ' ' <"$root/stderr")' does not say 'outside 1s..24h'"
+fi
+expect_closed "cookies: still fail closed after refused imports" cookies --format header -- app.example.test
+
+expect_served "import: playwright document held in memory" "imported 3 cookie(s) and 1 origin(s) into chrome/Default for api.third.test, app.example.test, www.other.test (expires in 2m0s)" import --format playwright --ttl 2m "${flags[@]}" -- app.example.test www.other.test api.third.test <"$pw"
+expect_served "cookies header from the import" "sid=synthetic-session" cookies --format header -- app.example.test
+expect_served "cookies header, second named host" "pref=dark" cookies --format header -- www.other.test
+expect_served "cookies playwright from the import" '{"cookies": [{"name": "sid", "value": "synthetic-session", "domain": "app.example.test", "path": "/", "expires": -1, "httpOnly": true, "secure": true, "sameSite": "Lax"}], "origins": [{"origin": "https://app.example.test", "localStorage": [{"name": "theme", "value": "dark"}]}]}' cookies --format playwright -- app.example.test
+expect_served "cookies webstorage from a playwright import" '{"origins": [{"origin": "https://app.example.test", "localStorage": [{"name": "theme", "value": "dark"}], "sessionStorage": []}]}' cookies --format webstorage -- app.example.test
+expect_served "cookies --browser chrome from the import" "sid=synthetic-session" cookies "${flags[@]}" --format header -- app.example.test
+expect_closed "cookies outside the import scope fail closed" cookies --format header -- sub.app.example.test
+expect_closed "cookies mixing imported and foreign hosts fail closed" cookies --format header -- app.example.test example.com
+
+if [[ -n "${COOKIESYNC_SMOKE_CHROME+set}" ]]; then
+  set +e
+  "$bin" bridge open --json >"$root/stdout" 2>"$root/stderr"
+  status=$?
+  set -e
+  if [[ $status -ne 0 ]]; then
+    fail "bridge open --json from the import: exit $status, want 0 ($(head -c 200 "$root/stderr" | tr '\n' ' '))"
+  elif ! grep -qF '"url": "ws://127.0.0.1:' "$root/stdout"; then
+    fail "bridge open --json from the import: stdout '$(head -c 300 "$root/stdout" | tr '\n' ' ')' has no ws://127.0.0.1 url"
+  elif ! grep -qF '"endpoint": "agent@vm:chrome:Default"' "$root/stdout"; then
+    fail "bridge open --json from the import: stdout '$(head -c 300 "$root/stdout" | tr '\n' ' ')' does not name agent@vm:chrome:Default"
+  elif ! jq -e '.expires_in > 0 and .expires_in <= 120' "$root/stdout" >/dev/null; then
+    fail "bridge open --json from the import: expires_in $(jq .expires_in "$root/stdout"), want 0 < expires_in <= 120"
+  else
+    pass "bridge open --json from the import: ws url, agent@vm:chrome:Default, expires_in $(jq .expires_in "$root/stdout") capped by the 2m import"
+  fi
+  expect_served "bridge stop after an import-seeded open" "bridge closed · :chrome:Default" bridge stop
+  gone=""
+  for _ in $(seq 1 25); do
+    if absent "$chrome_pattern"; then
+      gone=1
+      break
+    fi
+    sleep 0.2
+  done
+  if [[ -n "$gone" ]]; then
+    pass "bridge stop after an import-seeded open: no Chrome process running"
+  else
+    fail "bridge stop after an import-seeded open: Chrome still running: $(pgrep -a -f -- "$chrome_pattern" | cut -c1-120 | tr '\n' ';')"
+  fi
+else
+  echo "SKIP bridge open from import: COOKIESYNC_SMOKE_CHROME unset"
+fi
+
+expect_served "import: webstorage document replaces the playwright one" "imported 0 cookie(s) and 2 origin(s) into chrome/Default for app.example.test (expires in 2m0s)" import --format webstorage --ttl 2m "${flags[@]}" -- app.example.test <"$ws"
+expect_served "cookies webstorage carries sessionStorage" "$(<"$ws")" cookies --format webstorage -- app.example.test
+expect_served "cookies playwright after the replacement has no cookies" '{"cookies": [], "origins": [{"origin": "https://app.example.test", "localStorage": [{"name": "theme", "value": "dark"}]}]}' cookies --format playwright -- app.example.test
+expect_served "import: one-second ttl" "imported 0 cookie(s) and 2 origin(s) into chrome/Default for app.example.test (expires in 1s)" import --format webstorage --ttl 1s "${flags[@]}" -- app.example.test <"$ws"
+sleep 2
+expect_closed "cookies after the import's ttl lapses fail closed" cookies --format webstorage -- app.example.test
 
 out="$("$bin" uninstall)"
 expect_eq "uninstall: helper stopped" "Stopped the resident helper; 'cookiesync supervise' no longer runs it." "$out"

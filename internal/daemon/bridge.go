@@ -220,25 +220,9 @@ func (d *Daemon) openBridge(ctx context.Context, requestor, endpoint, browser, p
 			releaseSlots()
 		}
 	}()
-	st, err := d.state.Load(ctx)
+	storage, counts, ttl, err := d.bridgeSeed(ctx, requestor, browser, profile, browserObj, origin, advertise)
 	if err != nil {
 		return nil, err
-	}
-	// The strict biometrics-only tap; a cold or routed host fails closed here.
-	key, _, ttl, err := d.broker.ReleaseBridge(ctx, st, auth.Req{
-		Requestor: requestor,
-		Browser:   browser,
-		Profile:   profile,
-		Origin:    origin,
-		Mode:      auth.ModeLocal,
-	})
-	if err != nil {
-		return nil, err
-	}
-
-	storage, counts, err := d.seedSource(ctx, browserObj, profile, key)
-	if err != nil {
-		return nil, fmt.Errorf("seed source %s/%s: %w", browser, profile, err)
 	}
 	hostBin, err := d.hostBinary()
 	if err != nil {
@@ -352,6 +336,36 @@ func (d *Daemon) openBridge(ctx context.Context, requestor, endpoint, browser, p
 	result := sess.OpenResult()
 	result["seed"] = buildSeedReport(counts, seeded)
 	return result, nil
+}
+
+func (d *Daemon) bridgeSeed(ctx context.Context, requestor, browser, profile string, browserObj cookie.Browser, origin, advertise string) (cookie.StorageState, cookie.SeedCounts, time.Duration, error) {
+	if advertise == "" {
+		now := d.now()
+		if rec, ok := d.imports.live(importKey{browser: browser, profile: profile}, now); ok {
+			storage, counts := rec.seed(now)
+			return storage, counts, min(d.broker.BridgeTTL(), rec.expiresAt.Sub(now)), nil
+		}
+	}
+	st, err := d.state.Load(ctx)
+	if err != nil {
+		return cookie.StorageState{}, cookie.SeedCounts{}, 0, err
+	}
+	// The strict biometrics-only tap; a cold or routed host fails closed here.
+	key, _, ttl, err := d.broker.ReleaseBridge(ctx, st, auth.Req{
+		Requestor: requestor,
+		Browser:   browser,
+		Profile:   profile,
+		Origin:    origin,
+		Mode:      auth.ModeLocal,
+	})
+	if err != nil {
+		return cookie.StorageState{}, cookie.SeedCounts{}, 0, err
+	}
+	storage, counts, err := d.seedSource(ctx, browserObj, profile, key)
+	if err != nil {
+		return cookie.StorageState{}, cookie.SeedCounts{}, 0, fmt.Errorf("seed source %s/%s: %w", browser, profile, err)
+	}
+	return storage, counts, ttl, nil
 }
 
 // seedReport is the observability payload bridge_open returns: what the seed
@@ -519,6 +533,7 @@ func (d *Daemon) reapBridges() {
 		select {
 		case <-ticker.C:
 			d.reapExpiredBridges()
+			d.imports.purge(d.now())
 		case <-d.bridgeStop:
 			return
 		}

@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **`cookiesync import` on Linux.** Pipe a Mac's
+  `cookies --format playwright|webstorage -- HOST...` over ssh into the VM helper's
+  memory for `--ttl` (1s-24h). `cookies` and `bridge open` serve it for exactly those
+  hosts. Nothing is written to disk, and every refusal exits non-zero with empty stdout.
 - **Linux amd64 support for private single-user VMs.** Ship
   `cookiesync_linux_amd64.tar.gz` with `requestor`, `auth`, cookie output formats,
   and the bridge commands. Chrome profiles use `$XDG_CONFIG_HOME/google-chrome`;

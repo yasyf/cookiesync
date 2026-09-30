@@ -1,0 +1,1 @@
+{"origins": [{"origin": "https://app.example.test", "localStorage": [{"name": "theme", "value": "dark"}], "sessionStorage": [{"name": "draft", "value": "synthetic"}]}, {"origin": "https://app.example.test:8443", "localStorage": [], "sessionStorage": [{"name": "tab", "value": "1"}]}]}

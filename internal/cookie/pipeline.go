@@ -99,6 +99,12 @@ func isLive(cookie Cookie, now float64, includeExpired bool) bool {
 	return expires >= now
 }
 
+// Live reports whether cookie survives Extract's expiry filter at now (Unix seconds): a
+// session cookie always does, a persistent one while its expiry is not in the past.
+func Live(cookie Cookie, now float64) bool {
+	return isLive(cookie, now, false)
+}
+
 // Syncable reports whether cookie is persistent and has not expired at now.
 func Syncable(cookie Cookie, now float64) bool {
 	expires, session := chromeMicrosToUnix(cookie.ExpiresUTC)

@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -173,6 +174,75 @@ func TestBridgeOpenReattachClose(t *testing.T) {
 	d.closeAllBridges(ctx)
 	if got := bridgeCount(d); got != 0 {
 		t.Fatalf("live sessions after closeAllBridges = %d, want 0", got)
+	}
+}
+
+// TestBridgeOpenSeedsFromAnImport proves a local open over a live import seeds a
+// real Chrome from memory: no biometric tap, no profile read, and a lease no longer
+// than the import's remaining lifetime.
+func TestBridgeOpenSeedsFromAnImport(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping: launches a real Chrome")
+	}
+	if _, err := bridge.ResolveHostBinary(); err != nil {
+		t.Skipf("skipping: Chrome not installed: %v", err)
+	}
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	chrome, err := cookie.Lookup(cookie.BrowserName("chrome"))
+	if err != nil {
+		t.Fatalf("lookup chrome: %v", err)
+	}
+	profile := bridgeTestProfile(t, chrome)
+	fakeMesh(t, "me@laptop")
+
+	consent := &fakeConsent{key: cookie.DeriveKey(cookie.SafeStorageKey("peanuts"))}
+	st := stateWith("me@laptop", "")
+	d := New(consent, newFakeCache(), nil, staticProbe(liveSession(currentUser(t))), &recordingRunner{}, fixedState{st: st}, fixedState{st: st})
+	d.processes = testBridgeProcesses(t)
+	t.Cleanup(func() { d.closeAllBridges(context.Background()) })
+	d.seedSource = func(context.Context, cookie.Browser, string, cookie.AesKey) (cookie.StorageState, cookie.SeedCounts, error) {
+		t.Errorf("seedSource called: an open over a live import must never read the profile")
+		return cookie.StorageState{}, cookie.SeedCounts{}, errors.New("profile read forbidden")
+	}
+
+	importTTL := time.Minute
+	d.imports.put(importKey{browser: "chrome", profile: profile}, importTestRecord([]string{"example.com"},
+		[]cookie.Cookie{{HostKey: "example.com", Name: "bridge_probe", Value: "ok", Path: "/", IsSecure: true, SameSite: 2}},
+		[]cookie.OriginStorage{{Origin: "https://example.com", LocalStorage: []cookie.WebStorageEntry{{Name: "token", Value: "abc"}}}},
+		time.Now().Add(importTTL)))
+
+	ctx := context.Background()
+	res, err := dispatchSelf(t, d, "bridge_open", map[string]any{"browser": "chrome", "profile": profile, "headed": false})
+	if err != nil {
+		t.Fatalf("bridge_open over an import: %v", err)
+	}
+	open := resultMap(t, res)
+	url, _ := open["url"].(string)
+	capability, _ := open["capability"].(string)
+	if url == "" || capability == "" {
+		t.Fatalf("bridge_open missing url/capability: %+v", open)
+	}
+	if got := consent.biometricCalls.Load(); got != 0 {
+		t.Fatalf("ObtainKeyBiometric calls = %d, want 0 (the import replaces the tap)", got)
+	}
+	expiresIn, _ := open["expires_in"].(float64)
+	if expiresIn <= 0 || expiresIn > importTTL.Seconds() {
+		t.Fatalf("expires_in = %v, want within (0, %v]", expiresIn, importTTL.Seconds())
+	}
+	sess, ok := bridgeSessionFor(d, capability)
+	if !ok {
+		t.Fatalf("session for the capability not registered")
+	}
+	if sess.expiry.After(time.Now().Add(importTTL)) {
+		t.Fatalf("session expiry %v outlives the import lease of %v", sess.expiry, importTTL)
+	}
+	if got := open["seed"].(map[string]any)["attempted"]; got != float64(1) {
+		t.Fatalf("seed attempted = %v, want 1", got)
+	}
+
+	client := dialBridge(ctx, t, url)
+	if names := relayCookieNames(ctx, t, client); !contains(names, "bridge_probe") {
+		t.Fatalf("relay cookies = %v, want the imported bridge_probe", names)
 	}
 }
 
