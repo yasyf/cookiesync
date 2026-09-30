@@ -16,9 +16,6 @@ permissions:
 
 jobs:
   test:
-    # cookiesync is macOS-only (Safe Storage, Touch ID, launchd, ioreg), so its
-    # tests must run on macOS — the install/service/session tests need a real
-    # launchd and refuse to run elsewhere.
     runs-on: macos-latest
     timeout-minutes: 30
     steps:
@@ -31,18 +28,55 @@ jobs:
       - name: Vet
         run: go vet ./...
       - name: Test
-        run: ./scripts/test.sh -race ./...
+        run: ./scripts/test.sh -race -count=1 ./...
       - name: Build
         run: go build ./...
 
-  # daemonkit does not compile off darwin, so the analysis jobs cross-target it
-  # from ubuntu rather than moving to a macOS runner.
+  test-linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          check-latest: true
+          cache: true
+      - name: Build
+        run: CGO_ENABLED=0 go build ./...
+      - name: Vet
+        run: go vet ./...
+      - name: Test
+        env:
+          # Linux RLIMIT_NPROC counts threads, not processes, and the harness
+          # sizes its cap from the process count.
+          TEST_NPROC_HEADROOM: "4000"
+        run: ./scripts/test.sh -race -count=1 ./...
+
   lint:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     env:
       GOOS: darwin
       GOARCH: arm64
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          check-latest: true
+          cache: true
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v9
+        with:
+          version: latest
+
+  lint-linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      GOOS: linux
+      GOARCH: amd64
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v6
@@ -69,6 +103,76 @@ jobs:
         run: |
           go install golang.org/x/vuln/cmd/govulncheck@latest
           GOOS=darwin GOARCH=arm64 govulncheck ./...
+
+  vuln-linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          check-latest: true
+          cache: true
+      - name: govulncheck
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          GOOS=linux GOARCH=amd64 govulncheck ./...
+
+  linux-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          check-latest: true
+          cache: true
+      - name: Build the static Linux binary
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/bin"
+          CGO_ENABLED=0 go build -ldflags "-s -w -X main.version=0.0.0-smoke" -o "$RUNNER_TEMP/bin/cookiesync" .
+          bash .github/scripts/verify-static-elf.sh "$RUNNER_TEMP/bin/cookiesync" 0.0.0-smoke
+          echo "COOKIESYNC_BIN=$RUNNER_TEMP/bin/cookiesync" >> "$GITHUB_ENV"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+      - name: Let Chrome create its user-namespace sandbox on the hosted runner
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+      - name: Smoke-test the static binary
+        run: ./scripts/linux-smoke.sh
+      - name: Test the real Chrome and Secret Service boundaries
+        env:
+          TEST_NPROC_HEADROOM: "4000"
+          COOKIESYNC_SMOKE_DBUS: "1"
+        run: |
+          set -euo pipefail
+          COOKIESYNC_SMOKE_CHROME="$(command -v google-chrome)"
+          export COOKIESYNC_SMOKE_CHROME
+          dbus-run-session -- ./scripts/test.sh -race -count=1 ./...
+
+  release-assets:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Install goreleaser
+        uses: goreleaser/goreleaser-action@v7
+        with:
+          version: "~> v2"
+          install-only: true
+      - name: Check the goreleaser config
+        run: goreleaser check
+      - name: Build unsigned snapshot release assets
+        run: goreleaser release --snapshot --clean
+      - name: Verify the snapshot release archives
+        run: bash .github/scripts/verify-release-archives.sh dist "$(jq -r .version dist/metadata.json)"
 
   workflow:
     runs-on: ubuntu-latest

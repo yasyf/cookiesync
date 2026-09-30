@@ -85,15 +85,19 @@ func newBrowserProfilesCmd() *cobra.Command {
 // view) and records self_target. The convergent registry converges to peers on the
 // next reconcile, so the add is daemon-independent. Mirrors the Python add_endpoint.
 func runBrowserAdd(cmd *cobra.Command, host, browserName, profile string) error {
-	if err := validateBrowser(browserName); err != nil {
-		return err
-	}
 	self, peers, err := mesh.Resolve(cmd.Context())
 	if err != nil {
 		return err
 	}
 	if host != self && !contains(peers, host) {
 		return fmt.Errorf("unknown host %q; choose from %s", host, strings.Join(append([]string{self}, peers...), ", "))
+	}
+	known, err := targetBrowsers(host == self)
+	if err != nil {
+		return err
+	}
+	if !contains(known, browserName) {
+		return fmt.Errorf("unknown browser %q; choose from %s", browserName, strings.Join(known, ", "))
 	}
 	endpoint := state.Endpoint{Host: host, Browser: browserName, Profile: profile}
 	if err := state.New(paths.Config).AddBrowser(cmd.Context(), self, endpoint); err != nil {
@@ -191,22 +195,11 @@ type endpointJSON struct {
 	Profile string `json:"profile"`
 }
 
-// validateBrowser rejects a browser not in the registry, listing the known ones, so a
-// typo fails before any state write. Mirrors the Python "unknown browser" guard.
-func validateBrowser(name string) error {
-	registry, err := cookie.Registry()
-	if err != nil {
-		return err
+func targetBrowsers(local bool) ([]string, error) {
+	if local {
+		return knownBrowsers()
 	}
-	if _, ok := registry[cookie.BrowserName(name)]; ok {
-		return nil
-	}
-	known := make([]string, 0, len(registry))
-	for n := range registry {
-		known = append(known, string(n))
-	}
-	sort.Strings(known)
-	return fmt.Errorf("unknown browser %q; choose from %s", name, strings.Join(known, ", "))
+	return sortedBrowserNames(cookie.BrowserNames), nil
 }
 
 // knownBrowsers returns the registered browser names sorted, for the "choose from"
@@ -216,12 +209,16 @@ func knownBrowsers() ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	known := make([]string, 0, len(registry))
-	for n := range registry {
-		known = append(known, string(n))
+	return sortedBrowserNames(registry), nil
+}
+
+func sortedBrowserNames[V any](set map[cookie.BrowserName]V) []string {
+	names := make([]string, 0, len(set))
+	for n := range set {
+		names = append(names, string(n))
 	}
-	sort.Strings(known)
-	return known, nil
+	sort.Strings(names)
+	return names
 }
 
 // sortedEndpoints returns endpoints ordered by id, so ls output is stable across the

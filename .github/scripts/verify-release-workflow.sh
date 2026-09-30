@@ -39,6 +39,13 @@ for required in \
   'name: Verify signatures and checksums from the exact staged release' \
   "steps.stage.outputs['download-dir']" \
   'shasum -a 256 -c checksums.txt' \
+  './scripts/test.sh -race -count=1 ./...' \
+  'GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build ./...' \
+  'GOOS=linux GOARCH=amd64 go vet ./...' \
+  'dist/cookiesync_darwin_amd64.tar.gz' \
+  'dist/cookiesync_darwin_arm64.tar.gz' \
+  'dist/cookiesync_linux_amd64.tar.gz' \
+  'bash .github/scripts/verify-release-archives.sh "$downloaded" "${TAG#v}"' \
   'name: Package immutable release and Homebrew delivery' \
   'tap-delivery@c70d7e51bdb512db2a73d054e3a94afe0a61eedb' \
   'name: Upload immutable release and Homebrew delivery' \
@@ -55,6 +62,13 @@ for required in \
   'name: Publish the preserved cask to the tap'; do
   grep -Fq -- "$required" "$workflow"
 done
+
+if grep -Eq 'go test ' "$workflow"; then
+  echo "the release job must run the suite through scripts/test.sh" >&2
+  exit 1
+fi
+count_line='test "$(wc -l < "$manifest" | tr -d '"' '"')" = 6'
+test "$(grep -Fc -- "$count_line" "$workflow")" = 2
 
 line() { grep -Fn "$1" "$workflow" | cut -d: -f1; }
 verify="$(line 'name: Verify source')"
@@ -75,7 +89,9 @@ test "$draft" -lt "$app"
 test "$app" -lt "$manifest"
 test "$manifest" -lt "$stage"
 test "$stage" -lt "$verify_staged"
-test "$verify_staged" -lt "$bundle"
+archives="$(line 'bash .github/scripts/verify-release-archives.sh')"
+test "$verify_staged" -lt "$archives"
+test "$archives" -lt "$bundle"
 test "$bundle" -lt "$upload"
 test "$upload" -lt "$publish"
 test "$publish" -lt "$download"
@@ -98,5 +114,15 @@ if grep -Fq 'github/actions/publish@' "$release_block"; then
 fi
 if grep -Eq 'Import Developer ID|goreleaser release|stage-draft-release@|wrap-daemon-bundle@' "$tap_block"; then
   echo "the tap retry job must not rebuild, sign, notarize, or stage release assets" >&2
+  exit 1
+fi
+
+notarize_ids="$(awk '/^notarize:/{copy=1; next} /^[^[:space:]#]/{copy=0} copy && /^        - /{print $2}' .goreleaser.yaml)"
+if [ "$notarize_ids" != cookiesync ]; then
+  echo "notarize.macos must stay scoped to the darwin cookiesync build, got: $notarize_ids" >&2
+  exit 1
+fi
+if grep -qi linux .github/cask/cookiesync.rb.tmpl; then
+  echo "the Homebrew cask must stay darwin-only" >&2
   exit 1
 fi

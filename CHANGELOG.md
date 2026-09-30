@@ -6,6 +6,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Linux amd64 support for private single-user VMs.** Ship
+  `cookiesync_linux_amd64.tar.gz` with `requestor`, `auth`, cookie output formats,
+  and the bridge commands. Chrome profiles use `$XDG_CONFIG_HOME/google-chrome`;
+  Chromium is not registered until a Mac approver can resolve it.
+  Chromium v10 cookies use a fixed key; v11 uses the Secret Service secret.
+  Bridges run headless without a display. Every process running as the same user
+  can control the daemon.
+- Run `cookiesync supervise` in the foreground under the workspace process manager;
+  `install` starts the resident helper and `doctor` checks it. Linux never approves
+  consent: local key release routes to an already configured, attended Mac peer or
+  fails closed. Keys and grants stay in memory for at most five minutes. No automatic
+  pairing.
+
+### Changed
+- On every platform, including macOS, zero-argument `bridge open` and `bridge stop`
+  default to `chrome:Default`. A two-part `a:b` target reads as browser:profile when
+  `a` is a registered browser.
+
 ## [0.29.0] - 2026-08-29
 
 ### Changed

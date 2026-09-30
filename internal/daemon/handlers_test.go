@@ -6,7 +6,6 @@ import (
 	"errors"
 	"os/user"
 	"slices"
-	"strings"
 	"testing"
 	"time"
 
@@ -93,9 +92,9 @@ func TestGetCookiesAllUsesOneStateSnapshot(t *testing.T) {
 	cache := newFakeCache()
 	d := New(&fakeConsent{key: key}, cache, nil, staticProbe(SessionSnapshot{}), &recordingRunner{}, loader, fixedState{st: loader.st})
 	_, _ = cache.Put(ctx, endpointID(self, "chrome", "Default"), []byte(key), 0)
-	d.grant("local", []cookie.BrowserName{"chrome"}, time.Hour)
+	d.grant(ownSessionPrincipal(t), []cookie.BrowserName{"chrome"}, time.Hour)
 
-	got, err := d.handleGetCookies(ctx, map[string]any{"urls": []any{"https://x.com/"}})
+	got, err := dispatchSelf(t, d, "get_cookies", map[string]any{"urls": []any{"https://x.com/"}})
 	if err != nil {
 		t.Fatalf("handleGetCookies union: %v", err)
 	}
@@ -310,15 +309,15 @@ func TestHandlePrimeAuthLiveSession(t *testing.T) {
 	fakeMesh(t, "me@laptop")
 	d := New(consent, cache, nil, staticProbe(liveSession(me)), &recordingRunner{}, fixedState{st: st}, fixedState{st: st})
 
-	got, err := d.handlePrimeAuth(context.Background(), map[string]any{"browser": "chrome", "reason": "post a tweet"})
+	got, err := dispatchSelf(t, d, "prime_auth", map[string]any{"browser": "chrome", "reason": "post a tweet"})
 	if err != nil {
 		t.Fatalf("handlePrimeAuth: %v", err)
 	}
 	if marshalResult(t, got) != `{"endpoint":"me@laptop:chrome:Default","primed":true}` {
 		t.Fatalf("prime_auth = %s", marshalResult(t, got))
 	}
-	if len(consent.promptedReasons) != 1 || consent.promptedReasons[0] != "post a tweet" {
-		t.Fatalf("prompted reasons = %v, want one [post a tweet]", consent.promptedReasons)
+	if want := reasonForSelf(t, "post a tweet"); len(consent.promptedReasons) != 1 || consent.promptedReasons[0] != want {
+		t.Fatalf("prompted reasons = %v, want one [%s]", consent.promptedReasons, want)
 	}
 	if consent.unpromptedCalled != 0 {
 		t.Fatalf("a live session must not use the unprompted release")
@@ -337,11 +336,11 @@ func TestHandlePrimeAuthDefaultReason(t *testing.T) {
 	fakeMesh(t, "me@laptop")
 	d := New(consent, newFakeCache(), nil, staticProbe(liveSession(me)), &recordingRunner{}, fixedState{st: stateWith("me@laptop", "")}, fixedState{st: stateWith("me@laptop", "")})
 
-	if _, err := d.handlePrimeAuth(context.Background(), map[string]any{"browser": "chrome"}); err != nil {
+	if _, err := dispatchSelf(t, d, "prime_auth", map[string]any{"browser": "chrome"}); err != nil {
 		t.Fatalf("handlePrimeAuth: %v", err)
 	}
-	if len(consent.promptedReasons) != 1 || consent.promptedReasons[0] != consentReason {
-		t.Fatalf("default reason = %v, want [%q]", consent.promptedReasons, consentReason)
+	if want := reasonForSelf(t, consentReason); len(consent.promptedReasons) != 1 || consent.promptedReasons[0] != want {
+		t.Fatalf("default reason = %v, want [%q]", consent.promptedReasons, want)
 	}
 }
 
@@ -369,7 +368,7 @@ func TestHandlePrimeAuthHardRouteOverridesLocalSession(t *testing.T) {
 	d := New(consent, cache, nil, staticProbe(liveSession(me)), runner, fixedState{st: st}, fixedState{st: st})
 	pinnedNonce(d, nonce)
 
-	got, err := d.handlePrimeAuth(context.Background(), map[string]any{"browser": "chrome"})
+	got, err := dispatchSelf(t, d, "prime_auth", map[string]any{"browser": "chrome"})
 	if err != nil {
 		t.Fatalf("handlePrimeAuth: %v", err)
 	}
@@ -404,11 +403,11 @@ func TestHandlePrimeAuthHardRoutePeerOfflineFallsBackLocal(t *testing.T) {
 	cache := newFakeCache()
 	d := New(consent, cache, nil, staticProbe(liveSession(me)), runner, fixedState{st: st}, fixedState{st: st})
 
-	if _, err := d.handlePrimeAuth(context.Background(), map[string]any{"browser": "chrome", "reason": "post a tweet"}); err != nil {
+	if _, err := dispatchSelf(t, d, "prime_auth", map[string]any{"browser": "chrome", "reason": "post a tweet"}); err != nil {
 		t.Fatalf("handlePrimeAuth: %v", err)
 	}
-	if len(consent.promptedReasons) != 1 || consent.promptedReasons[0] != "post a tweet" {
-		t.Fatalf("an offline hard-route target must fall back to local Touch ID, got prompts %v", consent.promptedReasons)
+	if want := reasonForSelf(t, "post a tweet"); len(consent.promptedReasons) != 1 || consent.promptedReasons[0] != want {
+		t.Fatalf("an offline hard-route target must fall back to local Touch ID, got prompts %v, want [%s]", consent.promptedReasons, want)
 	}
 	if consent.unpromptedCalled != 0 {
 		t.Fatalf("the local fallback must not use the routed unprompted release, got %d", consent.unpromptedCalled)
@@ -434,11 +433,11 @@ func TestHandlePrimeAuthSoftRouteDoesNotOverrideLocalSession(t *testing.T) {
 	cache := newFakeCache()
 	d := New(consent, cache, nil, staticProbe(liveSession(me)), runner, fixedState{st: st}, fixedState{st: st})
 
-	if _, err := d.handlePrimeAuth(context.Background(), map[string]any{"browser": "chrome", "reason": "local tap"}); err != nil {
+	if _, err := dispatchSelf(t, d, "prime_auth", map[string]any{"browser": "chrome", "reason": "local tap"}); err != nil {
 		t.Fatalf("handlePrimeAuth: %v", err)
 	}
-	if len(consent.promptedReasons) != 1 || consent.promptedReasons[0] != "local tap" {
-		t.Fatalf("a soft route must not override a live local session, got prompts %v", consent.promptedReasons)
+	if want := reasonForSelf(t, "local tap"); len(consent.promptedReasons) != 1 || consent.promptedReasons[0] != want {
+		t.Fatalf("a soft route must not override a live local session, got prompts %v, want [%s]", consent.promptedReasons, want)
 	}
 	if consent.unpromptedCalled != 0 {
 		t.Fatalf("a soft route with a live local session must not route, got %d unprompted releases", consent.unpromptedCalled)
@@ -455,7 +454,7 @@ func TestHandleGetCookiesColdCacheFailsClosed(t *testing.T) {
 	fakeMesh(t, "me@laptop")
 	d := New(&fakeConsent{}, newFakeCache(), nil, staticProbe(SessionSnapshot{}), &recordingRunner{}, fixedState{st: stateWith("me@laptop", "")}, fixedState{st: stateWith("me@laptop", "")})
 
-	_, err := d.handleGetCookies(context.Background(), map[string]any{"browser": "chrome", "urls": []any{"https://x.com"}})
+	_, err := d.handleGetCookies(context.Background(), map[string]any{"requestor": "test", "browser": "chrome", "urls": []any{"https://x.com"}})
 	var authErr *AuthRequired
 	if !errors.As(err, &authErr) {
 		t.Fatalf("get_cookies cold = %v, want *AuthRequired", err)
@@ -469,7 +468,7 @@ func TestHandleGetWebStorageNoLocalBrowsersFailsClosed(t *testing.T) {
 	fakeMesh(t, "me@laptop")
 	d := New(&fakeConsent{}, newFakeCache(), nil, staticProbe(liveSession(currentUser(t))), &recordingRunner{}, fixedState{st: stateWith("me@laptop", "")}, fixedState{st: stateWith("me@laptop", "")})
 
-	_, err := d.handleGetWebStorage(context.Background(), map[string]any{"urls": []any{"https://x.com"}})
+	_, err := d.handleGetWebStorage(context.Background(), map[string]any{"requestor": "test", "urls": []any{"https://x.com"}})
 	var authErr *AuthRequired
 	if !errors.As(err, &authErr) {
 		t.Fatalf("get_web_storage with no local browsers = %v, want *AuthRequired", err)
@@ -487,22 +486,21 @@ func TestHandleGetWebStorageColdUnattendedReturnsNoStorage(t *testing.T) {
 	st := stateWith("me@laptop", "", stateEndpoint("me@laptop", "chrome", "Default"))
 	d := New(consent, newFakeCache(), nil, staticProbe(SessionSnapshot{}), &recordingRunner{}, fixedState{st: st}, fixedState{st: st})
 
-	got, err := d.handleGetWebStorage(context.Background(), map[string]any{"urls": []any{"https://x.com"}})
+	got, err := dispatchSelf(t, d, "get_web_storage", map[string]any{"urls": []any{"https://x.com"}})
 	if err != nil {
 		t.Fatalf("get_web_storage cold: %v", err)
 	}
-	reply, ok := got.(map[string]any)
-	if !ok {
-		t.Fatalf("get_web_storage reply = %T, want map[string]any", got)
+	var reply struct {
+		Origins  []cookie.WireOrigin `json:"origins"`
+		Warnings []string            `json:"warnings"`
 	}
-	origins, ok := reply["origins"].([]cookie.WireOrigin)
-	if !ok {
-		t.Fatalf("origins = %T, want []cookie.WireOrigin", reply["origins"])
+	if err := json.Unmarshal(got, &reply); err != nil {
+		t.Fatalf("decode get_web_storage reply %s: %v", got, err)
 	}
-	if len(origins) != 0 {
-		t.Fatalf("cold get_web_storage leaked %d origins without consent", len(origins))
+	if len(reply.Origins) != 0 {
+		t.Fatalf("cold get_web_storage leaked %d origins without consent", len(reply.Origins))
 	}
-	if reply["warnings"] == nil {
+	if len(reply.Warnings) == 0 {
 		t.Fatalf("cold get_web_storage should warn about the skipped endpoint")
 	}
 	if len(consent.promptedReasons) != 0 {
@@ -518,7 +516,7 @@ func TestHandleGetWebStorageSingleColdFailsClosed(t *testing.T) {
 	st := stateWith("me@laptop", "", stateEndpoint("me@laptop", "chrome", "Default"))
 	d := New(&fakeConsent{}, newFakeCache(), nil, staticProbe(SessionSnapshot{}), &recordingRunner{}, fixedState{st: st}, fixedState{st: st})
 
-	_, err := d.handleGetWebStorage(context.Background(), map[string]any{"browser": "chrome", "urls": []any{"https://x.com"}})
+	_, err := d.handleGetWebStorage(context.Background(), map[string]any{"requestor": "test", "browser": "chrome", "urls": []any{"https://x.com"}})
 	var authErr *AuthRequired
 	if !errors.As(err, &authErr) {
 		t.Fatalf("browser-scoped get_web_storage cold = %v, want *AuthRequired", err)
@@ -560,292 +558,6 @@ func stateEndpoint(host, browser, profile string) state.Endpoint {
 	return state.Endpoint{Host: host, Browser: browser, Profile: profile}
 }
 
-// primeAllReply decodes the browser-less prime_auth wire shape.
-type primeAllReply struct {
-	Primed    bool     `json:"primed"`
-	Endpoints []string `json:"endpoints"`
-	Warnings  []string `json:"warnings"`
-}
-
-// decodePrimeAll renders a handler result through the wire transport and decodes the
-// all-mode prime_auth reply, asserting the envelope shape.
-func decodePrimeAll(t *testing.T, result any) primeAllReply {
-	t.Helper()
-	var reply primeAllReply
-	if err := json.Unmarshal([]byte(marshalResult(t, result)), &reply); err != nil {
-		t.Fatalf("decode prime_auth all reply: %v", err)
-	}
-	return reply
-}
-
-// TestPrimeAuthAllLivePrimesEveryBrowserInOneEvaluation proves the browser-less
-// prime_auth over a live session runs exactly ONE consent evaluation covering every
-// tracked local browser and reports every tracked local endpoint id (all profiles
-// warmed by the single batch), never a peer endpoint.
-func TestPrimeAuthAllLivePrimesEveryBrowserInOneEvaluation(t *testing.T) {
-	ctx := context.Background()
-	self := "me@laptop"
-	fakeMesh(t, self)
-	st := stateWith(
-		self, "",
-		stateEndpoint(self, "chrome", "Default"),
-		stateEndpoint(self, "chrome", "Work"),
-		stateEndpoint(self, "arc", "Default"),
-		stateEndpoint("you@desktop", "chrome", "Default"),
-	)
-	consent := &fakeConsent{key: cookie.DeriveKey(cookie.SafeStorageKey("peanuts"))}
-	cache := newFakeCache()
-	d := New(consent, cache, nil, staticProbe(liveSession(currentUser(t))), &recordingRunner{}, fixedState{st: st}, fixedState{st: st})
-
-	got, err := d.handlePrimeAuth(ctx, map[string]any{})
-	if err != nil {
-		t.Fatalf("handlePrimeAuth all: %v", err)
-	}
-	reply := decodePrimeAll(t, got)
-	if !reply.Primed {
-		t.Fatalf("primed = false, want true")
-	}
-	if len(consent.batchCalls) != 1 {
-		t.Fatalf("consent evaluations = %d, want 1 (all-mode over a live session costs one sheet)", len(consent.batchCalls))
-	}
-	want := []string{
-		endpointID(self, "arc", "Default"),
-		endpointID(self, "chrome", "Default"),
-		endpointID(self, "chrome", "Work"),
-	}
-	if !slices.Equal(reply.Endpoints, want) {
-		t.Fatalf("endpoints = %v, want %v (every tracked local endpoint, sorted)", reply.Endpoints, want)
-	}
-	if len(reply.Warnings) != 0 {
-		t.Fatalf("warnings = %v, want none", reply.Warnings)
-	}
-	for _, id := range want {
-		if _, ok, _ := cache.Get(ctx, id); !ok {
-			t.Errorf("endpoint %s not warmed by the all-mode prime", id)
-		}
-	}
-	if _, ok, _ := cache.Get(ctx, endpointID("you@desktop", "chrome", "Default")); ok {
-		t.Errorf("a peer endpoint must never be warmed by a local all-mode prime")
-	}
-}
-
-// TestPrimeAuthAllMissingBrowserWarnsWithoutSecondSheet proves the never-a-second-sheet
-// invariant: when the one batch reports a browser Missing, the all-mode prime surfaces a
-// warning naming it and still runs exactly ONE consent evaluation, priming the released
-// browser.
-func TestPrimeAuthAllMissingBrowserWarnsWithoutSecondSheet(t *testing.T) {
-	ctx := context.Background()
-	self := "me@laptop"
-	fakeMesh(t, self)
-	st := stateWith(
-		self, "",
-		stateEndpoint(self, "chrome", "Default"),
-		stateEndpoint(self, "arc", "Default"),
-	)
-	consent := &partialGateConsent{
-		key:     cookie.DeriveKey(cookie.SafeStorageKey("peanuts")),
-		failFor: "arc",
-		entered: make(chan struct{}, 1),
-		release: make(chan struct{}),
-	}
-	close(consent.release)
-	cache := newFakeCache()
-	d := New(consent, cache, nil, staticProbe(liveSession(currentUser(t))), &recordingRunner{}, fixedState{st: st}, fixedState{st: st})
-
-	got, err := d.handlePrimeAuth(ctx, map[string]any{})
-	if err != nil {
-		t.Fatalf("handlePrimeAuth all: %v", err)
-	}
-	reply := decodePrimeAll(t, got)
-	if n := consent.batches.Load(); n != 1 {
-		t.Fatalf("consent evaluations = %d, want 1 (a Missing browser must not start a second sheet)", n)
-	}
-	if !slices.Equal(reply.Endpoints, []string{endpointID(self, "chrome", "Default")}) {
-		t.Fatalf("endpoints = %v, want only the released chrome endpoint", reply.Endpoints)
-	}
-	if len(reply.Warnings) != 1 || !strings.Contains(reply.Warnings[0], "arc") {
-		t.Fatalf("warnings = %v, want one naming arc", reply.Warnings)
-	}
-	if _, ok, _ := cache.Get(ctx, endpointID(self, "arc", "Default")); ok {
-		t.Errorf("the Missing browser must not be warmed")
-	}
-}
-
-// TestPrimeAuthAllColdRoutesConsentPerBrowser proves the cold-session path: with no live
-// local session each per-browser prime re-derives the routed split and routes consent per
-// distinct browser to a live peer (one request_consent each, never per profile),
-// bulk-caching a browser's other tracked profiles under the routed key.
-func TestPrimeAuthAllColdRoutesConsentPerBrowser(t *testing.T) {
-	ctx := context.Background()
-	self := "me@laptop"
-	peer := "you@desktop"
-	nonce := "all-route-nonce"
-	fakeMesh(t, self, peer)
-	st := stateWith(
-		self, "",
-		stateEndpoint(self, "chrome", "Default"),
-		stateEndpoint(self, "chrome", "Work"),
-		stateEndpoint(self, "arc", "Default"),
-	)
-	consent := &fakeConsent{key: cookie.DeriveKey(cookie.SafeStorageKey("peanuts"))}
-	runner := &recordingRunner{
-		replies: map[string]string{"cookiesync rpc whoami": liveWhoami},
-		byMethod: map[string]string{
-			endpointID(self, "arc", "Default"):    approvedReply(t, nonce, endpointID(self, "arc", "Default")),
-			endpointID(self, "chrome", "Default"): approvedReply(t, nonce, endpointID(self, "chrome", "Default")),
-		},
-	}
-	cache := newFakeCache()
-	// A cold, unattended local session forces the routed path.
-	d := New(consent, cache, nil, staticProbe(SessionSnapshot{}), runner, fixedState{st: st}, fixedState{st: st})
-	pinnedNonce(d, nonce)
-
-	got, err := d.handlePrimeAuth(ctx, map[string]any{})
-	if err != nil {
-		t.Fatalf("handlePrimeAuth all cold: %v", err)
-	}
-	reply := decodePrimeAll(t, got)
-	consents := 0
-	for _, call := range runner.calls {
-		if strings.Contains(call.cmd, "request_consent") {
-			consents++
-		}
-	}
-	if consents != 2 {
-		t.Fatalf("routed request_consent calls = %d, want 2 (one per distinct browser)", consents)
-	}
-	if consent.unpromptedCalled != 2 {
-		t.Fatalf("routed unprompted releases = %d, want 2 (one per browser)", consent.unpromptedCalled)
-	}
-	want := []string{
-		endpointID(self, "arc", "Default"),
-		endpointID(self, "chrome", "Default"),
-		endpointID(self, "chrome", "Work"),
-	}
-	if !slices.Equal(reply.Endpoints, want) {
-		t.Fatalf("endpoints = %v, want %v", reply.Endpoints, want)
-	}
-	if _, ok, _ := cache.Get(ctx, endpointID(self, "chrome", "Work")); !ok {
-		t.Errorf("chrome:Work must be warmed by the bulk Put after chrome's routed prime")
-	}
-}
-
-// TestPrimeAuthAllColdToLiveFlipKeepsOneSheet proves the loop keys off each flight's
-// ACTUAL consent surface, never a call-start routing snapshot: the console is cold when
-// the call starts — arc's flight routes consent to the live peer — and flips live before
-// chrome's flight, which leads exactly ONE local batch (where chrome is Missing). A
-// stale routed snapshot would disable the one-sheet guard and let the Missing browser
-// fire a second local sheet; here the flip costs one routed approval plus one local
-// evaluation, and the Missing browser is a skip warning.
-func TestPrimeAuthAllColdToLiveFlipKeepsOneSheet(t *testing.T) {
-	ctx := context.Background()
-	self := "me@laptop"
-	peer := "you@desktop"
-	nonce := "flip-live-nonce"
-	fakeMesh(t, self, peer)
-	st := stateWith(
-		self, "",
-		stateEndpoint(self, "arc", "Default"),
-		stateEndpoint(self, "chrome", "Default"),
-	)
-	consent := &fakeConsent{key: cookie.DeriveKey(cookie.SafeStorageKey("peanuts")), missingFor: "chrome"}
-	runner := &recordingRunner{
-		replies:  map[string]string{"cookiesync rpc whoami": liveWhoami},
-		byMethod: map[string]string{"request_consent": approvedReply(t, nonce, endpointID(self, "arc", "Default"))},
-	}
-	cache := newFakeCache()
-	d := New(consent, cache, nil, flipProbe(SessionSnapshot{}, liveSession(currentUser(t))), runner, fixedState{st: st}, fixedState{st: st})
-	pinnedNonce(d, nonce)
-
-	got, err := d.handlePrimeAuth(ctx, map[string]any{})
-	if err != nil {
-		t.Fatalf("handlePrimeAuth all: %v", err)
-	}
-	reply := decodePrimeAll(t, got)
-	consents := 0
-	for _, call := range runner.calls {
-		if strings.Contains(call.cmd, "request_consent") {
-			consents++
-		}
-	}
-	if consents != 1 {
-		t.Fatalf("routed request_consent calls = %d, want 1 (only arc's flight saw the cold console)", consents)
-	}
-	if consent.unpromptedCalled != 1 {
-		t.Fatalf("routed unprompted releases = %d, want 1", consent.unpromptedCalled)
-	}
-	if len(consent.batchCalls) != 1 {
-		t.Fatalf("local consent evaluations = %d, want 1 (a Missing browser after the flip must never fire a second sheet)", len(consent.batchCalls))
-	}
-	if !slices.Equal(reply.Endpoints, []string{endpointID(self, "arc", "Default")}) {
-		t.Fatalf("endpoints = %v, want only the arc endpoint", reply.Endpoints)
-	}
-	if len(reply.Warnings) != 1 || !strings.Contains(reply.Warnings[0], "skip chrome") {
-		t.Fatalf("warnings = %v, want one skipping chrome", reply.Warnings)
-	}
-	if _, ok, _ := cache.Get(ctx, endpointID(self, "chrome", "Default")); ok {
-		t.Errorf("the Missing browser must not be warmed")
-	}
-}
-
-// TestPrimeAuthAllHardRouteFlipDoesNotSkipLaterBrowsers proves the mirror flip: the
-// hard-route peer is dead when the first flight derives routing — so that flight leads
-// ONE local batch covering every tracked browser — and comes alive right after. Later
-// browsers ride the batch's grant: none may be skipped as "not released by the one-tap
-// batch" (the stale live-at-start snapshot regression), no consent is routed, and the
-// batch bulk-caches every profile.
-func TestPrimeAuthAllHardRouteFlipDoesNotSkipLaterBrowsers(t *testing.T) {
-	ctx := context.Background()
-	self := "me@laptop"
-	peer := "you@desktop"
-	nonce := "hard-route-flip-nonce"
-	fakeMesh(t, self, peer)
-	st := stateWith(
-		self, peer,
-		stateEndpoint(self, "arc", "Default"),
-		stateEndpoint(self, "arc", "Work"),
-		stateEndpoint(self, "chrome", "Default"),
-	)
-	st.ConsentRouteHard = true
-	consent := &fakeConsent{key: cookie.DeriveKey(cookie.SafeStorageKey("peanuts"))}
-	runner := &recordingRunner{
-		onceByMethod: map[string]string{"rpc whoami": deadWhoami},
-		replies:      map[string]string{"cookiesync rpc whoami": liveWhoami},
-		byMethod:     map[string]string{"request_consent": approvedReply(t, nonce, endpointID(self, "arc", "Default"))},
-	}
-	cache := newFakeCache()
-	d := New(consent, cache, nil, staticProbe(liveSession(currentUser(t))), runner, fixedState{st: st}, fixedState{st: st})
-	pinnedNonce(d, nonce)
-
-	got, err := d.handlePrimeAuth(ctx, map[string]any{})
-	if err != nil {
-		t.Fatalf("handlePrimeAuth all: %v", err)
-	}
-	reply := decodePrimeAll(t, got)
-	if len(reply.Warnings) != 0 {
-		t.Fatalf("warnings = %v, want none (a routed flip must not skip later browsers)", reply.Warnings)
-	}
-	want := []string{
-		endpointID(self, "arc", "Default"),
-		endpointID(self, "arc", "Work"),
-		endpointID(self, "chrome", "Default"),
-	}
-	if !slices.Equal(reply.Endpoints, want) {
-		t.Fatalf("endpoints = %v, want %v (every tracked endpoint primed by the one batch)", reply.Endpoints, want)
-	}
-	if len(consent.batchCalls) != 1 {
-		t.Fatalf("local consent evaluations = %d, want 1", len(consent.batchCalls))
-	}
-	if consent.unpromptedCalled != 0 {
-		t.Fatalf("unprompted releases = %d, want 0 (the dead-peer flight must release locally)", consent.unpromptedCalled)
-	}
-	for _, call := range runner.calls {
-		if strings.Contains(call.cmd, "request_consent") {
-			t.Fatalf("no consent may be routed after the local batch covered every browser, got %+v", runner.calls)
-		}
-	}
-}
-
 // TestPrimeAuthAllZeroLocalEndpointsFailsClosed proves the backstop: an all-mode prime
 // with no tracked local browser fails closed with AuthRequired.
 func TestPrimeAuthAllZeroLocalEndpointsFailsClosed(t *testing.T) {
@@ -854,7 +566,7 @@ func TestPrimeAuthAllZeroLocalEndpointsFailsClosed(t *testing.T) {
 	st := stateWith(self, "", stateEndpoint("you@desktop", "chrome", "Default"))
 	d := New(&fakeConsent{}, newFakeCache(), nil, staticProbe(liveSession(currentUser(t))), &recordingRunner{}, fixedState{st: st}, fixedState{st: st})
 
-	_, err := d.handlePrimeAuth(context.Background(), map[string]any{})
+	_, err := d.handlePrimeAuth(context.Background(), map[string]any{"requestor": "test"})
 	var authErr *AuthRequired
 	if !errors.As(err, &authErr) {
 		t.Fatalf("all-mode prime with zero local endpoints = %v, want *AuthRequired", err)
@@ -872,7 +584,7 @@ func TestPrimeAuthAllStaleRescanFailsClosed(t *testing.T) {
 	cache := &staleRescanCache{fakeCache: newFakeCache()}
 	d := New(consent, cache, nil, staticProbe(liveSession(currentUser(t))), &recordingRunner{}, fixedState{st: st}, fixedState{st: st})
 
-	got, err := d.handlePrimeAuth(context.Background(), map[string]any{})
+	got, err := d.handlePrimeAuth(context.Background(), map[string]any{"requestor": "test"})
 	var authErr *AuthRequired
 	if !errors.As(err, &authErr) {
 		t.Fatalf("all-mode prime with a stale rescan = %v, %v, want *AuthRequired", got, err)

@@ -15,6 +15,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/yasyf/cookiesync/internal/bridge"
 	"github.com/yasyf/cookiesync/internal/cookie"
 	"github.com/yasyf/cookiesync/internal/paths"
 	"github.com/yasyf/cookiesync/internal/rpc"
@@ -24,6 +25,8 @@ import (
 // bridgeDefaultProfile is the profile a bridge target assumes when none is
 // given, matching the daemon default.
 const bridgeDefaultProfile = "Default"
+
+const bridgeDefaultBrowser = "chrome"
 
 // bridgeOpenResult is the frozen bridge_open reply.
 type bridgeOpenResult struct {
@@ -94,14 +97,14 @@ type bridgeListJSON struct {
 // openBridge runs the tapped, consent-gated bridge_open behind both `bridge
 // open` and the plugin's browser.launch, persisting the capability and tearing
 // the session down if it can't be saved. A package var for the plugin tests' stub.
-var openBridge = func(ctx context.Context, host, browser, profile string, headed bool) (bridgeOpenResult, error) {
+var openBridge = func(ctx context.Context, host, browser, profile string, window bridge.WindowMode) (bridgeOpenResult, error) {
 	key := bridgeCapKey(host, browser, profile)
 	params := map[string]any{
 		"browser": browser,
 		"profile": profile,
 		"host":    host,
-		"headed":  headed,
 	}
+	setWindowParam(params, window)
 	if r, ok := resolveRequestor(); ok {
 		params["requestor"] = r
 	}
@@ -176,7 +179,7 @@ func newBridgeOpenCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			resp, err := openBridge(cmd.Context(), host, br, prof, headed && !headless)
+			resp, err := openBridge(cmd.Context(), host, br, prof, windowMode(cmd, headed, headless))
 			if err != nil {
 				return err
 			}
@@ -194,8 +197,8 @@ func newBridgeOpenCmd() *cobra.Command {
 			return nil
 		},
 	}
-	cmd.Flags().BoolVar(&headed, "headed", true, "Run Chrome headed (default) for fidelity.")
-	cmd.Flags().BoolVar(&headless, "headless", false, "Run Chrome headless (--headless=new).")
+	cmd.Flags().BoolVar(&headed, "headed", false, "Run Chrome headed for fidelity (the default wherever the daemon has a display).")
+	cmd.Flags().BoolVar(&headless, "headless", false, "Run Chrome headless (--headless=new; the default where the daemon has no display).")
 	cmd.Flags().StringVar(&browser, "browser", "", "The browser to seed the bridge from.")
 	cmd.Flags().StringVar(&profile, "profile", "", "The profile to seed the bridge from.")
 	cmd.Flags().BoolVar(&asJSON, "json", false, "Emit the bridge endpoint as JSON.")
@@ -274,6 +277,25 @@ func newBridgeStopCmd() *cobra.Command {
 	return cmd
 }
 
+func windowMode(cmd *cobra.Command, headed, headless bool) bridge.WindowMode {
+	switch {
+	case headless:
+		return bridge.WindowHeadless
+	case !cmd.Flags().Changed("headed"):
+		return bridge.WindowAuto
+	case headed:
+		return bridge.WindowHeaded
+	default:
+		return bridge.WindowHeadless
+	}
+}
+
+func setWindowParam(params map[string]any, window bridge.WindowMode) {
+	if window != bridge.WindowAuto {
+		params["headed"] = window == bridge.WindowHeaded
+	}
+}
+
 // arg returns the single optional positional, or "".
 func arg(args []string) string {
 	if len(args) == 1 {
@@ -283,16 +305,25 @@ func arg(args []string) string {
 }
 
 // parseBridgeTarget resolves a "[host:]browser[:profile]" target, with the
-// --browser/--profile flags filling the fields the positional omits.
+// --browser/--profile flags filling the fields the positional omits. A
+// two-part target is browser:profile only when its first part alone names a
+// browser ("arc:Default"); otherwise it stays host:browser.
 func parseBridgeTarget(target, browser, profile string) (host, br, prof string, err error) {
 	br, prof = browser, profile
+	if target == "" && br == "" {
+		br = bridgeDefaultBrowser
+	}
 	if target != "" {
 		parts := strings.SplitN(target, ":", 3)
 		switch len(parts) {
 		case 1:
 			br = parts[0]
 		case 2:
-			host, br = parts[0], parts[1]
+			if browserProfileForm(parts[0], parts[1]) {
+				br, prof = parts[0], parts[1]
+			} else {
+				host, br = parts[0], parts[1]
+			}
 		case 3:
 			host, br, prof = parts[0], parts[1], parts[2]
 		}
@@ -304,6 +335,12 @@ func parseBridgeTarget(target, browser, profile string) (host, br, prof string, 
 		prof = bridgeDefaultProfile
 	}
 	return host, br, prof, nil
+}
+
+func browserProfileForm(first, second string) bool {
+	_, firstIsBrowser := cookie.BrowserNames[cookie.BrowserName(first)]
+	_, secondIsBrowser := cookie.BrowserNames[cookie.BrowserName(second)]
+	return firstIsBrowser && !secondIsBrowser
 }
 
 // bridgeCapKey is the stable client-side lookup key for a target's capability.

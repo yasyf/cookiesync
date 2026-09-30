@@ -1,5 +1,6 @@
 // Package cookie is the Go port of the Python cookiesync cookie subsystem: the
-// data model and the Chrome macOS "Safe Storage" v10 cookie crypto.
+// data model and Chromium's "Safe Storage" cookie crypto, macOS v10 and Linux
+// v10/v11, bound to the host platform by build tag.
 //
 // Timestamps stay Chrome-native (ChromeMicros, µs since 1601) throughout the model;
 // conversion to Unix seconds happens only at serialize time.
@@ -18,7 +19,8 @@ type Host string
 // leading dot (e.g. ".x.com") to denote a domain cookie.
 type HostKey string
 
-// SafeStorageKey is the raw "Safe Storage" password read from the macOS Keychain.
+// SafeStorageKey is the raw "Safe Storage" password: the macOS Keychain item, or on
+// Linux the Secret Service secret, falling back to Chromium's basic-store literal.
 type SafeStorageKey string
 
 // AesKey is the 16-byte AES-128 key derived from a SafeStorageKey.
@@ -88,7 +90,8 @@ type Cookie struct {
 }
 
 // EncryptedRow is a raw, pre-decrypt cookie row straight off the Chrome SQLite
-// store. Only canonical encrypted_value bytes cross this boundary.
+// store. Only canonical encrypted_value bytes cross this boundary; the store's
+// meta.version rides along where the host scheme needs it to decrypt.
 type EncryptedRow struct {
 	HostKey              HostKey
 	Name                 string
@@ -104,6 +107,7 @@ type EncryptedRow struct {
 	SourcePort           int
 	TopFrameSiteKey      string
 	HasCrossSiteAncestor int
+	metaVersion          int
 }
 
 // WebStorageEntry is one localStorage or sessionStorage item: a name/value pair

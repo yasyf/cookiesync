@@ -22,8 +22,6 @@ import (
 	"github.com/yasyf/daemonkit"
 )
 
-const chromeHostBinary = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
-
 // maxStderrBytes caps the retained Chrome stderr; the process outlives seeding,
 // so the buffer keeps only the most recent bytes for diagnosis.
 const maxStderrBytes = 64 << 10
@@ -47,6 +45,7 @@ type Proc struct {
 
 	dataDir     string
 	browserUUID string
+	handlers    *handlerTracker
 
 	writeMu   sync.Mutex
 	id        atomic.Int64
@@ -70,6 +69,10 @@ func Launch(ctx context.Context, spawner Spawner, spec LaunchSpec) (*Proc, error
 	if err != nil {
 		return nil, err
 	}
+	nonce, err := newLaunchNonce()
+	if err != nil {
+		return nil, err
+	}
 	p := &Proc{
 		dataDir:     spec.DataDir,
 		browserUUID: uuid,
@@ -82,18 +85,19 @@ func Launch(ctx context.Context, spawner Spawner, spec LaunchSpec) (*Proc, error
 		Path: spec.RolePath,
 		Args: append(append([]string{}, spec.RoleArgs...),
 			"_bridge-chrome-child", spec.HostBinary, spec.DataDir, strconv.FormatBool(spec.Headed)),
-		Env:     bridgeEnvironment(),
+		Env:     chromeEnvironment(spec.DataDir, spec.Headed, nonce),
 		Session: true,
 		Exec:    daemonkit.ServingSameUser(),
 	}, daemonkit.ChannelStdio, stderr)
 	if err != nil {
 		return nil, fmt.Errorf("start chrome session: %w", err)
 	}
+	p.child = child
+	p.handlers = trackHandlers(spec.DataDir, nonce)
 	transport, err := child.Conn()
 	if err != nil {
-		return nil, stopChild(ctx, child, fmt.Errorf("bridge: take chrome cdp pipe: %w", err))
+		return nil, errors.Join(stopChild(ctx, child, fmt.Errorf("bridge: take chrome cdp pipe: %w", err)), p.handlers.close())
 	}
-	p.child = child
 	p.transport = transport
 	go p.readLoop()
 	if _, err := (&Conn{proc: p}).Call(readyCtx, "", "Browser.getVersion", nil); err != nil {
@@ -101,6 +105,7 @@ func Launch(ctx context.Context, spawner Spawner, spec LaunchSpec) (*Proc, error
 			fmt.Errorf("cdp handshake (chrome stderr: %q): %w", stderr.String(), err),
 			transport.Close(),
 			stopChild(ctx, child, nil),
+			p.handlers.close(),
 		)
 	}
 	return p, nil
@@ -122,26 +127,19 @@ func (p *Proc) Close() error {
 	return p.CloseContext(context.Background())
 }
 
-// CloseContext settles the managed Chrome process within ctx and removes the
-// data dir. A ctx carrying no deadline gets childSettlementTimeout, since
-// daemonkit's Stop refuses one that states no budget.
+// CloseContext settles the managed Chrome process within ctx, then every
+// crashpad handler carrying this launch's evidence, and removes the data dir;
+// a look-alike without that evidence is left running and named in the error.
+// A ctx carrying no deadline gets childSettlementTimeout, which daemonkit's
+// Stop requires.
 func (p *Proc) CloseContext(ctx context.Context) error {
 	p.closeOnce.Do(func() {
 		ctx, cancel := budgeted(ctx, childSettlementTimeout)
 		defer cancel()
 		_, stopErr := p.child.Stop(ctx)
-		p.closeErr = errors.Join(p.transport.Close(), stopErr, p.child.StderrErr(), os.RemoveAll(p.dataDir))
+		p.closeErr = errors.Join(p.transport.Close(), stopErr, p.child.StderrErr(), p.handlers.close(), os.RemoveAll(p.dataDir)) //nolint:gosec // G703: dataDir is this session's own throwaway profile dir.
 	})
 	return p.closeErr
-}
-
-// ResolveHostBinary returns the Google Chrome executable path, erroring if
-// Chrome is not installed.
-func ResolveHostBinary() (string, error) {
-	if _, err := os.Stat(chromeHostBinary); err != nil {
-		return "", fmt.Errorf("google chrome not installed at %s: %w", chromeHostBinary, err)
-	}
-	return chromeHostBinary, nil
 }
 
 func newBrowserUUID() (string, error) {

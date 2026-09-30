@@ -120,7 +120,11 @@ func (d *Daemon) handleExtract(ctx context.Context, params map[string]any) (any,
 	if err != nil {
 		return nil, err
 	}
-	req := auth.Req{Requestor: peerRequestor(ctx, params), Browser: browser, Profile: profile, Reason: consentReason, Mode: auth.ModeLocal}
+	requestor, err := peerRequestor(ctx, params)
+	if err != nil {
+		return nil, err
+	}
+	req := auth.Req{Requestor: requestor, Browser: browser, Profile: profile, Reason: consentReason, Mode: auth.ModeLocal}
 	if _, _, err := d.broker.Key(ctx, req); err != nil {
 		return nil, err
 	}
@@ -195,13 +199,17 @@ func sessionSummary(ctx context.Context, probe Probe) (map[string]any, error) {
 // registered local browser via LocalKeys(PrimeAll), emitting
 // {"primed": true, "endpoints": [...], "warnings": [...]}.
 func (d *Daemon) handlePrimeAuth(ctx context.Context, params map[string]any) (any, error) {
+	requestor, err := requestorID(ctx, params)
+	if err != nil {
+		return nil, err
+	}
 	reason := optionalString(params, "reason", consentReason)
 	browser := optionalString(params, "browser", "")
 	if browser == "" {
-		return d.primeAuthAll(ctx, requestorID(ctx, params), reason)
+		return d.primeAuthAll(ctx, requestor, reason)
 	}
 	profile := optionalString(params, "profile", defaultProfile)
-	req := auth.Req{Requestor: requestorID(ctx, params), Browser: browser, Profile: profile, Reason: reason, Mode: auth.ModeLocal}
+	req := auth.Req{Requestor: requestor, Browser: browser, Profile: profile, Reason: reason, Mode: auth.ModeLocal}
 	if _, _, err := d.broker.Key(ctx, req); err != nil {
 		return nil, err
 	}
@@ -360,7 +368,11 @@ func (d *Daemon) handleGetCookies(ctx context.Context, params map[string]any) (a
 		if err != nil {
 			return nil, err
 		}
-		return d.getCookiesAll(ctx, requestorID(ctx, params), urls)
+		requestor, err := requestorID(ctx, params)
+		if err != nil {
+			return nil, err
+		}
+		return d.getCookiesAll(ctx, requestor, urls)
 	}
 	return d.getCookiesSingle(ctx, params)
 }
@@ -388,7 +400,11 @@ func (d *Daemon) getCookiesSingle(ctx context.Context, params map[string]any) (a
 	if origin := optionalString(params, "origin", ""); origin != "" {
 		reason = fmt.Sprintf("send them to %s", origin)
 	}
-	req := auth.Req{Requestor: peerRequestor(ctx, params), Browser: browser, Profile: profile, Reason: reason, Mode: auth.ModeLocal}
+	requestor, err := peerRequestor(ctx, params)
+	if err != nil {
+		return nil, err
+	}
+	req := auth.Req{Requestor: requestor, Browser: browser, Profile: profile, Reason: reason, Mode: auth.ModeLocal}
 	key, _, err := d.broker.Key(ctx, req)
 	if err != nil {
 		return nil, err
@@ -552,7 +568,11 @@ func (d *Daemon) getWebStorageSingle(ctx context.Context, params map[string]any)
 	if err != nil {
 		return nil, err
 	}
-	req := auth.Req{Requestor: requestorID(ctx, params), Browser: browser, Profile: profile, Reason: consentReason, Mode: auth.ModeLocal}
+	requestor, err := requestorID(ctx, params)
+	if err != nil {
+		return nil, err
+	}
+	req := auth.Req{Requestor: requestor, Browser: browser, Profile: profile, Reason: consentReason, Mode: auth.ModeLocal}
 	if _, _, err := d.broker.Key(ctx, req); err != nil {
 		return nil, err
 	}
@@ -580,7 +600,11 @@ func (d *Daemon) getWebStorageAll(ctx context.Context, params map[string]any) (a
 	if err != nil {
 		return nil, err
 	}
-	outcomes, err := d.broker.LocalKeys(ctx, requestorID(ctx, params), consentReason, auth.OneFlight)
+	requestor, err := requestorID(ctx, params)
+	if err != nil {
+		return nil, err
+	}
+	outcomes, err := d.broker.LocalKeys(ctx, requestor, consentReason, auth.OneFlight)
 	if err != nil {
 		return nil, err
 	}

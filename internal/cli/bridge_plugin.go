@@ -7,6 +7,8 @@ import (
 	"io"
 
 	"github.com/spf13/cobra"
+
+	"github.com/yasyf/cookiesync/internal/bridge"
 )
 
 // agentBrowserProtocol tags every agent-browser plugin message on the wire.
@@ -139,7 +141,11 @@ func pluginLaunch(ctx context.Context, out io.Writer, body json.RawMessage) erro
 	if !ok {
 		return pluginFail(out, fmt.Errorf("unsupported launch engine %q", lr.LaunchOptions.Engine))
 	}
-	resp, err := openBridge(ctx, "", browser, bridgeDefaultProfile, lr.LaunchOptions.Headed)
+	window := bridge.WindowHeadless
+	if lr.LaunchOptions.Headed {
+		window = bridge.WindowHeaded
+	}
+	resp, err := openBridge(ctx, "", browser, bridgeDefaultProfile, window)
 	if err != nil {
 		return pluginFail(out, err)
 	}

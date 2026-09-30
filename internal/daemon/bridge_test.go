@@ -27,22 +27,14 @@ func TestBridgeOpenReattachClose(t *testing.T) {
 	if _, err := bridge.ResolveHostBinary(); err != nil {
 		t.Skipf("skipping: Chrome not installed: %v", err)
 	}
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	// The daemon validates the profile against the browser's real profiles, so
 	// pick one that exists; the fixture below is seeded regardless of its name.
 	chrome, err := cookie.Lookup(cookie.BrowserName("chrome"))
 	if err != nil {
 		t.Fatalf("lookup chrome: %v", err)
 	}
-	profiles, err := chrome.Profiles()
-	if err != nil {
-		t.Fatalf("chrome profiles: %v", err)
-	}
-	if len(profiles) == 0 {
-		t.Skip("skipping: no chrome profiles on this host")
-	}
-	profile := profiles[0].Dir
-
-	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	profile := bridgeTestProfile(t, chrome)
 	fakeMesh(t, "me@laptop")
 
 	consent := &fakeConsent{key: cookie.DeriveKey(cookie.SafeStorageKey("peanuts"))}
@@ -71,11 +63,11 @@ func TestBridgeOpenReattachClose(t *testing.T) {
 	openParams := map[string]any{"browser": "chrome", "profile": profile, "headed": false}
 
 	// (1) open returns a url + capability; the seeded cookie round-trips over ws.
-	res1, err := d.handleBridgeOpen(ctx, openParams)
+	res1, err := dispatchSelf(t, d, "bridge_open", openParams)
 	if err != nil {
 		t.Fatalf("bridge_open: %v", err)
 	}
-	open1 := res1.(map[string]any)
+	open1 := resultMap(t, res1)
 	url1, _ := open1["url"].(string)
 	cap1, _ := open1["capability"].(string)
 	if url1 == "" || cap1 == "" {
@@ -107,13 +99,13 @@ func TestBridgeOpenReattachClose(t *testing.T) {
 
 	// (2) re-attach WITH the capability returns the same url, no second tap, no
 	// second session, and no lease extension.
-	res2, err := d.handleBridgeOpen(ctx, map[string]any{
+	res2, err := dispatchSelf(t, d, "bridge_open", map[string]any{
 		"browser": "chrome", "profile": profile, "headed": false, "capability": cap1,
 	})
 	if err != nil {
 		t.Fatalf("bridge_open re-attach: %v", err)
 	}
-	open2 := res2.(map[string]any)
+	open2 := resultMap(t, res2)
 	if got := open2["url"].(string); got != url1 {
 		t.Fatalf("re-attach url = %q, want %q", got, url1)
 	}
@@ -143,11 +135,11 @@ func TestBridgeOpenReattachClose(t *testing.T) {
 	if got := stRes.(map[string]any); len(got) != 1 || got["protocol_version"] != cookie.ProtocolVersion {
 		t.Fatalf("bridge_status for a wrong capability = %+v, want exact version-only envelope", got)
 	}
-	res3, err := d.handleBridgeOpen(ctx, openParams)
+	res3, err := dispatchSelf(t, d, "bridge_open", openParams)
 	if err != nil {
 		t.Fatalf("fresh bridge_open (no cap): %v", err)
 	}
-	cap3 := res3.(map[string]any)["capability"].(string)
+	cap3 := resultMap(t, res3)["capability"].(string)
 	if cap3 == cap1 {
 		t.Fatalf("fresh open reused cap1 %q", cap1)
 	}
@@ -197,20 +189,12 @@ func TestBridgeFreshOpensDoNotShareSecrets(t *testing.T) {
 	if _, err := bridge.ResolveHostBinary(); err != nil {
 		t.Skipf("skipping: Chrome not installed: %v", err)
 	}
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	chrome, err := cookie.Lookup(cookie.BrowserName("chrome"))
 	if err != nil {
 		t.Fatalf("lookup chrome: %v", err)
 	}
-	profiles, err := chrome.Profiles()
-	if err != nil {
-		t.Fatalf("chrome profiles: %v", err)
-	}
-	if len(profiles) == 0 {
-		t.Skip("skipping: no chrome profiles on this host")
-	}
-	profile := profiles[0].Dir
-
-	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	profile := bridgeTestProfile(t, chrome)
 	fakeMesh(t, "me@laptop")
 
 	consent := &fakeConsent{key: cookie.DeriveKey(cookie.SafeStorageKey("peanuts"))}
@@ -231,7 +215,7 @@ func TestBridgeFreshOpensDoNotShareSecrets(t *testing.T) {
 	const n = 2
 	ctx := context.Background()
 	type outcome struct {
-		res any
+		res json.RawMessage
 		err error
 	}
 	results := make([]outcome, n)
@@ -242,7 +226,7 @@ func TestBridgeFreshOpensDoNotShareSecrets(t *testing.T) {
 			defer wg.Done()
 			// A private param copy per goroutine: same requestor+endpoint (the
 			// former collision key), no shared-map write.
-			res, err := d.handleBridgeOpen(ctx, map[string]any{"browser": "chrome", "profile": profile, "headed": false})
+			res, err := dispatchSelf(t, d, "bridge_open", map[string]any{"browser": "chrome", "profile": profile, "headed": false})
 			results[i] = outcome{res: res, err: err}
 		}(i)
 	}
@@ -253,7 +237,7 @@ func TestBridgeFreshOpensDoNotShareSecrets(t *testing.T) {
 		if got.err != nil {
 			t.Fatalf("concurrent open %d: %v", i, got.err)
 		}
-		open := got.res.(map[string]any)
+		open := resultMap(t, got.res)
 		capability, _ := open["capability"].(string)
 		url, _ := open["url"].(string)
 		if capability == "" || url == "" {

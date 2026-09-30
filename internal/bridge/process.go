@@ -37,6 +37,17 @@ type Spawner interface {
 }
 
 func bridgeEnvironment() []string {
+	return allowedEnvironment(nil)
+}
+
+func chromeEnvironment(dataDir string, headed bool, nonce string) []string {
+	if headed {
+		return withCrashpadEnvironment(allowedEnvironment(chromeDisplayEnv), dataDir, nonce)
+	}
+	return withCrashpadEnvironment(bridgeEnvironment(), dataDir, nonce)
+}
+
+func allowedEnvironment(extra []string) []string {
 	keys := map[string]string{}
 	for _, variable := range os.Environ() {
 		key, _, ok := strings.Cut(variable, "=")
@@ -44,7 +55,7 @@ func bridgeEnvironment() []string {
 			continue
 		}
 		if key == "HOME" || key == "USER" || key == "LOGNAME" || key == "TMPDIR" || key == "XDG_CONFIG_HOME" ||
-			strings.HasPrefix(key, "COOKIESYNC_") || strings.HasPrefix(key, "SSH_") {
+			slices.Contains(extra, key) || strings.HasPrefix(key, "COOKIESYNC_") || strings.HasPrefix(key, "SSH_") {
 			keys[key] = variable
 		}
 	}

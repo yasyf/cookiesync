@@ -290,7 +290,7 @@ func (m *browsersModel) advancePick() (stui.Screen, tea.Cmd) {
 	switch m.pick.step {
 	case pickHost:
 		m.pick.host = it.value
-		names, err := browserNames()
+		names, err := browserNames(m.pick.host == m.self)
 		if err != nil {
 			m.pick = nil
 			m.status = stui.StatusErr.Render(err.Error())
@@ -414,19 +414,24 @@ func selectID(l *list.Model, id string) {
 	}
 }
 
-// browserNames returns the registered browser names, sorted, for the add
-// picker's browser step.
-func browserNames() ([]string, error) {
+func browserNames(local bool) ([]string, error) {
+	if !local {
+		return sortedBrowserNames(cookie.BrowserNames), nil
+	}
 	registry, err := cookie.Registry()
 	if err != nil {
 		return nil, err
 	}
-	names := make([]string, 0, len(registry))
-	for n := range registry {
+	return sortedBrowserNames(registry), nil
+}
+
+func sortedBrowserNames[V any](set map[cookie.BrowserName]V) []string {
+	names := make([]string, 0, len(set))
+	for n := range set {
 		names = append(names, string(n))
 	}
 	sort.Strings(names)
-	return names, nil
+	return names
 }
 
 // browserProfiles scans the named browser's local data root for profiles that

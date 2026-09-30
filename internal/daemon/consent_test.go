@@ -248,7 +248,7 @@ func TestRoutedApprovalWarmsApproverCache(t *testing.T) {
 
 	// A following local prime is a DIFFERENT requestor: the warm cache alone must not
 	// serve it — it prompts its own evaluation.
-	res, err := d.handlePrimeAuth(ctx, map[string]any{"browser": "chrome", "profile": "Work"})
+	res, err := dispatchSelf(t, d, "prime_auth", map[string]any{"browser": "chrome", "profile": "Work"})
 	if err != nil {
 		t.Fatalf("handlePrimeAuth after approval: %v", err)
 	}

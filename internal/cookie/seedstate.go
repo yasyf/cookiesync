@@ -20,8 +20,12 @@ type SeedCounts struct {
 // SeedState decrypts every cookie and all local/session storage in a profile for bridge seeding.
 // It returns the full StorageState plus a per-cause count of the cookie rows it dropped (a caller may
 // fail loud on a materially incomplete clone). key must already be released by the consent layer.
-func SeedState(ctx context.Context, browser Browser, profile string, key AesKey) (state StorageState, counts SeedCounts, err error) {
-	rows, err := Read(ctx, browser, profile)
+func SeedState(ctx context.Context, browser Browser, profile string, key AesKey) (StorageState, SeedCounts, error) {
+	return hostCodec.seedState(ctx, browser, profile, key)
+}
+
+func (c codec) seedState(ctx context.Context, browser Browser, profile string, key AesKey) (state StorageState, counts SeedCounts, err error) {
+	rows, err := c.read(ctx, browser, profile)
 	if err != nil {
 		return StorageState{}, SeedCounts{}, fmt.Errorf("read cookies: %w", err)
 	}
@@ -29,8 +33,12 @@ func SeedState(ctx context.Context, browser Browser, profile string, key AesKey)
 	now := float64(time.Now().UnixNano()) / 1e9
 	counts.Attempted = len(rows)
 	cookies := make([]Cookie, 0, len(rows))
+	var failed DecryptCounts
 	for _, row := range rows {
-		cookie, ok := DecryptRow(row, key)
+		cookie, ok, err := c.decryptRow(row, key, &failed)
+		if err != nil {
+			return StorageState{}, SeedCounts{}, fmt.Errorf("decrypt cookies: %w", err)
+		}
 		if !ok {
 			counts.Undecryptable++
 			continue

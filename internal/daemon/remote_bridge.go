@@ -168,7 +168,7 @@ func (d *Daemon) handleBridgeKeepalive(ctx context.Context, params map[string]an
 // cookies there — the key never crosses the wire), spawns an ssh -L forward back
 // to the peer's loopback, proves it up, and registers a proxy session. A lost
 // port-bind race re-opens on a fresh port, bounded by remoteBridgeOpenAttempts.
-func (d *Daemon) remoteBridgeOpen(ctx context.Context, self, host, browser, profile string, headed bool) (any, error) {
+func (d *Daemon) remoteBridgeOpen(ctx context.Context, self, host, browser, profile string, window bridge.WindowMode) (any, error) {
 	if d.processes == nil {
 		return nil, errors.New("bridge: managed process owner is unavailable")
 	}
@@ -184,7 +184,7 @@ func (d *Daemon) remoteBridgeOpen(ctx context.Context, self, host, browser, prof
 	}()
 	var lastErr error
 	for attempt := 0; attempt < remoteBridgeOpenAttempts; attempt++ {
-		result, retry, err := d.tryRemoteBridgeOpen(ctx, self, host, browser, profile, headed, releaseSlots)
+		result, retry, err := d.tryRemoteBridgeOpen(ctx, self, host, browser, profile, window, releaseSlots)
 		if err == nil {
 			keepSlots = true
 			return result, nil
@@ -200,7 +200,7 @@ func (d *Daemon) remoteBridgeOpen(ctx context.Context, self, host, browser, prof
 // tryRemoteBridgeOpen runs one cross-host open attempt. retry reports a
 // port-collision the caller re-opens around; any other failure is terminal. Every
 // failure past the peer open best-effort closes the peer's bridge before returning.
-func (d *Daemon) tryRemoteBridgeOpen(ctx context.Context, self, host, browser, profile string, headed bool, releaseSlots func()) (result any, retry bool, err error) {
+func (d *Daemon) tryRemoteBridgeOpen(ctx context.Context, self, host, browser, profile string, window bridge.WindowMode, releaseSlots func()) (result any, retry bool, err error) {
 	// Reserve a loopback port and hold it until the peer's bridge is open, so
 	// nothing else grabs it between the advertise and the forward binding it.
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -213,7 +213,7 @@ func (d *Daemon) tryRemoteBridgeOpen(ctx context.Context, self, host, browser, p
 		return nil, false, err
 	}
 
-	reply, err := d.shellRemoteBridgeOpen(ctx, self, host, browser, profile, port, headed)
+	reply, err := d.shellRemoteBridgeOpen(ctx, self, host, browser, profile, port, window)
 	// Anchor the lease at the reply, before the forward proof, so the origin's
 	// expiry never overshoots the peer's by the proof latency.
 	replyAt := time.Now()
@@ -332,15 +332,18 @@ func (d *Daemon) tryRemoteBridgeOpen(ctx context.Context, self, host, browser, p
 // shellRemoteBridgeOpen shells the peer's own bridge_open over ssh, advertising
 // this origin's forwarded loopback port and carrying no --host so the peer takes
 // its local path. It sends no key or secret: --origin is display-only.
-func (d *Daemon) shellRemoteBridgeOpen(ctx context.Context, self, host, browser, profile string, port int, headed bool) (remoteBridgeReply, error) {
+func (d *Daemon) shellRemoteBridgeOpen(ctx context.Context, self, host, browser, profile string, port int, window bridge.WindowMode) (remoteBridgeReply, error) {
 	advertise := fmt.Sprintf("127.0.0.1:%d", port)
 	cmd := fmt.Sprintf(
 		"cookiesync rpc bridge_open --browser %s --profile %s --origin %s --advertise %s",
 		hostregistry.ShellQuote(browser), hostregistry.ShellQuote(profile),
 		hostregistry.ShellQuote(self), hostregistry.ShellQuote(advertise),
 	)
-	if !headed {
+	switch window {
+	case bridge.WindowHeadless:
 		cmd += " --headless"
+	case bridge.WindowHeaded:
+		cmd += " --headed"
 	}
 	rctx, cancel := context.WithTimeout(ctx, remoteBridgeOpenTimeout)
 	defer cancel()

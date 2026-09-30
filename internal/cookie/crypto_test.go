@@ -2,6 +2,7 @@ package cookie
 
 import (
 	"bytes"
+	"context"
 	"encoding/hex"
 	"errors"
 	"strings"
@@ -22,12 +23,12 @@ const (
 
 func key(t *testing.T) AesKey {
 	t.Helper()
-	return DeriveKey(SafeStorageKey("peanuts"))
+	return darwinCodec.deriveKey(SafeStorageKey("peanuts"))
 }
 
 func otherKey(t *testing.T) AesKey {
 	t.Helper()
-	return DeriveKey(SafeStorageKey("almonds"))
+	return darwinCodec.deriveKey(SafeStorageKey("almonds"))
 }
 
 func mustHex(t *testing.T, s string) []byte {
@@ -42,7 +43,7 @@ func mustHex(t *testing.T, s string) []byte {
 func TestDeriveKeyIsDeterministic16Bytes(t *testing.T) {
 	got := key(t)
 	if want := mustHex(t, goldenKeyHex); !bytes.Equal(got, want) {
-		t.Fatalf("DeriveKey(peanuts) = %x, want %s", got, goldenKeyHex)
+		t.Fatalf("darwinCodec.deriveKey(peanuts) = %x, want %s", got, goldenKeyHex)
 	}
 	if len(got) != 16 {
 		t.Fatalf("key length = %d, want 16", len(got))
@@ -54,7 +55,7 @@ func TestGoldenVectorDecrypts(t *testing.T) {
 	if !bytes.HasPrefix(blob, []byte("v10")) {
 		t.Fatalf("golden blob does not start with v10")
 	}
-	got, err := DecryptValue(blob, key(t), goldenHost)
+	got, err := darwinOpen(blob, key(t), goldenHost)
 	if err != nil {
 		t.Fatalf("DecryptValue: %v", err)
 	}
@@ -64,7 +65,7 @@ func TestGoldenVectorDecrypts(t *testing.T) {
 }
 
 func TestGoldenVectorEncryptsToExactBytes(t *testing.T) {
-	got, err := EncryptValue(goldenValue, key(t), goldenHost)
+	got, err := darwinSeal(goldenValue, key(t), goldenHost)
 	if err != nil {
 		t.Fatalf("EncryptValue: %v", err)
 	}
@@ -96,11 +97,11 @@ func TestRoundtrip(t *testing.T) {
 	for _, h := range hosts {
 		for _, v := range values {
 			t.Run(h.id+"/"+v.id, func(t *testing.T) {
-				blob, err := EncryptValue(v.value, key(t), h.host)
+				blob, err := darwinSeal(v.value, key(t), h.host)
 				if err != nil {
 					t.Fatalf("EncryptValue: %v", err)
 				}
-				got, err := DecryptValue(blob, key(t), h.host)
+				got, err := darwinOpen(blob, key(t), h.host)
 				if err != nil {
 					t.Fatalf("DecryptValue: %v", err)
 				}
@@ -113,14 +114,14 @@ func TestRoundtrip(t *testing.T) {
 }
 
 func TestEmptyBlobIsRejected(t *testing.T) {
-	if _, err := DecryptValue(nil, key(t), goldenHost); err == nil {
+	if _, err := darwinOpen(nil, key(t), goldenHost); err == nil {
 		t.Fatal("empty encrypted_value must not be accepted")
 	}
 }
 
 func TestV20IsRejected(t *testing.T) {
 	blob := append([]byte("v20"), bytes.Repeat([]byte{0x00}, 32)...)
-	_, err := DecryptValue(blob, key(t), goldenHost)
+	_, err := darwinOpen(blob, key(t), goldenHost)
 	if err == nil {
 		t.Fatal("expected DecryptError, got nil")
 	}
@@ -139,11 +140,11 @@ func TestV20IsRejected(t *testing.T) {
 func TestWrongKeyRaisesNoSilentGarbage(t *testing.T) {
 	// A wrong AES key garbles the whole block: it must raise (bad padding or a
 	// domain-hash mismatch), never return decoded garbage.
-	blob, err := EncryptValue("secret", key(t), goldenHost)
+	blob, err := darwinSeal("secret", key(t), goldenHost)
 	if err != nil {
 		t.Fatalf("EncryptValue: %v", err)
 	}
-	_, err = DecryptValue(blob, otherKey(t), goldenHost)
+	_, err = darwinOpen(blob, otherKey(t), goldenHost)
 	var de *DecryptError
 	if !errors.As(err, &de) {
 		t.Fatalf("expected *DecryptError, got %T: %v", err, err)
@@ -154,11 +155,11 @@ func TestWrongHostKeyRaises(t *testing.T) {
 	// The domain hash commits to the exact host_key, so decrypting under a
 	// different host (with the right AES key) must fail on the hash check, not
 	// silently strip 32 bytes and return the wrong tail.
-	blob, err := EncryptValue("secret", key(t), goldenHost)
+	blob, err := darwinSeal("secret", key(t), goldenHost)
 	if err != nil {
 		t.Fatalf("EncryptValue: %v", err)
 	}
-	_, err = DecryptValue(blob, key(t), HostKey(".other.com"))
+	_, err = darwinOpen(blob, key(t), HostKey(".other.com"))
 	var de *DecryptError
 	if !errors.As(err, &de) {
 		t.Fatalf("expected *DecryptError, got %T: %v", err, err)
@@ -170,7 +171,7 @@ func TestWrongHostKeyRaises(t *testing.T) {
 
 func TestNonBlockAlignedCiphertextRaises(t *testing.T) {
 	blob := append([]byte("v10"), bytes.Repeat([]byte{0x00}, 17)...)
-	_, err := DecryptValue(blob, key(t), goldenHost)
+	_, err := darwinOpen(blob, key(t), goldenHost)
 	var de *DecryptError
 	if !errors.As(err, &de) {
 		t.Fatalf("expected *DecryptError, got %T: %v", err, err)
@@ -230,7 +231,7 @@ func TestPKCS7UnpadRejectsBadPadding(t *testing.T) {
 }
 
 func TestUnprefixedPlaintextBlobIsRejected(t *testing.T) {
-	if _, err := DecryptValue([]byte("legacy-plain-value"), AesKey(bytes.Repeat([]byte{0x00}, 16)), goldenHost); err == nil {
+	if _, err := darwinOpen([]byte("legacy-plain-value"), AesKey(bytes.Repeat([]byte{0x00}, 16)), goldenHost); err == nil {
 		t.Fatal("unprefixed encrypted_value must not be accepted")
 	}
 }
@@ -243,11 +244,11 @@ func TestDomainHashDualAcceptIsAsymmetric(t *testing.T) {
 	// when the caller passes dotted ".example.com" (strip-the-dot candidate hits),
 	// but a blob committed under ".example.com" does NOT decrypt under bare
 	// "example.com" — neither candidate reproduces SHA256(".example.com").
-	bareBlob, err := EncryptValue(goldenValue, key(t), HostKey("example.com"))
+	bareBlob, err := darwinSeal(goldenValue, key(t), HostKey("example.com"))
 	if err != nil {
 		t.Fatalf("EncryptValue bare: %v", err)
 	}
-	got, err := DecryptValue(bareBlob, key(t), HostKey(".example.com"))
+	got, err := darwinOpen(bareBlob, key(t), HostKey(".example.com"))
 	if err != nil {
 		t.Fatalf("DecryptValue dotted host on bare blob: %v", err)
 	}
@@ -255,11 +256,11 @@ func TestDomainHashDualAcceptIsAsymmetric(t *testing.T) {
 		t.Fatalf("bare-blob/dotted-host = %q, want %q", got, goldenValue)
 	}
 
-	dotBlob, err := EncryptValue(goldenValue, key(t), HostKey(".example.com"))
+	dotBlob, err := darwinSeal(goldenValue, key(t), HostKey(".example.com"))
 	if err != nil {
 		t.Fatalf("EncryptValue dotted: %v", err)
 	}
-	_, err = DecryptValue(dotBlob, key(t), HostKey("example.com"))
+	_, err = darwinOpen(dotBlob, key(t), HostKey("example.com"))
 	var de *DecryptError
 	if !errors.As(err, &de) {
 		t.Fatalf("dotted-blob/bare-host: expected *DecryptError, got %T: %v", err, err)
@@ -267,4 +268,16 @@ func TestDomainHashDualAcceptIsAsymmetric(t *testing.T) {
 	if !strings.Contains(err.Error(), "wrong key") {
 		t.Fatalf("dotted-blob/bare-host error %q does not mention wrong key", err)
 	}
+}
+
+func darwinOpen(encrypted []byte, key AesKey, hostKey HostKey) (string, error) {
+	return darwinScheme{}.open(encrypted, key, hostKey, 0)
+}
+
+func darwinSeal(value string, key AesKey, hostKey HostKey) ([]byte, error) {
+	seal, err := darwinScheme{}.sealer(context.Background(), nil, key)
+	if err != nil {
+		return nil, err
+	}
+	return seal(value, hostKey)
 }

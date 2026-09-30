@@ -261,19 +261,6 @@ func (r *recordingRunner) Run(_ context.Context, target, cmd string, _ []byte) (
 	return "", nil
 }
 
-// consentCalls counts the recorded request_consent dials.
-func (r *recordingRunner) consentCalls() int {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	n := 0
-	for _, c := range r.calls {
-		if strings.Contains(c.cmd, "request_consent") {
-			n++
-		}
-	}
-	return n
-}
-
 // approverMesh scripts a mesh of approvers per target: whoami answers from
 // whoami (absent = dead, wedgedWhoami = parked until the probe context dies),
 // request_consent answers from consentErr, then consent (absent = a transport

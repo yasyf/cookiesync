@@ -3,10 +3,8 @@ package auth
 import (
 	"context"
 	"fmt"
-	"os/exec"
 	"os/user"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"time"
 
@@ -71,11 +69,11 @@ func requestorReason(ctx context.Context, requestor, reason string, pid int, has
 	if !hasPID {
 		return reason
 	}
-	out, err := exec.CommandContext(ctx, "ps", "-o", "comm=", "-p", strconv.Itoa(pid)).Output() //nolint:gosec // G204: pid is an int rendered to string, not user-supplied text; no injection surface.
+	out, err := processName(ctx, pid)
 	if err != nil {
 		return reason
 	}
-	name := strings.TrimSpace(string(out))
+	name := strings.TrimSpace(out)
 	if name == "" {
 		return reason
 	}

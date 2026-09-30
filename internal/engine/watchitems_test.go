@@ -41,6 +41,8 @@ CREATE TABLE cookies (
     source_type INTEGER NOT NULL,
     has_cross_site_ancestor INTEGER NOT NULL
 );
+CREATE TABLE meta (key LONGVARCHAR NOT NULL UNIQUE PRIMARY KEY, value LONGVARCHAR);
+INSERT INTO meta VALUES ('version', '24'), ('last_compatible_version', '24');
 `
 
 // addChromeStore creates an empty Chrome v24 cookie store for profile under the browser's
@@ -75,7 +77,9 @@ func TestWatchItemDeclaresCookiesDBFile(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			t.Setenv("HOME", t.TempDir())
+			home := t.TempDir()
+			t.Setenv("HOME", home)
+			t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
 			browser, err := cookie.Lookup("chrome")
 			if err != nil {
 				t.Fatalf("lookup chrome: %v", err)
@@ -136,7 +140,9 @@ func TestWatchItemBusyWhenBrowserMidWrite(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			t.Setenv("HOME", t.TempDir())
+			home := t.TempDir()
+			t.Setenv("HOME", home)
+			t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
 			browser, err := cookie.Lookup("chrome")
 			if err != nil {
 				t.Fatalf("lookup chrome: %v", err)

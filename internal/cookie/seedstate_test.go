@@ -41,7 +41,7 @@ func TestSeedState(t *testing.T) {
 		"map-9-session-beta":                         utf16LEBytes("four"),
 	})
 
-	state, counts, err := SeedState(context.Background(), browser, profile, key)
+	state, counts, err := darwinCodec.seedState(context.Background(), browser, profile, key)
 	if err != nil {
 		t.Fatalf("SeedState: %v", err)
 	}

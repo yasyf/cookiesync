@@ -23,12 +23,12 @@ func TestLogicalDigestApplyStable(t *testing.T) {
 			sampleCookie(".y.com", "tok", "xyz"),
 			sampleCookie(".x.com", "pref", "dark"),
 		}
-		if _, err := Apply(ctx, seed, browser, profile, key); err != nil {
+		if _, err := darwinCodec.apply(ctx, seed, browser, profile, key); err != nil {
 			t.Fatalf("seed apply: %v", err)
 		}
 
 		// The reference digest of S, taken over the raw rows (never decrypting).
-		rowsS, err := Read(ctx, browser, profile)
+		rowsS, err := darwinCodec.read(ctx, browser, profile)
 		if err != nil {
 			t.Fatalf("read S: %v", err)
 		}
@@ -41,19 +41,19 @@ func TestLogicalDigestApplyStable(t *testing.T) {
 		// merges in no new cookies writes back.
 		reapply := make([]Cookie, 0, len(rowsS))
 		for _, row := range rowsS {
-			c, ok := DecryptRow(row, key)
-			if !ok {
-				t.Fatalf("decrypt row %s/%s failed", row.HostKey, row.Name)
+			c, _, err := darwinCodec.decryptRows([]EncryptedRow{row}, key)
+			if err != nil || len(c) != 1 {
+				t.Fatalf("decrypt row %s/%s failed: %v", row.HostKey, row.Name, err)
 			}
-			reapply = append(reapply, c)
+			reapply = append(reapply, c[0])
 		}
-		if _, err := Apply(ctx, reapply, browser, profile, key); err != nil {
+		if _, err := darwinCodec.apply(ctx, reapply, browser, profile, key); err != nil {
 			t.Fatalf("re-apply: %v", err)
 		}
 
 		// The digest after the self-induced write is identical — the write is a no-op to
 		// the anti-echo ledger.
-		rowsAfter, err := Read(ctx, browser, profile)
+		rowsAfter, err := darwinCodec.read(ctx, browser, profile)
 		if err != nil {
 			t.Fatalf("read after re-apply: %v", err)
 		}

@@ -37,8 +37,10 @@ jobs:
           set -euo pipefail
           go mod verify
           go vet ./...
-          go test -race ./...
+          ./scripts/test.sh -race -count=1 ./...
           CGO_ENABLED=0 go build ./...
+          GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build ./...
+          GOOS=linux GOARCH=amd64 go vet ./...
 
       - name: Require every release credential
         env:
@@ -182,13 +184,14 @@ jobs:
             dist/checksums.txt
             dist/cookiesync_darwin_amd64.tar.gz
             dist/cookiesync_darwin_arm64.tar.gz
+            dist/cookiesync_linux_amd64.tar.gz
             "$APP_ZIP"
             "$app_sidecar"
           )
           for asset in "${assets[@]}"; do test -f "$asset"; done
           manifest="$RUNNER_TEMP/cookiesync-release-assets"
           printf '%s\n' "${assets[@]}" > "$manifest"
-          test "$(wc -l < "$manifest" | tr -d ' ')" = 5
+          test "$(wc -l < "$manifest" | tr -d ' ')" = 6
 
           core="${TAG%%+*}"
           prerelease=false
@@ -233,6 +236,7 @@ jobs:
             shasum -a 256 -c checksums.txt
             shasum -a 256 -c "$(basename "$app_sidecar")"
           )
+          bash .github/scripts/verify-release-archives.sh "$downloaded" "${TAG#v}"
 
           cli_smoke="$RUNNER_TEMP/downloaded-cli-smoke"
           rm -rf "$cli_smoke"
@@ -331,7 +335,7 @@ jobs:
           set -euo pipefail
           manifest="$RUNNER_TEMP/cookiesync-preserved-release-assets"
           find "$RELEASE_DIR" -mindepth 1 -maxdepth 1 -type f -print | LC_ALL=C sort > "$manifest"
-          test "$(wc -l < "$manifest" | tr -d ' ')" = 5
+          test "$(wc -l < "$manifest" | tr -d ' ')" = 6
           echo "path=$manifest" >> "$GITHUB_OUTPUT"
 
       - name: Reverify the published release by exact ID

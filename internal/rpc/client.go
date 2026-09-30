@@ -11,22 +11,17 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/yasyf/cookiesync/internal/paths"
 	"github.com/yasyf/daemonkit"
-	"github.com/yasyf/synckit/helperruntime"
 	synckit "github.com/yasyf/synckit/rpc"
 )
 
 // Call opens the resident daemon's business lane, invokes method with params, and
-// returns the decoded result. A daemon-side failure surfaces as a Go error carrying the
-// daemon's message; an unreachable daemon is wrapped with the hint to install it.
-// params may be nil for a no-arg method.
+// returns the decoded result. On Linux the helper is first ensured under the running
+// supervisor, so a call fails with the supervisor hint when none runs. A daemon-side
+// failure surfaces as a Go error carrying the daemon's message; an unreachable daemon is
+// wrapped with the hint to install it. params may be nil for a no-arg method.
 func Call(ctx context.Context, method string, params map[string]any) (any, error) {
-	spec, err := helperruntime.Spec(paths.ToolName, daemonkit.Program{}, 0)
-	if err != nil {
-		return nil, err
-	}
-	resident, err := daemonkit.Open(spec)
+	resident, err := open(ctx)
 	if err != nil {
 		return nil, err
 	}
