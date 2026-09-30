@@ -1,1 +1,1 @@
-{"v":1,"lamport":3,"session":"65672803-9c3c-4b06-bffb-62822d86087a","ops":[{"kind":"set_branch","branch":"yasyf/cookiesync-linux"}]}
+{"v":1,"lamport":4,"session":"65672803-9c3c-4b06-bffb-62822d86087a","ops":[{"kind":"link_commit","sha":"a4c43d94ab8a9d72f34aaa46f91ec8406bababd5"}]}
