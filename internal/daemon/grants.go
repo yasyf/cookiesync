@@ -3,8 +3,6 @@ package daemon
 import (
 	"context"
 	"strconv"
-
-	synckit "github.com/yasyf/synckit/rpc"
 )
 
 // requestorID resolves the LOCAL principal a request acts for. It never reads
@@ -16,7 +14,7 @@ func requestorID(ctx context.Context, params map[string]any) string {
 	if tok := optionalString(params, "requestor", ""); tok != "" {
 		return "req:" + tok
 	}
-	if sid, ok := synckit.PeerSID(ctx); ok {
+	if sid, ok := peerSession(ctx); ok {
 		return "sid:" + strconv.Itoa(sid)
 	}
 	return "local"

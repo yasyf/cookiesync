@@ -77,7 +77,7 @@ const (
 
 func testKey(t *testing.T) AesKey {
 	t.Helper()
-	return DeriveKey(SafeStorageKey("peanuts"))
+	return darwinCodec.deriveKey(SafeStorageKey("peanuts"))
 }
 
 func makeBrowser(t *testing.T, root, profile string) Browser {
@@ -191,7 +191,7 @@ func sampleCookie(host, name, value string) Cookie {
 
 func mustEncrypt(t *testing.T, value string, key AesKey, host HostKey) []byte {
 	t.Helper()
-	blob, err := EncryptValue(value, key, host)
+	blob, err := darwinSeal(value, key, host)
 	if err != nil {
 		t.Fatalf("EncryptValue: %v", err)
 	}
@@ -200,7 +200,7 @@ func mustEncrypt(t *testing.T, value string, key AesKey, host HostKey) []byte {
 
 func mustDecrypt(t *testing.T, blob []byte, key AesKey, host HostKey) string {
 	t.Helper()
-	got, err := DecryptValue(blob, key, host)
+	got, err := darwinOpen(blob, key, host)
 	if err != nil {
 		t.Fatalf("DecryptValue: %v", err)
 	}
@@ -226,7 +226,7 @@ func TestReadReturnsInsertedRow(t *testing.T) {
 		blob := mustEncrypt(t, "hello", key, HostKey(".x.com"))
 		insertNative(t, browser.CookiesDB(profile), ".x.com", "sid", blob)
 
-		rows, err := Read(context.Background(), browser, profile)
+		rows, err := darwinCodec.read(context.Background(), browser, profile)
 		if err != nil {
 			t.Fatalf("Read: %v", err)
 		}
@@ -253,7 +253,7 @@ func TestReadZeroFillsAbsentColumns(t *testing.T) {
 	forEachSchema(t, func(t *testing.T, browser Browser, profile string) {
 		key := testKey(t)
 		insertNative(t, browser.CookiesDB(profile), ".x.com", "sid", mustEncrypt(t, "v", key, HostKey(".x.com")))
-		rows, err := Read(context.Background(), browser, profile)
+		rows, err := darwinCodec.read(context.Background(), browser, profile)
 		if err != nil {
 			t.Fatalf("Read: %v", err)
 		}
@@ -281,7 +281,7 @@ func TestReadZeroFillsAbsentColumns(t *testing.T) {
 
 func TestReadEmptyDB(t *testing.T) {
 	forEachSchema(t, func(t *testing.T, browser Browser, profile string) {
-		rows, err := Read(context.Background(), browser, profile)
+		rows, err := darwinCodec.read(context.Background(), browser, profile)
 		if err != nil {
 			t.Fatalf("Read: %v", err)
 		}
@@ -358,7 +358,7 @@ func TestReadSeesWALSidecarRow(t *testing.T) {
 			t.Fatalf("main DB alone has %d rows, want 0 (row should be WAL-only)", mainCount)
 		}
 
-		rows, err := Read(context.Background(), browser, profile)
+		rows, err := darwinCodec.read(context.Background(), browser, profile)
 		if err != nil {
 			t.Fatalf("Read: %v", err)
 		}
@@ -378,10 +378,10 @@ func TestWriteInsertsThenUpsertsToSingleRow(t *testing.T) {
 	forEachSchema(t, func(t *testing.T, browser Browser, profile string) {
 		key := testKey(t)
 		first := sampleCookie(".example.com", "sid", "v1")
-		if n, err := Write(context.Background(), browser, profile, []Cookie{first}, key); err != nil || n != 1 {
+		if n, err := darwinCodec.write(context.Background(), browser, profile, []Cookie{first}, key); err != nil || n != 1 {
 			t.Fatalf("first Write = (%d, %v), want (1, nil)", n, err)
 		}
-		rows, err := Read(context.Background(), browser, profile)
+		rows, err := darwinCodec.read(context.Background(), browser, profile)
 		if err != nil {
 			t.Fatalf("Read: %v", err)
 		}
@@ -395,10 +395,10 @@ func TestWriteInsertsThenUpsertsToSingleRow(t *testing.T) {
 		second := first
 		second.Value = "v2-newest"
 		second.LastUpdateUTC = sampleUpdate + 1
-		if n, err := Write(context.Background(), browser, profile, []Cookie{second}, key); err != nil || n != 1 {
+		if n, err := darwinCodec.write(context.Background(), browser, profile, []Cookie{second}, key); err != nil || n != 1 {
 			t.Fatalf("second Write = (%d, %v), want (1, nil)", n, err)
 		}
-		rows, err = Read(context.Background(), browser, profile)
+		rows, err = darwinCodec.read(context.Background(), browser, profile)
 		if err != nil {
 			t.Fatalf("Read: %v", err)
 		}
@@ -414,7 +414,7 @@ func TestWriteInsertsThenUpsertsToSingleRow(t *testing.T) {
 func TestWriteLeavesPlaintextValueEmpty(t *testing.T) {
 	forEachSchema(t, func(t *testing.T, browser Browser, profile string) {
 		key := testKey(t)
-		if _, err := Write(context.Background(), browser, profile, []Cookie{sampleCookie(".example.com", "sid", "secret")}, key); err != nil {
+		if _, err := darwinCodec.write(context.Background(), browser, profile, []Cookie{sampleCookie(".example.com", "sid", "secret")}, key); err != nil {
 			t.Fatalf("Write: %v", err)
 		}
 		db, err := sql.Open(driverName, browser.CookiesDB(profile))
@@ -443,7 +443,7 @@ func TestWritePreservesLastUpdateAndCreation(t *testing.T) {
 	forEachSchema(t, func(t *testing.T, browser Browser, profile string) {
 		key := testKey(t)
 		cookie := sampleCookie(".example.com", "sid", "v")
-		if _, err := Write(context.Background(), browser, profile, []Cookie{cookie}, key); err != nil {
+		if _, err := darwinCodec.write(context.Background(), browser, profile, []Cookie{cookie}, key); err != nil {
 			t.Fatalf("Write: %v", err)
 		}
 		db, err := sql.Open(driverName, browser.CookiesDB(profile))
@@ -473,7 +473,7 @@ func TestWritePreservesLastUpdateAndCreation(t *testing.T) {
 func TestUpsertUpdatesExpiryAndFlags(t *testing.T) {
 	forEachSchema(t, func(t *testing.T, browser Browser, profile string) {
 		key := testKey(t)
-		if _, err := Write(context.Background(), browser, profile, []Cookie{sampleCookie(".example.com", "sid", "v1")}, key); err != nil {
+		if _, err := darwinCodec.write(context.Background(), browser, profile, []Cookie{sampleCookie(".example.com", "sid", "v1")}, key); err != nil {
 			t.Fatalf("Write v1: %v", err)
 		}
 		refreshed := sampleCookie(".example.com", "sid", "v2")
@@ -481,7 +481,7 @@ func TestUpsertUpdatesExpiryAndFlags(t *testing.T) {
 		refreshed.LastUpdateUTC = sampleUpdate + 1
 		refreshed.IsHTTPOnly = false
 		refreshed.SameSite = 0
-		if _, err := Write(context.Background(), browser, profile, []Cookie{refreshed}, key); err != nil {
+		if _, err := darwinCodec.write(context.Background(), browser, profile, []Cookie{refreshed}, key); err != nil {
 			t.Fatalf("Write v2: %v", err)
 		}
 		db, err := sql.Open(driverName, browser.CookiesDB(profile))
@@ -513,17 +513,17 @@ func TestWriteRejectsOlderCookie(t *testing.T) {
 		key := testKey(t)
 		newer := sampleCookie(".example.com", "sid", "newer")
 		newer.LastUpdateUTC = sampleUpdate + 2
-		if n, err := Write(context.Background(), browser, profile, []Cookie{newer}, key); err != nil || n != 1 {
+		if n, err := darwinCodec.write(context.Background(), browser, profile, []Cookie{newer}, key); err != nil || n != 1 {
 			t.Fatalf("newer Write = (%d, %v), want (1, nil)", n, err)
 		}
 
 		older := newer
 		older.Value = "older"
 		older.LastUpdateUTC = sampleUpdate + 1
-		if n, err := Write(context.Background(), browser, profile, []Cookie{older}, key); err != nil || n != 0 {
+		if n, err := darwinCodec.write(context.Background(), browser, profile, []Cookie{older}, key); err != nil || n != 0 {
 			t.Fatalf("older Write = (%d, %v), want (0, nil)", n, err)
 		}
-		rows, err := Read(context.Background(), browser, profile)
+		rows, err := darwinCodec.read(context.Background(), browser, profile)
 		if err != nil {
 			t.Fatalf("Read: %v", err)
 		}
@@ -546,7 +546,7 @@ func TestWriteAcceptsNewerCookie(t *testing.T) {
 		}
 		key := testKey(t)
 		original := sampleCookie(".example.com", "sid", "original")
-		if n, err := Write(context.Background(), browser, profile, []Cookie{original}, key); err != nil || n != 1 {
+		if n, err := darwinCodec.write(context.Background(), browser, profile, []Cookie{original}, key); err != nil || n != 1 {
 			t.Fatalf("original Write = (%d, %v), want (1, nil)", n, err)
 		}
 
@@ -557,10 +557,10 @@ func TestWriteAcceptsNewerCookie(t *testing.T) {
 		newer.IsSecure = false
 		newer.IsHTTPOnly = false
 		newer.SameSite = 0
-		if n, err := Write(context.Background(), browser, profile, []Cookie{newer}, key); err != nil || n != 1 {
+		if n, err := darwinCodec.write(context.Background(), browser, profile, []Cookie{newer}, key); err != nil || n != 1 {
 			t.Fatalf("newer Write = (%d, %v), want (1, nil)", n, err)
 		}
-		rows, err := Read(context.Background(), browser, profile)
+		rows, err := darwinCodec.read(context.Background(), browser, profile)
 		if err != nil {
 			t.Fatalf("Read: %v", err)
 		}
@@ -596,17 +596,17 @@ func TestWriteRejectsEqualTimestampCookie(t *testing.T) {
 		}
 		key := testKey(t)
 		original := sampleCookie(".example.com", "sid", "original")
-		if n, err := Write(context.Background(), browser, profile, []Cookie{original}, key); err != nil || n != 1 {
+		if n, err := darwinCodec.write(context.Background(), browser, profile, []Cookie{original}, key); err != nil || n != 1 {
 			t.Fatalf("original Write = (%d, %v), want (1, nil)", n, err)
 		}
 
 		equal := original
 		equal.Value = "equal"
 		equal.ExpiresUTC = sampleExpires + 1
-		if n, err := Write(context.Background(), browser, profile, []Cookie{equal}, key); err != nil || n != 0 {
+		if n, err := darwinCodec.write(context.Background(), browser, profile, []Cookie{equal}, key); err != nil || n != 0 {
 			t.Fatalf("equal Write = (%d, %v), want (0, nil)", n, err)
 		}
-		rows, err := Read(context.Background(), browser, profile)
+		rows, err := darwinCodec.read(context.Background(), browser, profile)
 		if err != nil {
 			t.Fatalf("Read: %v", err)
 		}
@@ -629,15 +629,15 @@ func TestWriteInsertsNewKey(t *testing.T) {
 	forEachSchema(t, func(t *testing.T, browser Browser, profile string) {
 		key := testKey(t)
 		first := sampleCookie(".example.com", "first", "one")
-		if n, err := Write(context.Background(), browser, profile, []Cookie{first}, key); err != nil || n != 1 {
+		if n, err := darwinCodec.write(context.Background(), browser, profile, []Cookie{first}, key); err != nil || n != 1 {
 			t.Fatalf("first Write = (%d, %v), want (1, nil)", n, err)
 		}
 
 		second := sampleCookie(".example.com", "second", "two")
-		if n, err := Write(context.Background(), browser, profile, []Cookie{second}, key); err != nil || n != 1 {
+		if n, err := darwinCodec.write(context.Background(), browser, profile, []Cookie{second}, key); err != nil || n != 1 {
 			t.Fatalf("second Write = (%d, %v), want (1, nil)", n, err)
 		}
-		rows, err := Read(context.Background(), browser, profile)
+		rows, err := darwinCodec.read(context.Background(), browser, profile)
 		if err != nil {
 			t.Fatalf("Read: %v", err)
 		}
@@ -669,16 +669,16 @@ func TestWriteV18UpsertIsUnguarded(t *testing.T) {
 	key := testKey(t)
 	newer := sampleCookie(".example.com", "sid", "newer")
 	newer.LastUpdateUTC = sampleUpdate + 1
-	if n, err := Write(context.Background(), browser, profile, []Cookie{newer}, key); err != nil || n != 1 {
+	if n, err := darwinCodec.write(context.Background(), browser, profile, []Cookie{newer}, key); err != nil || n != 1 {
 		t.Fatalf("newer Write = (%d, %v), want (1, nil)", n, err)
 	}
 	older := newer
 	older.Value = "older"
 	older.LastUpdateUTC = sampleUpdate - 1
-	if n, err := Write(context.Background(), browser, profile, []Cookie{older}, key); err != nil || n != 1 {
+	if n, err := darwinCodec.write(context.Background(), browser, profile, []Cookie{older}, key); err != nil || n != 1 {
 		t.Fatalf("older Write = (%d, %v), want (1, nil)", n, err)
 	}
-	rows, err := Read(context.Background(), browser, profile)
+	rows, err := darwinCodec.read(context.Background(), browser, profile)
 	if err != nil {
 		t.Fatalf("Read: %v", err)
 	}
@@ -697,10 +697,10 @@ func TestFullRoundtripPreservesValueAndFlags(t *testing.T) {
 	forEachSchema(t, func(t *testing.T, browser Browser, profile string) {
 		key := testKey(t)
 		original := sampleCookie(".roundtrip.test", "auth", "café—token—😀")
-		if _, err := Write(context.Background(), browser, profile, []Cookie{original}, key); err != nil {
+		if _, err := darwinCodec.write(context.Background(), browser, profile, []Cookie{original}, key); err != nil {
 			t.Fatalf("Write: %v", err)
 		}
-		rows, err := Read(context.Background(), browser, profile)
+		rows, err := darwinCodec.read(context.Background(), browser, profile)
 		if err != nil {
 			t.Fatalf("Read: %v", err)
 		}
@@ -735,10 +735,10 @@ func TestFullRoundtripPreservesValueAndFlags(t *testing.T) {
 
 		reencrypted := original
 		reencrypted.Value = mustDecrypt(t, row.EncryptedValue, key, row.HostKey)
-		if _, err := Write(context.Background(), browser, profile, []Cookie{reencrypted}, key); err != nil {
+		if _, err := darwinCodec.write(context.Background(), browser, profile, []Cookie{reencrypted}, key); err != nil {
 			t.Fatalf("re-Write: %v", err)
 		}
-		rows2, err := Read(context.Background(), browser, profile)
+		rows2, err := darwinCodec.read(context.Background(), browser, profile)
 		if err != nil {
 			t.Fatalf("re-Read: %v", err)
 		}
@@ -759,10 +759,10 @@ func TestMultipleDistinctCookiesCoexist(t *testing.T) {
 			sampleCookie(".a.com", "y", "2"),
 			sampleCookie(".b.com", "x", "3"),
 		}
-		if n, err := Write(context.Background(), browser, profile, cookies, key); err != nil || n != 3 {
+		if n, err := darwinCodec.write(context.Background(), browser, profile, cookies, key); err != nil || n != 3 {
 			t.Fatalf("Write = (%d, %v), want (3, nil)", n, err)
 		}
-		rows, err := Read(context.Background(), browser, profile)
+		rows, err := darwinCodec.read(context.Background(), browser, profile)
 		if err != nil {
 			t.Fatalf("Read: %v", err)
 		}
@@ -805,7 +805,7 @@ func TestWriteSoftBusyReturnsMinusOne(t *testing.T) {
 			insertV18(t, ltx.Exec, ".lock.com", "held", mustEncrypt(t, "x", key, HostKey(".lock.com")))
 		}
 
-		n, err := Write(context.Background(), browser, profile, []Cookie{sampleCookie(".example.com", "sid", "v")}, key)
+		n, err := darwinCodec.write(context.Background(), browser, profile, []Cookie{sampleCookie(".example.com", "sid", "v")}, key)
 		if err != nil {
 			t.Fatalf("Write returned error on locked DB, want soft -1: %v", err)
 		}
@@ -818,7 +818,7 @@ func TestWriteSoftBusyReturnsMinusOne(t *testing.T) {
 
 		// Soft busy must not clobber: the rejected Write rolled back, so its row is
 		// absent (and the locker's uncommitted row rolled back too) — DB is empty.
-		rows, err := Read(context.Background(), browser, profile)
+		rows, err := darwinCodec.read(context.Background(), browser, profile)
 		if err != nil {
 			t.Fatalf("Read after soft-busy: %v", err)
 		}
@@ -867,7 +867,7 @@ func TestReadSnapshotConsistentUnderHotWriter(t *testing.T) {
 			insertV18(t, wtx.Exec, ".uncommitted.com", "held", held)
 		}
 
-		rows, err := Read(context.Background(), browser, profile)
+		rows, err := darwinCodec.read(context.Background(), browser, profile)
 		_ = wtx.Rollback()
 		if err != nil {
 			assertNoTornCopyNoise(t, err)
@@ -893,7 +893,7 @@ func TestReadTornDBReturnsCleanError(t *testing.T) {
 	if err := os.WriteFile(browser.CookiesDB("Default"), []byte(strings.Repeat("\xde\xad\xbe\xef", 1024)), 0o600); err != nil {
 		t.Fatalf("write garbage db: %v", err)
 	}
-	_, err := Read(context.Background(), browser, "Default")
+	_, err := darwinCodec.read(context.Background(), browser, "Default")
 	if err == nil {
 		t.Fatal("Read of a garbage DB returned nil error, want a clean typed failure")
 	}
@@ -910,7 +910,7 @@ func TestReadHotJournalIsBusy(t *testing.T) {
 		if err := os.WriteFile(journal, []byte("hot-journal"), 0o600); err != nil {
 			t.Fatalf("plant journal: %v", err)
 		}
-		_, err := Read(context.Background(), browser, profile)
+		_, err := darwinCodec.read(context.Background(), browser, profile)
 		if !errors.Is(err, ErrStoreBusy) {
 			t.Fatalf("Read err = %v, want ErrStoreBusy", err)
 		}
@@ -926,7 +926,7 @@ func TestReadHotJournalIsBusy(t *testing.T) {
 func TestReadMissingCookiesTableCleanError(t *testing.T) {
 	browser := makeBrowser(t, t.TempDir(), "Default")
 	initDB(t, browser.CookiesDB("Default"), "CREATE TABLE meta (key TEXT, value TEXT);")
-	_, err := Read(context.Background(), browser, "Default")
+	_, err := darwinCodec.read(context.Background(), browser, "Default")
 	if !errors.Is(err, errNoCookiesTable) {
 		t.Fatalf("Read err = %v, want errNoCookiesTable", err)
 	}
@@ -995,7 +995,7 @@ func TestWriteAllImmediateSoftBusyIsPrompt(t *testing.T) {
 		}
 
 		start := time.Now()
-		n, err := Write(context.Background(), browser, profile, []Cookie{sampleCookie(".example.com", "sid", "v")}, key)
+		n, err := darwinCodec.write(context.Background(), browser, profile, []Cookie{sampleCookie(".example.com", "sid", "v")}, key)
 		elapsed := time.Since(start)
 		if err != nil {
 			t.Fatalf("Write on locked DB errored, want soft -1: %v", err)
@@ -1019,7 +1019,7 @@ func TestReadCleansUpTempDir(t *testing.T) {
 	browser := makeBrowser(t, t.TempDir(), "Default")
 	initDB(t, browser.CookiesDB("Default"), v24SQL)
 	before := tempDirCount(t)
-	if _, err := Read(context.Background(), browser, "Default"); err != nil {
+	if _, err := darwinCodec.read(context.Background(), browser, "Default"); err != nil {
 		t.Fatalf("Read: %v", err)
 	}
 	if after := tempDirCount(t); after != before {

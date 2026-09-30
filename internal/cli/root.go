@@ -72,6 +72,7 @@ func newRoot(version string) *cobra.Command {
 		newDoctorCmd(),
 		newTUICmd(version),
 	)
+	root.AddCommand(platformCmds()...)
 	root.SetOut(os.Stdout)
 	root.SetErr(os.Stderr)
 	return root

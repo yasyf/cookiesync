@@ -82,8 +82,9 @@ func (s CachedKeySource) keyFor(ctx context.Context, browser, profile string) (c
 }
 
 // Extract reads every row of browser/profile off a private store copy and decrypts it
-// with the cached key, dropping v20 app-bound and otherwise-undecryptable rows. A cold
-// cache returns ErrNeedsAuth.
+// with the cached key, dropping v20 app-bound and otherwise-undecryptable rows. A v11 row
+// without a v11 key or an unsupported prefix fails the whole read. A cold cache returns
+// ErrNeedsAuth.
 func (s CachedKeySource) Extract(ctx context.Context, browser, profile string) (Extracted, error) {
 	key, err := s.keyFor(ctx, browser, profile)
 	if err != nil {
@@ -97,11 +98,9 @@ func (s CachedKeySource) Extract(ctx context.Context, browser, profile string) (
 	if err != nil {
 		return Extracted{}, err
 	}
-	cookies := make([]cookie.Cookie, 0, len(rows))
-	for _, row := range rows {
-		if c, ok := cookie.DecryptRow(row, key); ok {
-			cookies = append(cookies, c)
-		}
+	cookies, _, err := cookie.DecryptRows(rows, key)
+	if err != nil {
+		return Extracted{}, err
 	}
 	return Extracted{Cookies: cookies}, nil
 }

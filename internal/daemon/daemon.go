@@ -43,7 +43,6 @@ import (
 	"github.com/yasyf/cookiesync/internal/cache"
 	"github.com/yasyf/cookiesync/internal/cookie"
 	"github.com/yasyf/cookiesync/internal/engine"
-	"github.com/yasyf/cookiesync/internal/helper"
 	"github.com/yasyf/cookiesync/internal/mesh"
 	"github.com/yasyf/cookiesync/internal/paths"
 	"github.com/yasyf/cookiesync/internal/state"
@@ -54,10 +53,6 @@ import (
 	synckit "github.com/yasyf/synckit/rpc"
 	"github.com/yasyf/synckit/syncservice"
 )
-
-// consentReason is the default Touch ID prompt reason for a prime_auth with no
-// caller-supplied reason — the frozen wording the Python daemon uses.
-const consentReason = "sync them across your Macs"
 
 // defaultProfile is the profile a method assumes when the request omits one,
 // matching the Python DEFAULT_PROFILE.
@@ -80,6 +75,15 @@ type Probe = auth.Probe
 
 // SessionSnapshot is a point-in-time read of this host's console GUI session.
 type SessionSnapshot = presence.SessionSnapshot
+
+// platform is the per-GOOS half of the composition root: the four concrete
+// providers build wires behind the daemon's seams.
+type platform struct {
+	sealer  cache.Helper
+	consent cookie.Consent
+	session Probe
+	keybag  Probe
+}
 
 // Daemon holds every collaborator behind an injected seam so the dispatcher
 // runs in unit tests against fakes. In production it is built by buildDaemon with the
@@ -136,7 +140,8 @@ func build(c daemonkit.Ctx) (*Daemon, *cache.KeyCache, error) {
 		return nil, nil, err
 	}
 
-	keyCache, err := cache.Open(ctx, helper.Bridge{})
+	host := hostPlatform()
+	keyCache, err := cache.Open(ctx, host.sealer)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -146,17 +151,15 @@ func build(c daemonkit.Ctx) (*Daemon, *cache.KeyCache, error) {
 	// applied digests through a standalone recorder.
 	eng := engine.New(store, keyCache, runner, engine.NewDigestRecorder())
 
-	d := New(cookie.TouchIDConsent{}, keyCache, eng, presence.Session, runner, store, store)
-	// keybag_locked derives from the console session alone: the ioreg-only
-	// probe keeps netstat off the doctor hot path.
-	d.broker.KeybagProbe = presence.Console
+	d := New(host.consent, keyCache, eng, host.session, runner, store, store)
+	d.broker.KeybagProbe = host.keybag
 
 	return d, keyCache, nil
 }
 
 // New builds a daemon over injected collaborators, for tests and for buildDaemon. The
 // auth broker is constructed here over the same seams; buildDaemon pins its
-// KeybagProbe to the ioreg-only read, and tests pin the broker's exported
+// KeybagProbe to the platform's keybag read, and tests pin the broker's exported
 // fields directly.
 func New(consent cookie.Consent, c Cache, eng *engine.Engine, probe Probe, runner engine.SSHRunner, st StateLoader, reg transfer.RegistryStore) *Daemon {
 	d := &Daemon{

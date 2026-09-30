@@ -8,21 +8,15 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
-	"strings"
-	"unicode/utf8"
 
 	"golang.org/x/crypto/pbkdf2"
 )
 
-// Chrome macOS "Safe Storage" v10 crypto parameters. These are fixed by Chrome and
-// must match byte-for-byte:
-//
-//	key   = PBKDF2-HMAC-SHA1(safe_storage_password, "saltysalt", 1003, dklen=16)
-//	value = AES-128-CBC(key, iv=16x 0x20) over the ciphertext, PKCS7-(un)padded, with
-//	        a 32-byte SHA256(host_key) domain-hash prefix Chrome v24+ prepends.
 const (
-	iterations = 1003
-	keyLength  = 16
+	keyLength          = 16
+	tagLength          = 3
+	domainHashLength   = sha256.Size
+	hashedStoreVersion = 24
 )
 
 var (
@@ -34,6 +28,36 @@ var (
 // Safe Storage key. The pipeline counts these separately from other decrypt
 // failures, so callers branch on it with errors.Is(err, ErrV20).
 var ErrV20 = errors.New("v20 app-bound cookie (not decryptable with the Safe Storage key)")
+
+// ErrV11KeyUnavailable marks a v11 (keyring-encrypted) cookie value met on a host
+// that holds only the basic-store key. It fails the whole read rather than dropping
+// the row, so a keyring-backed profile is never silently reported as smaller than
+// it is.
+var ErrV11KeyUnavailable = errors.New("v11 cookie needs the Secret Service Safe Storage key; this host holds only the basic-store key")
+
+// ErrUnsupportedPrefix marks a cookie value whose encryption tag this host cannot
+// decrypt at all: v12 (portal-bound), v20 (app-bound) on Linux, or an unversioned
+// value. It fails the whole read.
+var ErrUnsupportedPrefix = errors.New("unsupported cookie encryption prefix")
+
+// ErrStoreTagUnknown refuses a write into a store with no encrypted rows: the tag
+// the owning browser encrypts with cannot be determined, so nothing is written
+// rather than guessing a weaker one.
+var ErrStoreTagUnknown = errors.New("cookie store has no encrypted rows to determine its encryption tag from")
+
+// ErrStoreTagUnmatched refuses a write into a store holding rows under a tag this
+// host cannot produce (v12 or unknown), since the write could not match what the
+// browser expects.
+var ErrStoreTagUnmatched = errors.New("cookie store holds encryption tags this host cannot match")
+
+// ErrStoreKeyMismatch refuses a v11 write when the key in hand decrypts none of the
+// store's existing v11 rows: writing under the wrong keyring secret would make the
+// browser discard those cookies on load.
+var ErrStoreKeyMismatch = errors.New("the Safe Storage key in hand decrypts none of the cookie store's v11 rows")
+
+// ErrStoreVersionUnknown refuses I/O against a store whose meta.version cannot be
+// read, since it decides whether values carry the host_key hash prefix.
+var ErrStoreVersionUnknown = errors.New("cookie store meta.version is unreadable")
 
 // DecryptError reports that a cookie value could not be decrypted: a v20 app-bound
 // blob, a malformed ciphertext, or a wrong key. Its message mirrors the Python
@@ -47,9 +71,8 @@ func (e *DecryptError) Error() string { return e.Msg }
 
 func (e *DecryptError) Unwrap() error { return e.Err }
 
-// DeriveKey derives the 16-byte AES key from the raw "Safe Storage" password.
-func DeriveKey(password SafeStorageKey) AesKey {
-	return AesKey(pbkdf2.Key([]byte(password), salt, iterations, keyLength, sha1.New))
+func pbkdf2Key(password []byte, iterations int) AesKey {
+	return AesKey(pbkdf2.Key(password, salt, iterations, keyLength, sha1.New))
 }
 
 func pkcs7Pad(data []byte) []byte {
@@ -76,62 +99,33 @@ func domainHash(hostKey HostKey) []byte {
 	return sum[:]
 }
 
-// DecryptValue decrypts one canonical Chrome v10 encrypted_value blob. It returns a
-// *DecryptError on any failure; a v20 blob unwraps to ErrV20.
-func DecryptValue(encrypted []byte, key AesKey, hostKey HostKey) (string, error) {
-	var ciphertext []byte
-	switch {
-	case bytes.HasPrefix(encrypted, []byte("v20")):
-		return "", &DecryptError{Msg: ErrV20.Error(), Err: ErrV20}
-	case bytes.HasPrefix(encrypted, []byte("v10")):
-		ciphertext = encrypted[3:]
-	default:
-		return "", &DecryptError{Msg: "unrecognized cookie encoding"}
+func splitTag(encrypted []byte) (string, []byte) {
+	if len(encrypted) < tagLength {
+		return string(encrypted), nil
 	}
+	return string(encrypted[:tagLength]), encrypted[tagLength:]
+}
 
+func openCBC(ciphertext []byte, key AesKey) ([]byte, error) {
 	if len(ciphertext) == 0 || len(ciphertext)%aes.BlockSize != 0 {
-		return "", &DecryptError{Msg: "ciphertext is not a positive multiple of the block size"}
+		return nil, &DecryptError{Msg: "ciphertext is not a positive multiple of the block size"}
 	}
-
-	block, err := aes.NewCipher(key)
-	if err != nil {
-		return "", fmt.Errorf("aes cipher: %w", err)
-	}
-	plain := make([]byte, len(ciphertext))
-	cipher.NewCBCDecrypter(block, iv).CryptBlocks(plain, ciphertext)
-
-	plain, err = pkcs7Unpad(plain)
-	if err != nil {
-		return "", err
-	}
-
-	if len(plain) < 32 || !domainHashMatches(plain[:32], hostKey) {
-		return "", &DecryptError{Msg: "domain-hash prefix mismatch (wrong key)"}
-	}
-
-	value := plain[32:]
-	if !utf8.Valid(value) {
-		return "", &DecryptError{Msg: "decrypted value is not valid UTF-8 (likely wrong key)"}
-	}
-	return string(value), nil
-}
-
-// domainHashMatches dual-accepts the SHA256 of the host_key as stored and with its
-// leading dot stripped, matching how Chrome commits either form.
-func domainHashMatches(prefix []byte, hostKey HostKey) bool {
-	return bytes.Equal(prefix, domainHash(hostKey)) ||
-		bytes.Equal(prefix, domainHash(HostKey(strings.TrimLeft(string(hostKey), "."))))
-}
-
-// EncryptValue encrypts one cookie value into Chrome's v10 blob, committing to the
-// exact host_key (leading dot included) via the 32-byte domain-hash prefix.
-func EncryptValue(plaintext string, key AesKey, hostKey HostKey) ([]byte, error) {
 	block, err := aes.NewCipher(key)
 	if err != nil {
 		return nil, fmt.Errorf("aes cipher: %w", err)
 	}
-	padded := pkcs7Pad(append(domainHash(hostKey), plaintext...))
+	plain := make([]byte, len(ciphertext))
+	cipher.NewCBCDecrypter(block, iv).CryptBlocks(plain, ciphertext)
+	return pkcs7Unpad(plain)
+}
+
+func sealCBC(tag string, plain []byte, key AesKey) ([]byte, error) {
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, fmt.Errorf("aes cipher: %w", err)
+	}
+	padded := pkcs7Pad(plain)
 	out := make([]byte, len(padded))
 	cipher.NewCBCEncrypter(block, iv).CryptBlocks(out, padded)
-	return append([]byte("v10"), out...), nil
+	return append([]byte(tag), out...), nil
 }

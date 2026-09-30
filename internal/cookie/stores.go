@@ -235,6 +235,10 @@ func snapshotDB(ctx context.Context, src, dst string) error {
 // copy, and the snapshot is opened immutable. Only columns present in this store's
 // schema are selected; absent columns fall back to their defaults.
 func Read(ctx context.Context, browser Browser, profile string) ([]EncryptedRow, error) {
+	return hostCodec.read(ctx, browser, profile)
+}
+
+func (c codec) read(ctx context.Context, browser Browser, profile string) ([]EncryptedRow, error) {
 	tmpDir, err := os.MkdirTemp("", "cookiesync-")
 	if err != nil {
 		return nil, err
@@ -253,6 +257,10 @@ func Read(ctx context.Context, browser Browser, profile string) ([]EncryptedRow,
 	defer func() { _ = db.Close() }()
 
 	columns, err := tableColumns(ctx, db)
+	if err != nil {
+		return nil, err
+	}
+	version, err := c.storeVersion(ctx, db)
 	if err != nil {
 		return nil, err
 	}
@@ -279,7 +287,9 @@ func Read(ctx context.Context, browser Browser, profile string) ([]EncryptedRow,
 		if err := rows.Scan(ptrs...); err != nil {
 			return nil, err
 		}
-		out = append(out, rowFromColumns(readColumns, values))
+		row := rowFromColumns(readColumns, values)
+		row.metaVersion = version
+		out = append(out, row)
 	}
 	return out, rows.Err()
 }
@@ -358,12 +368,18 @@ func upsertSQL(columns, conflict []string) (string, error) {
 
 // Write encrypts and upserts cookies into profile's live Cookies DB and returns
 // the number of rows actually inserted or updated. Each value is re-encrypted
-// into a v10 blob, leaving the plaintext value column empty. On stores with a
+// under the tag and key the store's own browser uses (v10 on macOS; on Linux the
+// tag its existing rows carry, refused with a typed error when that cannot be
+// matched), leaving the plaintext value column empty. On stores with a
 // last_update_utc column, a conflict updates the on-disk row only when the
 // incoming timestamp is strictly newer; an equal or older timestamp is a no-op.
 // Cookie timestamps are preserved, never stamped to "now". On a locked database
 // this returns -1 (soft busy) rather than forcing a write.
 func Write(ctx context.Context, browser Browser, profile string, cookies []Cookie, key AesKey) (int, error) {
+	return hostCodec.write(ctx, browser, profile, cookies, key)
+}
+
+func (c codec) write(ctx context.Context, browser Browser, profile string, cookies []Cookie, key AesKey) (int, error) {
 	dsn := fmt.Sprintf("file:%s?_txlock=immediate&_pragma=busy_timeout(%d)", browser.CookiesDB(profile), busyTimeoutMS)
 	db, err := sql.Open(driverName, dsn)
 	if err != nil {
@@ -384,7 +400,7 @@ func Write(ctx context.Context, browser Browser, profile string, cookies []Cooki
 		return 0, err
 	}
 
-	count, err := writeAll(ctx, db, query, columns, cookies, key)
+	count, err := c.writeAll(ctx, db, query, columns, cookies, key)
 	if err != nil {
 		if isBusy(err) {
 			slog.WarnContext(ctx, "cookie store busy; skipping write", "browser", browser.Name, "profile", profile)
@@ -395,16 +411,24 @@ func Write(ctx context.Context, browser Browser, profile string, cookies []Cooki
 	return count, nil
 }
 
-func writeAll(ctx context.Context, db *sql.DB, query string, columns []string, cookies []Cookie, key AesKey) (int, error) {
+func (c codec) writeAll(ctx context.Context, db *sql.DB, query string, columns []string, cookies []Cookie, key AesKey) (int, error) {
 	// BEGIN IMMEDIATE (via _txlock=immediate in the DSN): fail-fast on a locked DB
 	// rather than a DEFERRED tx that upgrades to a write lock mid-loop.
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return 0, err
 	}
+	if len(cookies) == 0 {
+		return 0, tx.Commit()
+	}
+	seal, err := c.sealer(ctx, tx, key)
+	if err != nil {
+		_ = tx.Rollback()
+		return 0, err
+	}
 	count := 0
 	for _, cookie := range cookies {
-		encrypted, err := EncryptValue(cookie.Value, key, cookie.HostKey)
+		encrypted, err := seal(cookie.Value, cookie.HostKey)
 		if err != nil {
 			_ = tx.Rollback()
 			return 0, err

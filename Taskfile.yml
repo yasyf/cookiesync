@@ -8,6 +8,15 @@ tasks:
     cmds:
       - go build ./...
 
+  build-linux:
+    desc: Compile every package for the static linux/amd64 release target
+    env:
+      GOOS: linux
+      GOARCH: amd64
+      CGO_ENABLED: "0"
+    cmds:
+      - go build ./...
+
   run:
     desc: Run the CLI (pass args after --)
     cmds:
@@ -20,6 +29,14 @@ tasks:
 
   vet:
     desc: Vet the module
+    cmds:
+      - go vet ./...
+
+  vet-linux:
+    desc: Vet the module for linux/amd64
+    env:
+      GOOS: linux
+      GOARCH: amd64
     cmds:
       - go vet ./...
 
@@ -37,6 +54,8 @@ tasks:
     desc: Everything CI runs
     cmds:
       - task: vet
+      - task: vet-linux
       - task: lint
       - task: test
       - task: build
+      - task: build-linux

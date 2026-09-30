@@ -341,8 +341,12 @@ func TestRemoteProfileStepSurfacesSSHError(t *testing.T) {
 func TestSelfProfileStepUsesLocalScan(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
-	dataRoot := filepath.Join(home, "Library", "Application Support", "Google", "Chrome")
-	seedLocalChrome(t, dataRoot)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+	chrome, err := cookie.Lookup("chrome")
+	if err != nil {
+		t.Fatalf("lookup chrome: %v", err)
+	}
+	seedLocalChrome(t, chrome.DataRoot)
 
 	runner := &fakeRunner{} // SSH must not be called on the self path.
 	m := browserPickModel(t, runner, "me@laptop", "me@laptop")

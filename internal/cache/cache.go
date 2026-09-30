@@ -130,7 +130,7 @@ func open(ctx context.Context, h Helper, now func() time.Time) (*KeyCache, error
 		c.keyLive = true
 		c.state.Store(&epoch{kind: stateEnclave})
 	case helper.CodePresenceUnavailable:
-		slog.WarnContext(ctx, "Secure Enclave presence unavailable — screen locked or no user present; caching keys in process memory until the keybag unlocks",
+		slog.WarnContext(ctx, memoryOpenNotice,
 			"stderr", string(bytes.TrimSpace(result.Stderr)))
 		c.state.Store(&epoch{kind: stateMemory})
 	default:

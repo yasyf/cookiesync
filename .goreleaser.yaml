@@ -13,13 +13,22 @@ builds:
       # modernc.org/sqlite is pure Go, so the darwin binaries cross-compile with no
       # C toolchain — CGO stays off and arm64 builds from the amd64 runner cleanly.
       - CGO_ENABLED=0
-    # macOS only: cookiesync drives Safe Storage, Touch ID, the Secure Enclave,
-    # launchd, and ioreg, none of which exist off darwin.
     goos:
       - darwin
     goarch:
       - amd64
       - arm64
+    ldflags:
+      - -s -w -X main.version={{ .Version }}
+  # A build of its own so notarize.macos, scoped to the cookiesync id, never
+  # picks up the static Linux binary.
+  - id: cookiesync-linux
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+    goarch:
+      - amd64
     ldflags:
       - -s -w -X main.version={{ .Version }}
 

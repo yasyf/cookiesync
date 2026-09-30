@@ -114,3 +114,41 @@ func TestShortRef(t *testing.T) {
 		})
 	}
 }
+
+// TestRequestorCommandOutputForms pins the exact stdout bytes of `cookiesync requestor`
+// for each identity source, since agent-browser-with-cookies hashes the raw line into
+// its session name: the explicit token verbatim, the Claude Code form with a U+00B7
+// separator, and the parent-pid fallback.
+func TestRequestorCommandOutputForms(t *testing.T) {
+	tests := []struct {
+		name      string
+		requestor string
+		claudeSID string
+		want      string
+	}{
+		{
+			name:      "explicit token verbatim",
+			requestor: "vm-ci · lane 7",
+			claudeSID: "a3283ae1-b524-48c3-ab30-42eb6e1ab6e6",
+			want:      "vm-ci · lane 7\n",
+		},
+		{
+			name:      "claude code session",
+			claudeSID: "a3283ae1-b524-48c3-ab30-42eb6e1ab6e6",
+			want:      "Claude Code · a3283ae1\n",
+		},
+		{
+			name: "parent pid fallback",
+			want: fmt.Sprintf("pid-%d\n", os.Getppid()),
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv(requestorEnv, tc.requestor)
+			t.Setenv("CLAUDE_CODE_SESSION_ID", tc.claudeSID)
+			if got := runRootCmd(t, "requestor"); got != tc.want {
+				t.Fatalf("cookiesync requestor printed %q, want %q", got, tc.want)
+			}
+		})
+	}
+}

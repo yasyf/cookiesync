@@ -110,7 +110,7 @@ func TestExtractMatchesPythonPipeline(t *testing.T) {
 	browser := makeBrowser(t, t.TempDir(), "Default")
 	dbPath := browser.CookiesDB("Default")
 	initDB(t, dbPath, v24SQL)
-	key := DeriveKey(SafeStorageKey("peanuts"))
+	key := darwinCodec.deriveKey(SafeStorageKey("peanuts"))
 
 	// Use real wall-clock now: Go's Extract reads time.Now() internally, so the oracle
 	// must be handed the same now. The ±1-day margins keep the tiny delta between this
@@ -125,7 +125,7 @@ func TestExtractMatchesPythonPipeline(t *testing.T) {
 	insertRaw(t, dbPath, ".x.com", "bound", "/", append([]byte("v20"), 0x01, 0x02, 0x03), live)   // v20 -> dropped
 	insertRaw(t, dbPath, ".other.com", "n", "/", mustEncrypt(t, "nope", key, ".other.com"), live) // wrong host -> excluded
 
-	state, err := Extract(context.Background(), "https://x.com/", browser, key, "Default", false, false)
+	state, err := darwinCodec.extract(context.Background(), "https://x.com/", browser, key, "Default", false, false)
 	if err != nil {
 		t.Fatalf("Extract: %v", err)
 	}
@@ -185,11 +185,11 @@ func TestSyncable(t *testing.T) {
 // while the second extract remains byte-for-byte equal to the first on every schema.
 func TestExtractApplyRoundTrip(t *testing.T) {
 	forEachSchema(t, func(t *testing.T, browser Browser, profile string) {
-		key := DeriveKey(SafeStorageKey("peanuts"))
+		key := darwinCodec.deriveKey(SafeStorageKey("peanuts"))
 		dbPath := browser.CookiesDB(profile)
 		insertNative(t, dbPath, ".x.com", "sid", mustEncrypt(t, "v1", key, ".x.com"))
 
-		first, err := Extract(context.Background(), "https://x.com/", browser, key, profile, true, false)
+		first, err := darwinCodec.extract(context.Background(), "https://x.com/", browser, key, profile, true, false)
 		if err != nil {
 			t.Fatalf("Extract: %v", err)
 		}
@@ -197,7 +197,7 @@ func TestExtractApplyRoundTrip(t *testing.T) {
 			t.Fatalf("first extract = %+v, want one cookie value v1", first.Cookies)
 		}
 
-		n, err := Apply(context.Background(), first.Cookies, browser, profile, key)
+		n, err := darwinCodec.apply(context.Background(), first.Cookies, browser, profile, key)
 		if err != nil {
 			t.Fatalf("Apply: %v", err)
 		}
@@ -209,7 +209,7 @@ func TestExtractApplyRoundTrip(t *testing.T) {
 			t.Fatalf("Apply wrote %d rows, want %d", n, wantApplied)
 		}
 
-		second, err := Extract(context.Background(), "https://x.com/", browser, key, profile, true, false)
+		second, err := darwinCodec.extract(context.Background(), "https://x.com/", browser, key, profile, true, false)
 		if err != nil {
 			t.Fatalf("re-Extract: %v", err)
 		}
@@ -227,11 +227,11 @@ func TestExtractFallbackTriggersWhenEmpty(t *testing.T) {
 	browser := makeBrowser(t, t.TempDir(), "Default")
 	dbPath := browser.CookiesDB("Default")
 	initDB(t, dbPath, v24SQL)
-	key := DeriveKey(SafeStorageKey("peanuts"))
+	key := darwinCodec.deriveKey(SafeStorageKey("peanuts"))
 	insertNative(t, dbPath, ".x.com", "sid", mustEncrypt(t, "abc", key, ".x.com"))
 
 	// fallback=false on an empty host yields an empty set, never touching get-cookie.
-	state, err := Extract(context.Background(), "https://nomatch.example/", browser, key, "Default", false, false)
+	state, err := darwinCodec.extract(context.Background(), "https://nomatch.example/", browser, key, "Default", false, false)
 	if err != nil {
 		t.Fatalf("Extract (no fallback): %v", err)
 	}

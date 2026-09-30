@@ -10,6 +10,7 @@ require (
 	github.com/charmbracelet/lipgloss v1.1.0
 	github.com/charmbracelet/x/exp/teatest v0.0.0-20260615092313-b57e5e6d29bb
 	github.com/coder/websocket v1.8.15
+	github.com/godbus/dbus/v5 v5.2.2
 	github.com/spf13/cobra v1.10.2
 	github.com/syndtr/goleveldb v1.0.0
 	github.com/yasyf/daemonkit v0.32.1

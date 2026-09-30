@@ -3,6 +3,7 @@ package cookie
 import (
 	"context"
 	"errors"
+	"fmt"
 	"time"
 )
 
@@ -45,32 +46,43 @@ func cookieFromRow(row EncryptedRow, value string) Cookie {
 	}
 }
 
-// DecryptRow decrypts one row into a Cookie, reporting ok=false when the row could
-// not be decrypted (a v20 app-bound row or any other DecryptError). It is the
-// count-free decrypt the sync Source uses; Extract uses decryptRow to also tally the
-// failures.
-func DecryptRow(row EncryptedRow, key AesKey) (Cookie, bool) {
-	value, err := DecryptValue(row.EncryptedValue, key, row.HostKey)
-	if err != nil {
-		return Cookie{}, false
-	}
-	return cookieFromRow(row, value), true
+// DecryptRows decrypts rows read from one store with key. A row that fails on its
+// own (v20 app-bound, wrong key, corrupt) is skipped and tallied; a condition that
+// makes the store unreadable on this host — a v11 row with no keyring key
+// (ErrV11KeyUnavailable) or an unsupported tag (ErrUnsupportedPrefix) — fails the
+// whole call rather than dropping rows.
+func DecryptRows(rows []EncryptedRow, key AesKey) ([]Cookie, DecryptCounts, error) {
+	return hostCodec.decryptRows(rows, key)
 }
 
-// decryptRow decrypts one row, tallying a v20 or other failure into counts and
-// returning ok=false on failure. It mirrors the Python _decrypt_row: a DecryptError
-// wrapping ErrV20 increments V20, any other DecryptError increments Failed.
-func decryptRow(row EncryptedRow, key AesKey, counts *DecryptCounts) (Cookie, bool) {
-	value, err := DecryptValue(row.EncryptedValue, key, row.HostKey)
-	if err != nil {
-		if errors.Is(err, ErrV20) {
-			counts.V20++
-		} else {
-			counts.Failed++
+func (c codec) decryptRows(rows []EncryptedRow, key AesKey) ([]Cookie, DecryptCounts, error) {
+	var counts DecryptCounts
+	cookies := make([]Cookie, 0, len(rows))
+	for _, row := range rows {
+		cookie, ok, err := c.decryptRow(row, key, &counts)
+		if err != nil {
+			return nil, DecryptCounts{}, err
 		}
-		return Cookie{}, false
+		if ok {
+			cookies = append(cookies, cookie)
+		}
 	}
-	return cookieFromRow(row, value), true
+	return cookies, counts, nil
+}
+
+func (c codec) decryptRow(row EncryptedRow, key AesKey, counts *DecryptCounts) (Cookie, bool, error) {
+	value, err := c.open(row.EncryptedValue, key, row.HostKey, row.metaVersion)
+	switch {
+	case err == nil:
+		return cookieFromRow(row, value), true, nil
+	case errors.Is(err, ErrV11KeyUnavailable), errors.Is(err, ErrUnsupportedPrefix):
+		return Cookie{}, false, fmt.Errorf("decrypt cookie store: %w", err)
+	case errors.Is(err, ErrV20):
+		counts.V20++
+	default:
+		counts.Failed++
+	}
+	return Cookie{}, false, nil
 }
 
 // isLive reports whether a cookie should be kept: includeExpired keeps everything; a
@@ -119,8 +131,20 @@ func Extract(
 	includeExpired bool,
 	fallback bool,
 ) (StorageState, error) {
+	return hostCodec.extract(ctx, url, browser, key, profile, includeExpired, fallback)
+}
+
+func (c codec) extract(
+	ctx context.Context,
+	url string,
+	browser Browser,
+	key AesKey,
+	profile string,
+	includeExpired bool,
+	fallback bool,
+) (StorageState, error) {
 	host := NormalizeHost(url)
-	rows, err := Read(ctx, browser, profile)
+	rows, err := c.read(ctx, browser, profile)
 	if err != nil {
 		return StorageState{}, err
 	}
@@ -131,7 +155,10 @@ func Extract(
 		if !Applies(row.HostKey, host) {
 			continue
 		}
-		cookie, ok := decryptRow(row, key, &counts)
+		cookie, ok, err := c.decryptRow(row, key, &counts)
+		if err != nil {
+			return StorageState{}, err
+		}
 		if !ok {
 			continue
 		}
@@ -152,5 +179,9 @@ func Extract(
 // Apply re-encrypts cookies into profile's live store with key, returning the number
 // of rows written (-1 on a soft-busy locked store, per Write).
 func Apply(ctx context.Context, cookies []Cookie, browser Browser, profile string, key AesKey) (int, error) {
-	return Write(ctx, browser, profile, cookies, key)
+	return hostCodec.apply(ctx, cookies, browser, profile, key)
+}
+
+func (c codec) apply(ctx context.Context, cookies []Cookie, browser Browser, profile string, key AesKey) (int, error) {
+	return c.write(ctx, browser, profile, cookies, key)
 }

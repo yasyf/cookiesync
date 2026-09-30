@@ -26,13 +26,15 @@ type Profile struct {
 }
 
 // Browser is a Chromium-family browser and its on-disk layout: where one
-// profile keeps its cookie store and Local State, and the Keychain service
-// holding its Safe Storage password.
+// profile keeps its cookie store and Local State, and where its Safe Storage
+// password lives — the Keychain service on macOS, the Secret Service item's
+// "application" attribute on Linux.
 type Browser struct {
-	Name            BrowserName
-	Display         string
-	DataRoot        string
-	KeychainService string
+	Name                     BrowserName
+	Display                  string
+	DataRoot                 string
+	KeychainService          string
+	SecretServiceApplication string
 }
 
 // ProfileDir is the directory holding one profile's state under this browser's
@@ -131,30 +133,6 @@ func (b Browser) infoCache() (map[string]profileInfo, error) {
 		return nil, fmt.Errorf("parse %s local state: %w", b.Name, err)
 	}
 	return state.Profile.InfoCache, nil
-}
-
-// Registry maps every supported browser to its on-disk layout, resolved against
-// the current user's home directory ("~/Library/Application Support/...").
-func Registry() (map[BrowserName]Browser, error) {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return nil, fmt.Errorf("resolve home directory: %w", err)
-	}
-	appSupport := filepath.Join(home, "Library", "Application Support")
-	return map[BrowserName]Browser{
-		BrowserName("chrome"): {
-			Name:            BrowserName("chrome"),
-			Display:         "Chrome",
-			DataRoot:        filepath.Join(appSupport, "Google", "Chrome"),
-			KeychainService: "Chrome Safe Storage",
-		},
-		BrowserName("arc"): {
-			Name:            BrowserName("arc"),
-			Display:         "Arc",
-			DataRoot:        filepath.Join(appSupport, "Arc", "User Data"),
-			KeychainService: "Arc Safe Storage",
-		},
-	}, nil
 }
 
 // Lookup resolves one browser by name from the Registry.
