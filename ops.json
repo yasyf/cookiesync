@@ -1,1 +1,1 @@
-{"v":1,"lamport":5,"session":"65672803-9c3c-4b06-bffb-62822d86087a","ops":[{"kind":"link_commit","sha":"a92416aa53d8032e0961495e8a13f13351ac788e"}]}
+{"v":1,"lamport":6,"session":"65672803-9c3c-4b06-bffb-62822d86087a","ops":[{"kind":"set_criterion_status","id":"8177d7bcd2a69419b77478958d7ec39a","status":"met","note":"PR #3 https://github.com/yasyf/cookiesync/pull/3 open, ready (not draft), head 509a2b2088af1d0d554a1a5ca5dd275ccf82f101, body applied from pr-body-final.md; not merged, not tagged."}]}
