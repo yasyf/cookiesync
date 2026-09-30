@@ -28,7 +28,14 @@ func TestNewImportRecordNeverWidens(t *testing.T) {
 			[]string{"app.example.test"},
 			cookie.StorageState{Cookies: []cookie.Cookie{hostOnly}},
 			nil,
-			`import refused: cookie "csrf" for api.third.test is sent to none of the named hosts`,
+			`import refused: cookies[0] is sent to none of the named hosts`,
+		},
+		{
+			"the refusal never echoes the cookie name or host",
+			[]string{"app.example.test"},
+			cookie.StorageState{Cookies: []cookie.Cookie{{HostKey: "SECRET-HOST.test", Name: "SECRET-NAME", Value: "SECRET-VALUE", Path: "/"}}},
+			nil,
+			`import refused: cookies[0] is sent to none of the named hosts`,
 		},
 		{
 			"a domain cookie sent to a named subdomain is in scope",
@@ -49,7 +56,7 @@ func TestNewImportRecordNeverWidens(t *testing.T) {
 			[]string{"example.test"},
 			cookie.StorageState{Cookies: []cookie.Cookie{domain, hostOnly}},
 			nil,
-			`import refused: cookie "csrf" for api.third.test is sent to none of the named hosts`,
+			`import refused: cookies[1] is sent to none of the named hosts`,
 		},
 		{
 			"an origin with a port is scoped by its host",

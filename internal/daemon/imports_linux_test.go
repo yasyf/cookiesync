@@ -172,7 +172,7 @@ func TestImportRPCRefusesAndKeepsThePreviousRecord(t *testing.T) {
 		{
 			"a cookie sent past the named hosts",
 			func(p map[string]any) { p["hosts"] = []any{"app.example.test"} },
-			`import refused: cookie "csrf" for api.third.test is sent to none of the named hosts`,
+			`import refused: cookies[0] is sent to none of the named hosts`,
 		},
 		{"a ttl above the cap", func(p map[string]any) { p["ttl"] = "25h" }, "import ttl 25h is outside 1s..24h"},
 		{"a zero ttl", func(p map[string]any) { p["ttl"] = "0s" }, "import ttl 0s is outside 1s..24h"},

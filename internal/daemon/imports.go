@@ -128,9 +128,9 @@ func newImportRecord(hosts []string, parsed cookie.StorageState, expiresAt time.
 		}
 		named[host] = true
 	}
-	for _, c := range parsed.Cookies {
+	for i, c := range parsed.Cookies {
 		if !sentToNamedHost(c.HostKey, named) {
-			return importRecord{}, fmt.Errorf("import refused: cookie %q for %s is sent to none of the named hosts", c.Name, c.HostKey)
+			return importRecord{}, fmt.Errorf("import refused: cookies[%d] is sent to none of the named hosts", i)
 		}
 	}
 	for i, o := range parsed.Origins {
