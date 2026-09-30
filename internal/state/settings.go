@@ -2,6 +2,7 @@ package state
 
 import (
 	"fmt"
+	"math"
 	"strconv"
 	"time"
 )
@@ -54,6 +55,9 @@ func ParseDuration(text string) (time.Duration, error) {
 			count, err := strconv.Atoi(text[:len(text)-1])
 			if err != nil {
 				return 0, fmt.Errorf("invalid duration %q: %w", text, err)
+			}
+			if int64(count) > math.MaxInt64/int64(u.size) || int64(count) < math.MinInt64/int64(u.size) {
+				return 0, fmt.Errorf("invalid duration %q: overflows time.Duration", text)
 			}
 			return time.Duration(count) * u.size, nil
 		}

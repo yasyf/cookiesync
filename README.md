@@ -105,7 +105,27 @@ cookiesync doctor
 
 `requestor`, `auth --reason`, `bridge open --json`, and `bridge stop` keep their command contracts. `cookies` supports `playwright`, `webstorage`, `header`, `netscape`, and `json` output. Chrome profiles live under `$XDG_CONFIG_HOME/google-chrome`, defaulting to `~/.config/google-chrome`; Chromium is not registered yet, because the Mac that approves consent must resolve the same browser name. Chromium v10 cookies use a fixed key; v11 uses the Secret Service secret. The bridge runs headless when both `DISPLAY` and `WAYLAND_DISPLAY` are unset.
 
-Linux never approves consent. Local key release routes to an already configured, attended Mac peer or fails closed. Cached keys and grants stay in process memory and expire within five minutes. There is no automatic pairing. A standalone host with no peers fails closed on `auth` and `cookies`.
+Linux never approves consent. Local key release routes to an already configured, attended Mac peer or fails closed. Cached keys and grants stay in process memory and expire within five minutes. There is no automatic pairing. If your host has no peers, `auth` fails closed regardless of imports; `cookies` and `bridge open` also fail closed unless a live import names every requested host.
+
+Bring a Mac's cookies for a few hosts onto your VM without giving the VM a key.
+
+```bash
+cookiesync cookies --browser chrome --profile Default --format playwright -- app.example.com api.example.com | ssh vm cookiesync import --ttl 1h --format playwright --browser chrome --profile Default -- app.example.com api.example.com
+```
+
+The helper holds your import only in memory, bound to the browser, profile, named hosts, and `--ttl`. The minimum `--ttl` is `1s` and the maximum is `24h`. Reads refuse your import at expiry. The helper's reaper runs every 30 s and purges expired imports. A helper restart or upgrade drops it. A new import for the same browser and profile replaces it. The helper refuses your import unless the hosts you name and the origins in your document are plain ASCII hosts or origins without a user name, path, query, or fragment.
+
+`cookies`, with or without `--browser`, and `bridge open` serve your import while every requested host is a named host. One host your import does not name sends the whole request through the normal path, which fails closed on a standalone VM. A native profile, when present, serves every host in that request, including hosts your import names, under the normal consent rules.
+
+The helper refuses your whole import if a cookie or origin reaches past the named hosts. You can send up to `16 MiB` encoded in one request.
+
+`playwright` carries cookies and `localStorage`, while `webstorage` carries `localStorage` and `sessionStorage` with no cookies. You get `sessionStorage` only from a `webstorage` import.
+
+Your imported browser and profile are opaque labels that select the import record in the helper's memory and are never used as a file system path. You need no local profile for any imported browser and profile. On a host with no Chrome profile or native cookie store, you can run `import`, `cookies` with or without `--browser`, and `bridge open`. The import path never reads a native browser profile, cookiesync's browser state, the key cache, or a key ring. When you run `bridge open` from an import, the import path asks the broker only for the bridge lease length, never for a key or consent, and creates no profile. Every `bridge open` still reads the synckit host registry, the mesh state file, to resolve your target host.
+
+A `bridge open` seeded from your import gets a lease no longer than the import's remaining TTL. The bridge closes when that lease expires.
+
+TTL expiry does not revoke cookies already returned by `cookies`, stored by your agent, or seeded into a bridge's Chrome. Each receiving process keeps its copy until it exits. TTL limits how long the helper serves your record, not the life of copies it hands out.
 
 ## Commands
 
@@ -118,6 +138,7 @@ Linux never approves consent. Local key release routes to an already configured,
 | `browser profiles <browser>` | List this host's profiles for a browser that hold a cookie store. |
 | `auth` | Release the Safe Storage key behind one Touch ID tap and cache it for a short window; omit `--browser` to prime every registered browser at once. |
 | `cookies <url>...` | Stream cookies for one or more URLs as `playwright`, `netscape`, `header`, `json`, or `webstorage`; omit `--browser` to union every registered browser and host. |
+| `import --ttl <d> --format <f> --browser <b> --profile <p> -- <host>...` | Linux only. Hold a Mac-exported cookies or web-storage document in memory for the named hosts until the TTL lapses. |
 | `route-consent <target>` | Route the consent gate to a host that already has a live, unlocked session. |
 | `self` | Print this host's SSH target, as the synckit host mesh reports it. |
 | `rpc <method>` | Low-level RPC client for the resident daemon (extract, apply, sync, reconcile). |

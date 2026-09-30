@@ -140,7 +140,7 @@ jobs:
       - name: Let Chrome create its user-namespace sandbox on the hosted runner
         run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
       - name: Smoke-test the static binary
-        run: ./scripts/linux-smoke.sh
+        run: COOKIESYNC_SMOKE_CHROME="$(command -v google-chrome)" ./scripts/linux-smoke.sh
       - name: Test the real Chrome and Secret Service boundaries
         env:
           TEST_NPROC_HEADROOM: "4000"

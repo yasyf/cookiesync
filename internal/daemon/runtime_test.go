@@ -138,7 +138,7 @@ func TestHelperRuntimeActivatesAfterOwnershipAndClosesGeneration(t *testing.T) {
 	var builds atomic.Int32
 	var closes atomic.Int32
 	activated := make(chan struct{})
-	d := &Daemon{bridges: map[string]session{}, bridgeStop: make(chan struct{})}
+	d := &Daemon{bridges: map[string]session{}, bridgeStop: make(chan struct{}), imports: newImportStore(), now: time.Now}
 	builder := func(daemonkit.Ctx) (*Daemon, func(context.Context) error, error) {
 		builds.Add(1)
 		close(activated)
@@ -192,7 +192,7 @@ func TestHelperRuntimeDrainsKeepaliveBeforeAdmissionSettlement(t *testing.T) {
 		t.Fatal(err)
 	}
 	prepareHelperRuntime(t, executable)
-	d := &Daemon{bridges: map[string]session{}, bridgeStop: make(chan struct{})}
+	d := &Daemon{bridges: map[string]session{}, bridgeStop: make(chan struct{}), imports: newImportStore(), now: time.Now}
 	builder := func(daemonkit.Ctx) (*Daemon, func(context.Context) error, error) {
 		return d, func(context.Context) error { return nil }, nil
 	}
@@ -277,6 +277,7 @@ func TestHelperRuntimeSettlesBridgeRecoveryBeforeReadiness(t *testing.T) {
 	d := &Daemon{
 		runner: runner, bridges: map[string]session{}, bridgeStop: make(chan struct{}),
 		bridgeSlots: semaphore.NewWeighted(bridgeProcessCapacity),
+		imports:     newImportStore(), now: time.Now,
 	}
 	builder := func(daemonkit.Ctx) (*Daemon, func(context.Context) error, error) {
 		return d, func(context.Context) error { return nil }, nil

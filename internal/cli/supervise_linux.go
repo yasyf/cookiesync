@@ -8,7 +8,7 @@ import (
 )
 
 func platformCmds() []*cobra.Command {
-	return []*cobra.Command{newSuperviseCmd()}
+	return []*cobra.Command{newSuperviseCmd(), newImportCmd()}
 }
 
 func newSuperviseCmd() *cobra.Command {

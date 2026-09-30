@@ -372,6 +372,11 @@ func (d *Daemon) handleGetCookies(ctx context.Context, params map[string]any) (a
 		if err != nil {
 			return nil, err
 		}
+		if optionalString(params, "origin", "") == "" {
+			if reply, ok := d.importedCookiesUnion(urls); ok {
+				return reply, nil
+			}
+		}
 		return d.getCookiesAll(ctx, requestor, urls)
 	}
 	return d.getCookiesSingle(ctx, params)
@@ -397,12 +402,18 @@ func (d *Daemon) getCookiesSingle(ctx context.Context, params map[string]any) (a
 		return nil, err
 	}
 	reason := consentReason
-	if origin := optionalString(params, "origin", ""); origin != "" {
+	origin := optionalString(params, "origin", "")
+	if origin != "" {
 		reason = fmt.Sprintf("send them to %s", origin)
 	}
 	requestor, err := peerRequestor(ctx, params)
 	if err != nil {
 		return nil, err
+	}
+	if origin == "" {
+		if reply, ok := d.importedCookies(browser, profile, urls); ok {
+			return reply, nil
+		}
 	}
 	req := auth.Req{Requestor: requestor, Browser: browser, Profile: profile, Reason: reason, Mode: auth.ModeLocal}
 	key, _, err := d.broker.Key(ctx, req)
@@ -572,6 +583,9 @@ func (d *Daemon) getWebStorageSingle(ctx context.Context, params map[string]any)
 	if err != nil {
 		return nil, err
 	}
+	if reply, ok := d.importedOrigins(browser, profile, urls); ok {
+		return reply, nil
+	}
 	req := auth.Req{Requestor: requestor, Browser: browser, Profile: profile, Reason: consentReason, Mode: auth.ModeLocal}
 	if _, _, err := d.broker.Key(ctx, req); err != nil {
 		return nil, err
@@ -603,6 +617,9 @@ func (d *Daemon) getWebStorageAll(ctx context.Context, params map[string]any) (a
 	requestor, err := requestorID(ctx, params)
 	if err != nil {
 		return nil, err
+	}
+	if reply, ok := d.importedOriginsUnion(urls); ok {
+		return reply, nil
 	}
 	outcomes, err := d.broker.LocalKeys(ctx, requestor, consentReason, auth.OneFlight)
 	if err != nil {

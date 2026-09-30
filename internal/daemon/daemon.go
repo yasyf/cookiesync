@@ -102,6 +102,9 @@ type Daemon struct {
 	seedSource func(context.Context, cookie.Browser, string, cookie.AesKey) (cookie.StorageState, cookie.SeedCounts, error)
 	hostBinary func() (string, error)
 
+	imports *importStore
+	now     func() time.Time
+
 	// openTunnel and openKeepalive are the cross-host bridge seams: the ssh -L
 	// forward and the keepalive supervisor, defaulted in New and faked in tests.
 	openTunnel    func(context.Context, bridge.TunnelSpec) (bridgeTunnel, error)
@@ -174,6 +177,8 @@ func New(consent cookie.Consent, c Cache, eng *engine.Engine, probe Probe, runne
 		bridgeStop:  make(chan struct{}),
 		seedSource:  cookie.SeedState,
 		hostBinary:  bridge.ResolveHostBinary,
+		imports:     newImportStore(),
+		now:         time.Now,
 	}
 	d.openTunnel = func(ctx context.Context, spec bridge.TunnelSpec) (bridgeTunnel, error) {
 		t, err := bridge.OpenTunnel(ctx, d.processes.spawner, spec)
@@ -230,6 +235,7 @@ func (d *Daemon) register(dispatcher *synckit.Dispatcher) {
 	dispatcher.Register("bridge_status", d.handleBridgeStatus)
 	dispatcher.Register("bridge_close", d.handleBridgeClose)
 	dispatcher.Register("bridge_keepalive", d.handleBridgeKeepalive)
+	d.registerPlatform(dispatcher)
 }
 
 // Serve runs the resident helper as one exact daemonkit generation. The

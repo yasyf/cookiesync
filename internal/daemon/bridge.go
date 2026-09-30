@@ -179,7 +179,7 @@ func (d *Daemon) handleBridgeOpen(ctx context.Context, params map[string]any) (a
 	if err != nil {
 		return nil, err
 	}
-	resolved, err := resolveBridgeProfile(browserObj, profile)
+	resolved, imported, err := d.resolveBridgeTarget(browserObj, browser, profile, advertise)
 	if err != nil {
 		return nil, err
 	}
@@ -188,7 +188,17 @@ func (d *Daemon) handleBridgeOpen(ctx context.Context, params map[string]any) (a
 		return nil, err
 	}
 	// Never collapsed: a shared open would piggyback one tap and share its token.
-	return d.openBridge(ctx, requestor, endpoint, browser, resolved, browserObj, headed, origin, advertise)
+	return d.openBridge(ctx, requestor, endpoint, browser, resolved, browserObj, headed, origin, advertise, imported)
+}
+
+func (d *Daemon) resolveBridgeTarget(browserObj cookie.Browser, browser, profile, advertise string) (string, bool, error) {
+	if advertise == "" {
+		if _, ok := d.imports.live(importKey{browser: browser, profile: profile}, d.now()); ok {
+			return profile, true, nil
+		}
+	}
+	resolved, err := resolveBridgeProfile(browserObj, profile)
+	return resolved, false, err
 }
 
 // reattachBridge returns the live session's reply when capability keys it and
@@ -206,7 +216,7 @@ func (d *Daemon) reattachBridge(capability, endpoint string) (any, bool) {
 // openBridge is the fresh-open critical path: the biometric tap, the seed read,
 // launch, CDP seed, and WS relay. A deferred cleanup installed before launch
 // tears down a half-open browser on any failure.
-func (d *Daemon) openBridge(ctx context.Context, requestor, endpoint, browser, profile string, browserObj cookie.Browser, headed bool, origin, advertise string) (any, error) {
+func (d *Daemon) openBridge(ctx context.Context, requestor, endpoint, browser, profile string, browserObj cookie.Browser, headed bool, origin, advertise string, imported bool) (any, error) {
 	if d.processes == nil {
 		return nil, errors.New("bridge: managed process owner is unavailable")
 	}
@@ -220,25 +230,9 @@ func (d *Daemon) openBridge(ctx context.Context, requestor, endpoint, browser, p
 			releaseSlots()
 		}
 	}()
-	st, err := d.state.Load(ctx)
+	storage, counts, ttl, importExpiry, err := d.bridgeSeed(ctx, requestor, browser, profile, browserObj, origin, imported)
 	if err != nil {
 		return nil, err
-	}
-	// The strict biometrics-only tap; a cold or routed host fails closed here.
-	key, _, ttl, err := d.broker.ReleaseBridge(ctx, st, auth.Req{
-		Requestor: requestor,
-		Browser:   browser,
-		Profile:   profile,
-		Origin:    origin,
-		Mode:      auth.ModeLocal,
-	})
-	if err != nil {
-		return nil, err
-	}
-
-	storage, counts, err := d.seedSource(ctx, browserObj, profile, key)
-	if err != nil {
-		return nil, fmt.Errorf("seed source %s/%s: %w", browser, profile, err)
 	}
 	hostBin, err := d.hostBinary()
 	if err != nil {
@@ -315,7 +309,6 @@ func (d *Daemon) openBridge(ctx context.Context, requestor, endpoint, browser, p
 	if err != nil {
 		return nil, err
 	}
-
 	sess := &bridgeSession{
 		sessionID:    sessionID,
 		token:        token,
@@ -325,22 +318,15 @@ func (d *Daemon) openBridge(ctx context.Context, requestor, endpoint, browser, p
 		profile:      profile,
 		wsURL:        server.URL(),
 		proxyPort:    proxyPort,
-		expiry:       time.Now().Add(ttl),
 		proc:         proc,
 		server:       server,
 		cancel:       cancel,
 		dataDir:      dataDir,
 		releaseSlots: releaseSlots,
 	}
-
-	d.bridgeMu.Lock()
-	if d.bridgeShutdown {
-		d.bridgeMu.Unlock()
-		return nil, errBridgeShutdown // defer unwinds proc+server+dir
+	if err := d.publishBridge(sess, ttl, importExpiry); err != nil {
+		return nil, err // defer unwinds proc+server+dir
 	}
-	d.bridges[capability] = sess
-	d.bridgeWG.Add(1)
-	d.bridgeMu.Unlock()
 	success = true
 	keepSlots = true
 
@@ -352,6 +338,59 @@ func (d *Daemon) openBridge(ctx context.Context, requestor, endpoint, browser, p
 	result := sess.OpenResult()
 	result["seed"] = buildSeedReport(counts, seeded)
 	return result, nil
+}
+
+func (d *Daemon) publishBridge(sess *bridgeSession, ttl time.Duration, importExpiry time.Time) error {
+	d.bridgeMu.Lock()
+	defer d.bridgeMu.Unlock()
+	if d.bridgeShutdown {
+		return errBridgeShutdown
+	}
+	now := d.now()
+	sess.expiry = now.Add(ttl)
+	if !importExpiry.IsZero() {
+		if !importExpiry.After(now) {
+			return fmt.Errorf("import for %s expired during bridge startup", sess.endpoint)
+		}
+		if importExpiry.Before(sess.expiry) {
+			sess.expiry = importExpiry
+		}
+		sess.expiry = sess.expiry.Round(0)
+	}
+	d.bridges[sess.capability] = sess
+	d.bridgeWG.Add(1)
+	return nil
+}
+
+func (d *Daemon) bridgeSeed(ctx context.Context, requestor, browser, profile string, browserObj cookie.Browser, origin string, imported bool) (cookie.StorageState, cookie.SeedCounts, time.Duration, time.Time, error) {
+	if imported {
+		now := d.now()
+		rec, ok := d.imports.live(importKey{browser: browser, profile: profile}, now)
+		if !ok {
+			return cookie.StorageState{}, cookie.SeedCounts{}, 0, time.Time{}, fmt.Errorf("import for %s/%s expired before bridge startup", browser, profile)
+		}
+		storage, counts := rec.seed(now)
+		return storage, counts, min(d.broker.BridgeTTL(), rec.expiresAt.Sub(now)), rec.expiresAt, nil
+	}
+	st, err := d.state.Load(ctx)
+	if err != nil {
+		return cookie.StorageState{}, cookie.SeedCounts{}, 0, time.Time{}, err
+	}
+	key, _, ttl, err := d.broker.ReleaseBridge(ctx, st, auth.Req{
+		Requestor: requestor,
+		Browser:   browser,
+		Profile:   profile,
+		Origin:    origin,
+		Mode:      auth.ModeLocal,
+	})
+	if err != nil {
+		return cookie.StorageState{}, cookie.SeedCounts{}, 0, time.Time{}, err
+	}
+	storage, counts, err := d.seedSource(ctx, browserObj, profile, key)
+	if err != nil {
+		return cookie.StorageState{}, cookie.SeedCounts{}, 0, time.Time{}, fmt.Errorf("seed source %s/%s: %w", browser, profile, err)
+	}
+	return storage, counts, ttl, time.Time{}, nil
 }
 
 // seedReport is the observability payload bridge_open returns: what the seed
@@ -519,6 +558,7 @@ func (d *Daemon) reapBridges() {
 		select {
 		case <-ticker.C:
 			d.reapExpiredBridges()
+			d.imports.purge(d.now())
 		case <-d.bridgeStop:
 			return
 		}

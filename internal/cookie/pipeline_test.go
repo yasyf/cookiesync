@@ -180,6 +180,27 @@ func TestSyncable(t *testing.T) {
 	}
 }
 
+func TestLive(t *testing.T) {
+	now := float64(1_700_000_000)
+	tests := []struct {
+		name    string
+		expires ChromeMicros
+		want    bool
+	}{
+		{name: "session cookie kept", expires: 0, want: true},
+		{name: "expiry one second ahead kept", expires: 13_344_473_601_000_000, want: true},
+		{name: "expiry exactly now kept", expires: 13_344_473_600_000_000, want: true},
+		{name: "expiry one second past dropped", expires: 13_344_473_599_000_000, want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := Live(Cookie{Name: "sid", ExpiresUTC: tt.expires}, now); got != tt.want {
+				t.Fatalf("Live() = %t, want %t", got, tt.want)
+			}
+		})
+	}
+}
+
 // TestExtractApplyRoundTrip proves an Extract then Apply then Extract preserves the
 // cookie set exactly. Stores with last_update_utc reject the identical timestamp,
 // while the second extract remains byte-for-byte equal to the first on every schema.
