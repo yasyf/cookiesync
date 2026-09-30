@@ -13,7 +13,7 @@ require (
 	github.com/godbus/dbus/v5 v5.2.2
 	github.com/spf13/cobra v1.10.2
 	github.com/syndtr/goleveldb v1.0.0
-	github.com/yasyf/daemonkit v0.32.1
+	github.com/yasyf/daemonkit v0.32.2
 	github.com/yasyf/synckit v0.37.0
 	golang.org/x/crypto v0.48.0
 	golang.org/x/sync v0.20.0
