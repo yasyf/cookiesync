@@ -87,13 +87,25 @@ func TestRequestorIDFromPeerCredentials(t *testing.T) {
 		{"a token wins over the peer session", os.Getpid(), map[string]any{"requestor": "agent-1"}, "req:agent-1", ""},
 		{"a token wins over an underivable session", 0, map[string]any{"requestor": "agent-1"}, "req:agent-1", ""},
 		{"a peer pid keys the grant on its session", os.Getpid(), map[string]any{}, "sid:" + strconv.Itoa(sid), ""},
-		{"a peer outside the pid namespace is refused", 0, map[string]any{}, "",
-			"cannot derive a requestor for socket peer pid 0 (no socket peer, or a peer outside this pid namespace)" + requestorHint},
-		{"an exited peer is refused", exited, map[string]any{}, "",
-			"cannot derive a requestor for socket peer pid " + strconv.Itoa(exited) + " (getsid: no such process)" + requestorHint},
+		{
+			"a peer outside the pid namespace is refused", 0,
+			map[string]any{},
+			"",
+			"cannot derive a requestor for socket peer pid 0 (no socket peer, or a peer outside this pid namespace)" + requestorHint,
+		},
+		{
+			"an exited peer is refused", exited,
+			map[string]any{},
+			"",
+			"cannot derive a requestor for socket peer pid " + strconv.Itoa(exited) + " (getsid: no such process)" + requestorHint,
+		},
 		{"origin never keys a local method", os.Getpid(), map[string]any{"origin": "them@mac"}, "sid:" + strconv.Itoa(sid), ""},
-		{"origin never rescues an underivable session", 0, map[string]any{"origin": "them@mac"}, "",
-			"cannot derive a requestor for socket peer pid 0 (no socket peer, or a peer outside this pid namespace)" + requestorHint},
+		{
+			"origin never rescues an underivable session", 0,
+			map[string]any{"origin": "them@mac"},
+			"",
+			"cannot derive a requestor for socket peer pid 0 (no socket peer, or a peer outside this pid namespace)" + requestorHint,
+		},
 	}
 	dispatcher := synckit.NewDispatcher()
 	dispatcher.Register("requestor", func(ctx context.Context, params map[string]any) (any, error) {

@@ -3,6 +3,7 @@ package auth
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 
 	consentkit "github.com/yasyf/synckit/consent"
@@ -162,4 +163,17 @@ func TestConcurrentDistinctBrowserKeysNeverShareAFlight(t *testing.T) {
 	if string(chrome.key) != string(consent.key) {
 		t.Fatalf("chrome key = %q, want the released key", chrome.key)
 	}
+}
+
+// consentCalls counts the recorded request_consent dials.
+func (r *recordingRunner) consentCalls() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	n := 0
+	for _, c := range r.calls {
+		if strings.Contains(c.cmd, "request_consent") {
+			n++
+		}
+	}
+	return n
 }

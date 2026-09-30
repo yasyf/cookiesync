@@ -16,8 +16,8 @@ import (
 )
 
 const (
-	fakeSecret            = "synthetic-safe-storage-secret"
-	fakeStaleSecret       = "stale-secret-from-another-collection"
+	fakeSecret            = "synthetic-safe-storage-secret"        //nolint:gosec // G101: synthetic test secret.
+	fakeStaleSecret       = "stale-secret-from-another-collection" //nolint:gosec // G101: synthetic test secret.
 	fakeDefaultCollection = dbus.ObjectPath("/org/freedesktop/secrets/collection/login")
 	fakeOtherCollection   = dbus.ObjectPath("/org/freedesktop/secrets/collection/session")
 	fakeItemPath          = fakeDefaultCollection + "/1"

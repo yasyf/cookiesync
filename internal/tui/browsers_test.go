@@ -170,7 +170,7 @@ func TestBrowserStepOffersTheChosenHostsBrowsers(t *testing.T) {
 			if bm.pick == nil || bm.pick.step != pickBrowser {
 				t.Fatalf("advancePick on host %s did not enter the browser step: %+v (status %q)", tt.host, bm.pick, bm.status)
 			}
-			var got []string
+			got := make([]string, 0, len(bm.pick.list.Items()))
 			for _, it := range bm.pick.list.Items() {
 				got = append(got, it.(pickItem).value)
 			}
