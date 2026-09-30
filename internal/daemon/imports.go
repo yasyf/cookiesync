@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/yasyf/cookiesync/internal/cookie"
 	"github.com/yasyf/cookiesync/internal/state"
@@ -121,22 +122,37 @@ func newImportRecord(hosts []string, parsed cookie.StorageState, expiresAt time.
 		if !bareOrigin(raw) {
 			return importRecord{}, fmt.Errorf("import host %q must be a bare host or an origin", raw)
 		}
-		named[cookie.NormalizeHost(raw)] = true
+		host, ok := asciiHost(raw)
+		if !ok {
+			return importRecord{}, fmt.Errorf("import host %q must be an ASCII host or origin", raw)
+		}
+		named[host] = true
 	}
 	for _, c := range parsed.Cookies {
 		if !sentToNamedHost(c.HostKey, named) {
 			return importRecord{}, fmt.Errorf("import refused: cookie %q for %s is sent to none of the named hosts", c.Name, c.HostKey)
 		}
 	}
-	for _, o := range parsed.Origins {
-		if !bareOrigin(o.Origin) {
-			return importRecord{}, fmt.Errorf("import refused: origin %s is not a bare origin", o.Origin)
+	for i, o := range parsed.Origins {
+		host, ok := asciiHost(o.Origin)
+		if !ok || !bareOrigin(o.Origin) {
+			return importRecord{}, fmt.Errorf("import refused: origins[%d] is not a bare origin", i)
 		}
-		if !named[cookie.NormalizeHost(o.Origin)] {
-			return importRecord{}, fmt.Errorf("import refused: origin %s is not a named host", o.Origin)
+		if !named[host] {
+			return importRecord{}, fmt.Errorf("import refused: origins[%d] is not a named host", i)
 		}
 	}
 	return importRecord{hosts: named, cookies: parsed.Cookies, origins: parsed.Origins, expiresAt: expiresAt}, nil
+}
+
+func asciiHost(raw string) (cookie.Host, bool) {
+	for i := range len(raw) {
+		if raw[i] >= utf8.RuneSelf {
+			return "", false
+		}
+	}
+	host := cookie.NormalizeHost(raw)
+	return host, host != ""
 }
 
 func bareOrigin(raw string) bool {

@@ -259,6 +259,24 @@ func TestParseRenderedRefuses(t *testing.T) {
 			want:   `parse playwright document: cookies[0] expires is neither -1 nor a positive Unix time`,
 		},
 		{
+			name:   "invalid escape in a value never echoes the byte",
+			doc:    `{"cookies": [{"name": "sid", "value": "\q"}], "origins": []}`,
+			format: FormatPlaywright,
+			want:   `parse playwright document: invalid JSON at offset 41`,
+		},
+		{
+			name:   "cookies carrying a string never echoes it",
+			doc:    `{"cookies": "SECRET", "origins": []}`,
+			format: FormatPlaywright,
+			want:   `parse playwright document: wrong JSON type at offset 20`,
+		},
+		{
+			name:   "origins carrying a string never echoes it",
+			doc:    `{"origins": "SECRET"}`,
+			format: FormatWebStorage,
+			want:   `parse webstorage document: wrong JSON type at offset 20`,
+		},
+		{
 			name:   "cookie path not rooted at /",
 			doc:    playwrightWith(`{"name": "sid", "value": "synthetic-session", "domain": "app.example.test", "path": "@evil.com/", "expires": -1, "httpOnly": true, "secure": true, "sameSite": "Lax"}`),
 			format: FormatPlaywright,

@@ -182,6 +182,20 @@ func TestImportRPCRefusesAndKeepsThePreviousRecord(t *testing.T) {
 		{"no hosts", func(p map[string]any) { delete(p, "hosts") }, "import requires non-empty hosts"},
 		{"an empty host", func(p map[string]any) { p["hosts"] = []any{""} }, "hosts[0] is string, want non-empty string"},
 		{"a document outside the format's grammar", func(p map[string]any) { p["document"] = `{"origins": []}` }, `parse playwright document: missing "cookies"`},
+		{
+			"a dots-only host over an empty document",
+			func(p map[string]any) {
+				p["hosts"] = []any{"."}
+				p["document"] = `{"cookies": [], "origins": []}`
+			},
+			`import host "." must be an ASCII host or origin`,
+		},
+		{"a host outside ASCII", func(p map[string]any) { p["hosts"] = []any{"İ.example.test"} }, `import host "İ.example.test" must be an ASCII host or origin`},
+		{
+			"a document whose invalid escape is never echoed",
+			func(p map[string]any) { p["document"] = `{"cookies": [{"name": "sid", "value": "\q"}], "origins": []}` },
+			"parse playwright document: invalid JSON at offset 41",
+		},
 		{"a missing document", func(p map[string]any) { delete(p, "document") }, `missing required param "document"`},
 	}
 	for _, tc := range tests {

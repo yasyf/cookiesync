@@ -226,6 +226,7 @@ func TestImportHostAliasesFallThrough(t *testing.T) {
 	}{
 		{"fragment hiding userinfo", []string{"app.example.test"}, "app.example.test", []any{"https://app.example.test/"}, []any{"https://evil.test#@app.example.test"}},
 		{"neighbouring IPv6 literal", []string{"[2001:db8::1]"}, "[2001:db8::1]", []any{"https://[2001:db8::1]:8443/p"}, []any{"https://[2001:db8::2]"}},
+		{"backslash scheme", []string{"app.example.test"}, "app.example.test", []any{"https://app.example.test/"}, []any{`evil.test\https://app.example.test`}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

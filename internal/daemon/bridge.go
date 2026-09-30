@@ -309,17 +309,6 @@ func (d *Daemon) openBridge(ctx context.Context, requestor, endpoint, browser, p
 	if err != nil {
 		return nil, err
 	}
-	now := d.now()
-	expiry := now.Add(ttl)
-	if !importExpiry.IsZero() {
-		if !importExpiry.After(now) {
-			return nil, fmt.Errorf("import for %s expired during bridge startup", endpoint)
-		}
-		if importExpiry.Before(expiry) {
-			expiry = importExpiry
-		}
-	}
-
 	sess := &bridgeSession{
 		sessionID:    sessionID,
 		token:        token,
@@ -329,22 +318,15 @@ func (d *Daemon) openBridge(ctx context.Context, requestor, endpoint, browser, p
 		profile:      profile,
 		wsURL:        server.URL(),
 		proxyPort:    proxyPort,
-		expiry:       expiry,
 		proc:         proc,
 		server:       server,
 		cancel:       cancel,
 		dataDir:      dataDir,
 		releaseSlots: releaseSlots,
 	}
-
-	d.bridgeMu.Lock()
-	if d.bridgeShutdown {
-		d.bridgeMu.Unlock()
-		return nil, errBridgeShutdown // defer unwinds proc+server+dir
+	if err := d.publishBridge(sess, ttl, importExpiry); err != nil {
+		return nil, err // defer unwinds proc+server+dir
 	}
-	d.bridges[capability] = sess
-	d.bridgeWG.Add(1)
-	d.bridgeMu.Unlock()
 	success = true
 	keepSlots = true
 
@@ -356,6 +338,28 @@ func (d *Daemon) openBridge(ctx context.Context, requestor, endpoint, browser, p
 	result := sess.OpenResult()
 	result["seed"] = buildSeedReport(counts, seeded)
 	return result, nil
+}
+
+func (d *Daemon) publishBridge(sess *bridgeSession, ttl time.Duration, importExpiry time.Time) error {
+	d.bridgeMu.Lock()
+	defer d.bridgeMu.Unlock()
+	if d.bridgeShutdown {
+		return errBridgeShutdown
+	}
+	now := d.now()
+	sess.expiry = now.Add(ttl)
+	if !importExpiry.IsZero() {
+		if !importExpiry.After(now) {
+			return fmt.Errorf("import for %s expired during bridge startup", sess.endpoint)
+		}
+		if importExpiry.Before(sess.expiry) {
+			sess.expiry = importExpiry
+		}
+		sess.expiry = sess.expiry.Round(0)
+	}
+	d.bridges[sess.capability] = sess
+	d.bridgeWG.Add(1)
+	return nil
 }
 
 func (d *Daemon) bridgeSeed(ctx context.Context, requestor, browser, profile string, browserObj cookie.Browser, origin string, imported bool) (cookie.StorageState, cookie.SeedCounts, time.Duration, time.Time, error) {

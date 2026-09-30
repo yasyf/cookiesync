@@ -142,7 +142,16 @@ func ParseRendered(data []byte, format OutputFormat) (StorageState, error) {
 	default:
 		return StorageState{}, fmt.Errorf("cannot parse a %s document", format)
 	}
-	if err != nil {
+	var (
+		syntaxErr *json.SyntaxError
+		typeErr   *json.UnmarshalTypeError
+	)
+	switch {
+	case errors.As(err, &syntaxErr):
+		return StorageState{}, fmt.Errorf("parse %s document: invalid JSON at offset %d", format, syntaxErr.Offset)
+	case errors.As(err, &typeErr):
+		return StorageState{}, fmt.Errorf("parse %s document: wrong JSON type at offset %d", format, typeErr.Offset)
+	case err != nil:
 		return StorageState{}, fmt.Errorf("parse %s document: %w", format, err)
 	}
 	return state, nil

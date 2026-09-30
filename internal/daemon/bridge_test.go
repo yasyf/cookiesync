@@ -237,6 +237,9 @@ func TestBridgeOpenSeedsFromAnImport(t *testing.T) {
 	if sess.expiry.After(importExpiresAt) {
 		t.Fatalf("session expiry %v outlives the import's absolute expiry %v", sess.expiry, importExpiresAt)
 	}
+	if sess.expiry != sess.expiry.Round(0) {
+		t.Fatalf("session expiry %v carries a monotonic reading, want the wall clock alone", sess.expiry)
+	}
 	if got := open["seed"].(map[string]any)["attempted"]; got != float64(1) {
 		t.Fatalf("seed attempted = %v, want 1", got)
 	}
@@ -248,8 +251,8 @@ func TestBridgeOpenSeedsFromAnImport(t *testing.T) {
 }
 
 // TestBridgeOpenRefusesAnImportThatExpiresDuringStartup advances the pinned clock
-// past the import's expiry between the seed and Chrome's launch: the open fails
-// naming the endpoint, the launched Chrome is torn down, and no session is left.
+// past the import's expiry after the seed, so publication refuses: the open fails
+// naming the endpoint, Chrome is torn down, the slot is freed, no session is left.
 func TestBridgeOpenRefusesAnImportThatExpiresDuringStartup(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping: launches a real Chrome")
@@ -304,6 +307,56 @@ func TestBridgeOpenRefusesAnImportThatExpiresDuringStartup(t *testing.T) {
 	}
 	if len(sessions) != 0 {
 		t.Fatalf("session dirs left behind by the torn-down Chrome: %v", sessions)
+	}
+	if !d.bridgeSlots.TryAcquire(bridgeProcessCapacity) {
+		t.Fatalf("the refused open kept its process slot")
+	}
+	d.bridgeSlots.Release(bridgeProcessCapacity)
+}
+
+// TestPublishBridgeCapsAnImportSeededSession pins the lease read under bridgeMu: an
+// import-seeded session ends at its import deadline as wall clock, or is refused.
+func TestPublishBridgeCapsAnImportSeededSession(t *testing.T) {
+	start := time.Now()
+	deadline := start.Add(time.Minute).Round(0)
+	endpoint := endpointID("me@laptop", "chrome", "Default")
+	tests := []struct {
+		name         string
+		clock        time.Time
+		ttl          time.Duration
+		importExpiry time.Time
+		wantExpiry   time.Time
+		wantErr      string
+	}{
+		{"a tap session keeps its monotonic lease", start, time.Hour, time.Time{}, start.Add(time.Hour), ""},
+		{"an import deadline before the bridge ttl caps the lease", start, time.Hour, deadline, deadline, ""},
+		{"a bridge ttl before the import deadline is stored as wall clock", start, time.Second, deadline, start.Add(time.Second).Round(0), ""},
+		{"an import that lapsed before publication is refused", deadline, time.Hour, deadline, time.Time{}, "import for " + endpoint + " expired during bridge startup"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			d := &Daemon{bridges: map[string]session{}, now: func() time.Time { return tc.clock }}
+			sess := &bridgeSession{capability: "cap", endpoint: endpoint}
+			err := d.publishBridge(sess, tc.ttl, tc.importExpiry)
+			if tc.wantErr != "" {
+				if err == nil || err.Error() != tc.wantErr {
+					t.Fatalf("publishBridge error = %v, want %q", err, tc.wantErr)
+				}
+				if len(d.bridges) != 0 {
+					t.Fatalf("bridges after the refusal = %v, want none", d.bridges)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("publishBridge: %v", err)
+			}
+			if d.bridges["cap"] != sess {
+				t.Fatalf("bridges = %v, want the session published under its capability", d.bridges)
+			}
+			if sess.expiry != tc.wantExpiry {
+				t.Fatalf("expiry = %v, want %v", sess.expiry, tc.wantExpiry)
+			}
+		})
 	}
 }
 
