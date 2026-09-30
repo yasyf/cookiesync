@@ -154,7 +154,19 @@ func TestParseRenderedRefuses(t *testing.T) {
 			name:   "unknown top-level key",
 			doc:    `{"cookies": [], "origins": [], "extra": 1}`,
 			format: FormatPlaywright,
-			want:   `parse playwright document: json: unknown field "extra"`,
+			want:   `parse playwright document: unknown field`,
+		},
+		{
+			name:   "unknown top-level key never echoes it",
+			doc:    `{"cookies": [], "origins": [], "SECRET-KEY": 1}`,
+			format: FormatPlaywright,
+			want:   `parse playwright document: unknown field`,
+		},
+		{
+			name:   "unknown cookie key never echoes it",
+			doc:    playwrightWith(`{"name": "sid", "value": "synthetic-session", "domain": "app.example.test", "path": "/", "expires": -1, "httpOnly": true, "secure": true, "sameSite": "Lax", "SECRET-KEY": "SECRET-VALUE"}`),
+			format: FormatPlaywright,
+			want:   `parse playwright document: unknown field`,
 		},
 		{
 			name:   "trailing document",
@@ -184,7 +196,7 @@ func TestParseRenderedRefuses(t *testing.T) {
 			name:   "playwright document read as webstorage",
 			doc:    readGolden(t, "import_playwright.json"),
 			format: FormatWebStorage,
-			want:   `parse webstorage document: json: unknown field "cookies"`,
+			want:   `parse webstorage document: unknown field`,
 		},
 		{
 			name:   "webstorage document without origins",
@@ -196,7 +208,7 @@ func TestParseRenderedRefuses(t *testing.T) {
 			name:   "sessionStorage in a playwright origin",
 			doc:    `{"cookies": [], "origins": [{"origin": "https://app.example.test", "localStorage": [{"name": "theme", "value": "dark"}], "sessionStorage": []}]}`,
 			format: FormatPlaywright,
-			want:   `parse playwright document: json: unknown field "sessionStorage"`,
+			want:   `parse playwright document: unknown field`,
 		},
 		{
 			name:   "lowercase sameSite",

@@ -8,6 +8,8 @@ import (
 	"strings"
 )
 
+const unknownFieldPrefix = "json: unknown field "
+
 var samesitePlaywright = map[string]int{"None": 0, "Lax": 1, "Strict": 2}
 
 type renderedCookie struct {
@@ -151,6 +153,9 @@ func ParseRendered(data []byte, format OutputFormat) (StorageState, error) {
 		return StorageState{}, fmt.Errorf("parse %s document: invalid JSON at offset %d", format, syntaxErr.Offset)
 	case errors.As(err, &typeErr):
 		return StorageState{}, fmt.Errorf("parse %s document: wrong JSON type at offset %d", format, typeErr.Offset)
+	// encoding/json has no typed error for an unknown field; its only signal is a message carrying the document's key.
+	case err != nil && strings.HasPrefix(err.Error(), unknownFieldPrefix):
+		return StorageState{}, fmt.Errorf("parse %s document: unknown field", format)
 	case err != nil:
 		return StorageState{}, fmt.Errorf("parse %s document: %w", format, err)
 	}
