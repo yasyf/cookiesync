@@ -6,7 +6,7 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/pbkdf2"
-	"crypto/sha1"
+	"crypto/sha1" //nolint:gosec // G505: Chromium's PBKDF2 derivation uses HMAC-SHA1.
 	"crypto/sha256"
 	"database/sql"
 	"encoding/binary"

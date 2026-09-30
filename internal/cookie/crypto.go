@@ -126,6 +126,6 @@ func sealCBC(tag string, plain []byte, key AesKey) ([]byte, error) {
 	}
 	padded := pkcs7Pad(plain)
 	out := make([]byte, len(padded))
-	cipher.NewCBCEncrypter(block, iv).CryptBlocks(out, padded)
+	cipher.NewCBCEncrypter(block, iv).CryptBlocks(out, padded) //nolint:gosec // G407: Chromium's os_crypt fixes the CBC IV at 16 spaces.
 	return append([]byte(tag), out...), nil
 }

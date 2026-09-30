@@ -128,7 +128,7 @@ func (p *Proc) CloseContext(ctx context.Context) error {
 		ctx, cancel := budgeted(ctx, childSettlementTimeout)
 		defer cancel()
 		_, stopErr := p.child.Stop(ctx)
-		p.closeErr = errors.Join(p.transport.Close(), stopErr, p.child.StderrErr(), os.RemoveAll(p.dataDir))
+		p.closeErr = errors.Join(p.transport.Close(), stopErr, p.child.StderrErr(), os.RemoveAll(p.dataDir)) //nolint:gosec // G703: dataDir is this session's own throwaway profile dir.
 	})
 	return p.closeErr
 }

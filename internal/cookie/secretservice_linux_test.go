@@ -214,8 +214,8 @@ func assertLookupError(t *testing.T, err, want error) {
 	if strings.Contains(err.Error(), fakeSecret) {
 		t.Fatalf("error text carries the secret: %q", err.Error())
 	}
-	var svcErr *SecretServiceError
-	if _, isSvc := want.(*SecretServiceError); isSvc {
+	var wantSvc, svcErr *SecretServiceError
+	if errors.As(want, &wantSvc) {
 		if !errors.As(err, &svcErr) {
 			t.Fatalf("err = %v, want *SecretServiceError", err)
 		}

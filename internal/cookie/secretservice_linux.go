@@ -159,7 +159,7 @@ func sessionBusAddress() (string, bool) {
 		return "", false
 	}
 	socket := filepath.Join(runtimeDir, "bus")
-	if _, err := os.Stat(socket); err != nil {
+	if _, err := os.Stat(socket); err != nil { //nolint:gosec // G703: the session bus socket lives under XDG_RUNTIME_DIR.
 		return "", false
 	}
 	return "unix:path=" + dbus.EscapeBusAddressValue(socket), true

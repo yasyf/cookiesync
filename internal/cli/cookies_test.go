@@ -15,7 +15,7 @@ import (
 // writeCookieStore creates an empty cookie store file at path, making its parent dirs.
 func writeCookieStore(t *testing.T, path string) {
 	t.Helper()
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil { //nolint:gosec // G703: path is rooted in t.TempDir.
 		t.Fatalf("mkdir store dir: %v", err)
 	}
 	if err := os.WriteFile(path, []byte("x"), 0o600); err != nil {

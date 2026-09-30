@@ -1,6 +1,7 @@
 package bridge
 
 import (
+	"errors"
 	"slices"
 	"testing"
 )
@@ -34,7 +35,7 @@ func TestResolveHeadedWithoutADisplay(t *testing.T) {
 	if headed, err := ResolveHeaded(WindowAuto); err != nil || headed {
 		t.Fatalf("ResolveHeaded(auto) with no display = %v, %v, want headless", headed, err)
 	}
-	if _, err := ResolveHeaded(WindowHeaded); err != errNoDisplay {
+	if _, err := ResolveHeaded(WindowHeaded); !errors.Is(err, errNoDisplay) {
 		t.Fatalf("ResolveHeaded(headed) with no display error = %v, want %v", err, errNoDisplay)
 	}
 }
