@@ -68,7 +68,44 @@ Every listed endpoint converges continuously. The daemon watches each cookie sto
 
 `cookiesync install` notes the signed key helper and registers a manifest with [synckit](https://github.com/yasyf/synckit), the sync substrate cookiesync shares with [reposync](https://github.com/yasyf/reposync). The resident supervisor, `synckitd` (`brew install yasyf/tap/synckitd && synckitd install`), reads that manifest, watches each tracked browser's cookie store, and on a change converges that browser's group across your hosts over SSH: extract on the host that changed, merge the union, re-apply everywhere. Decryption needs the browser's Safe Storage key, which a Developer-ID-signed, notarized helper app releases only behind a Touch ID tap and caches Secure-Enclave-wrapped for a short window.
 
-> **macOS only.** Safe Storage, Touch ID, the Secure Enclave, and launchd don't exist off darwin. Decrypted cookies and keys never land on disk, and you pick exactly which machines and which browser profiles cookiesync touches.
+> **On macOS.** Keychain, Touch ID, the Secure Enclave, and launchd provide key storage, consent, key wrapping, and service management. Decrypted cookies and keys never land on disk, and you pick exactly which machines and which browser profiles cookiesync touches.
+
+## Linux
+
+Linux amd64 is supported on a private single-user VM. Every process running as the same user can control the daemon, so this is not for shared hosts.
+
+Download `cookiesync_linux_amd64.tar.gz` from [releases](https://github.com/yasyf/cookiesync/releases), then extract and install the binary:
+
+```bash
+tar -xzf cookiesync_linux_amd64.tar.gz
+mkdir -p ~/.local/bin
+install -m 0755 cookiesync ~/.local/bin/cookiesync
+```
+
+For a new standalone host without peers, create `$XDG_CONFIG_HOME/synckit/state.json`; the default path is `~/.config/synckit/state.json`. Use directory mode `0700` and file mode `0600`. Replace `agent@vm` with this host's `user@host` identity:
+
+```json
+{"host_registry":{"self":"agent@vm","hosts":[]},"schema":{"identity":"synckit-state-v1","version":1,"fingerprint":"2dc96a8a0930930535e711cbab04af029573c9b95318206f8a8fbad87677ca38"},"synckit":{}}
+```
+
+Run the supervisor in the foreground under the workspace process manager. Its `PATH` must include `~/.local/bin` and provide `cookiesync`, `ssh`, and a Chrome or Chromium binary:
+
+```bash
+cookiesync supervise
+```
+
+With the supervisor running, initialize and check the helper:
+
+```bash
+cookiesync install
+cookiesync doctor
+```
+
+`install` initializes cookiesync state and starts the resident helper; it writes no synckit manifest. `doctor` checks the supervisor, socket, memory cache, mesh, browser roots, and Chrome binary.
+
+`requestor`, `auth --reason`, `bridge open --json`, and `bridge stop` keep their command contracts. `cookies` supports `playwright`, `webstorage`, `header`, `netscape`, and `json` output. Chrome and Chromium profiles live under `$XDG_CONFIG_HOME`, defaulting to `~/.config`. Chromium v10 cookies use a fixed key; v11 uses the Secret Service secret. The bridge runs headless when both `DISPLAY` and `WAYLAND_DISPLAY` are unset.
+
+Linux never approves consent. Local key release routes to an already configured, attended Mac peer or fails closed. Cached keys and grants stay in process memory and expire within five minutes. There is no automatic pairing. A standalone host with no peers fails closed on `auth` and `cookies`.
 
 ## Commands
 
