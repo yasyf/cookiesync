@@ -12,8 +12,8 @@ import (
 )
 
 // TestEnsureLocalEndpointsRegistersInstalledLinuxBrowsers proves the auto-register reads
-// the XDG layout on Linux: every Chrome profile directory holding a cookie store
-// registers, Default and "Profile 3" alike, under the google-chrome data root.
+// the XDG layout on Linux: with several Chrome profiles holding a cookie store under
+// the google-chrome data root, the one primary profile, Default, registers.
 func TestEnsureLocalEndpointsRegistersInstalledLinuxBrowsers(t *testing.T) {
 	testutil.IsolateHostConfig(t, paths.Config)
 	seedRegistry(t, "me@vm")
@@ -33,7 +33,7 @@ func TestEnsureLocalEndpointsRegistersInstalledLinuxBrowsers(t *testing.T) {
 	for _, ep := range st.Endpoints() {
 		got[string(ep.ID())] = true
 	}
-	want := map[string]bool{"me@vm:chrome:Profile 3": true, "me@vm:chrome:Default": true}
+	want := map[string]bool{"me@vm:chrome:Default": true}
 	if len(got) != len(want) {
 		t.Fatalf("registered %v, want %v", got, want)
 	}
