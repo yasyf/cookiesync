@@ -96,7 +96,7 @@ func (c preservedCandidate) present(pid int) (bool, error) {
 		return false, err
 	}
 	defer func() { _ = candidate.release() }()
-	stat, readErr := os.ReadFile(procPath(pid, "stat"))
+	stat, readErr := os.ReadFile(procPath(pid, "stat")) //nolint:gosec // G703: pid is a decimal int rendered into /proc/<pid>/stat, which cannot traverse.
 	alive, err := candidate.alive()
 	if err != nil || !alive {
 		return false, err
