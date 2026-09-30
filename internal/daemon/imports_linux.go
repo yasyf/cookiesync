@@ -61,11 +61,12 @@ func (d *Daemon) handleImport(ctx context.Context, params map[string]any) (any, 
 	if err != nil {
 		return nil, err
 	}
-	rec, err := newImportRecord(hosts, parsed, d.now().Add(ttl).Round(0))
+	now := d.now()
+	rec, err := newImportRecord(hosts, parsed, now.Add(ttl).Round(0))
 	if err != nil {
 		return nil, err
 	}
-	if err := d.imports.hold(importKey{browser: browser, profile: profile}, rec); err != nil {
+	if err := d.imports.hold(importKey{browser: browser, profile: profile}, rec, now); err != nil {
 		return nil, err
 	}
 	return map[string]any{

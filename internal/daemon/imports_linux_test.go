@@ -145,6 +145,20 @@ func TestImportRPCRefusesASeventeenthRecord(t *testing.T) {
 		t.Fatalf("store after the refusal = %+v, want only the 16 records already held", d.imports.records)
 	}
 	assertImportTouchedNothing(t, consent, cache)
+
+	expiredKey := importKey{browser: "chrome", profile: "Profile 0"}
+	expired := held[expiredKey]
+	expired.expiresAt = now
+	d.imports.put(expiredKey, expired)
+	if _, err := dispatchSelf(t, d, "import", importParams(readImportFixture(t))); err != nil {
+		t.Fatalf("import once a held record expired: %v", err)
+	}
+	if _, present := d.imports.records[expiredKey]; present || len(d.imports.records) != importMaxRecords {
+		t.Fatalf("store after the import keeps the expired key = %v with %d records, want it evicted and %d held", present, len(d.imports.records), importMaxRecords)
+	}
+	if _, present := d.imports.records[importDefaultKey]; !present {
+		t.Fatalf("store after the import lacks %+v", importDefaultKey)
+	}
 }
 
 func TestImportRPCRefusesAndKeepsThePreviousRecord(t *testing.T) {

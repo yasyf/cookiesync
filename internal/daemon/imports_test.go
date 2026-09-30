@@ -284,33 +284,29 @@ func TestImportStoreHoldsAtMostSixteenRecords(t *testing.T) {
 	store := newImportStore()
 
 	for i := range importMaxRecords {
-		if err := store.hold(key(i), live); err != nil {
+		if err := store.hold(key(i), live, now); err != nil {
 			t.Fatalf("hold record %d: %v", i, err)
 		}
 	}
-	if err := store.hold(key(importMaxRecords), live); err == nil || err.Error() != wantErr {
+	if err := store.hold(key(importMaxRecords), live, now); err == nil || err.Error() != wantErr {
 		t.Fatalf("hold of a 17th record error = %v, want %q", err, wantErr)
 	}
 	if _, present := store.records[key(importMaxRecords)]; present || len(store.records) != importMaxRecords {
 		t.Fatalf("store after the refusal holds %d records including the 17th = %v, want the 16 already held", len(store.records), present)
 	}
 
-	if err := store.hold(key(0), replacement); err != nil {
+	if err := store.hold(key(0), replacement, now); err != nil {
 		t.Fatalf("replacing a held key at the cap: %v", err)
 	}
 	if got := store.records[key(0)]; !reflect.DeepEqual(got, replacement) {
 		t.Fatalf("record after replacement = %+v, want %+v", got, replacement)
 	}
 
-	store.put(key(1), importRecord{hosts: map[cookie.Host]bool{"stale.test": true}, expiresAt: now})
-	if err := store.hold(key(importMaxRecords), live); err == nil || err.Error() != wantErr {
-		t.Fatalf("hold past an expired but unpurged record error = %v, want %q", err, wantErr)
+	store.put(key(1), importRecord{hosts: map[cookie.Host]bool{"stale.test": true}, expiresAt: now.Add(time.Minute)})
+	if err := store.hold(key(importMaxRecords), live, now.Add(time.Minute)); err != nil {
+		t.Fatalf("hold once a held record expired: %v", err)
 	}
-	store.purge(now)
-	if err := store.hold(key(importMaxRecords), live); err != nil {
-		t.Fatalf("hold after purge freed a slot: %v", err)
-	}
-	if len(store.records) != importMaxRecords {
-		t.Fatalf("store after the purge and hold holds %d records, want %d", len(store.records), importMaxRecords)
+	if _, present := store.records[key(1)]; present || len(store.records) != importMaxRecords {
+		t.Fatalf("store after holding past an expiry keeps the expired key = %v with %d records, want it evicted and %d held", present, len(store.records), importMaxRecords)
 	}
 }

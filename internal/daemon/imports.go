@@ -51,14 +51,23 @@ func (s *importStore) put(key importKey, rec importRecord) {
 	s.records[key] = rec
 }
 
-func (s *importStore) hold(key importKey, rec importRecord) error {
+func (s *importStore) hold(key importKey, rec importRecord, now time.Time) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.evictExpired(now)
 	if _, replacing := s.records[key]; !replacing && len(s.records) >= importMaxRecords {
 		return fmt.Errorf("import refused: %d records already held", importMaxRecords)
 	}
 	s.records[key] = rec
 	return nil
+}
+
+func (s *importStore) evictExpired(now time.Time) {
+	for key, rec := range s.records {
+		if !rec.expiresAt.After(now) {
+			delete(s.records, key)
+		}
+	}
 }
 
 func (s *importStore) live(key importKey, now time.Time) (importRecord, bool) {
@@ -99,11 +108,7 @@ func (s *importStore) liveAll(now time.Time) []importRecord {
 func (s *importStore) purge(now time.Time) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	for key, rec := range s.records {
-		if !rec.expiresAt.After(now) {
-			delete(s.records, key)
-		}
-	}
+	s.evictExpired(now)
 }
 
 func newImportStore() *importStore {
