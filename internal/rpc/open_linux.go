@@ -43,6 +43,7 @@ func Ensure(ctx context.Context) (daemonkit.Ensured, error) {
 // restarted supervisor no longer resumes it. Stopping a helper that was never
 // applied succeeds, since Stop names no program for daemonkit to resolve.
 func Stop(ctx context.Context) error {
+	// TODO: use daemon.HelperSpec() once daemonkit ships the never-installed Stop fix (yasyf/daemonkit-stop-inventory).
 	spec, err := helperruntime.Spec(paths.ToolName, daemonkit.Program{}, 0)
 	if err != nil {
 		return err

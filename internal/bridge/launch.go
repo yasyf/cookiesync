@@ -45,6 +45,7 @@ type Proc struct {
 
 	dataDir     string
 	browserUUID string
+	handlers    *handlerTracker
 
 	writeMu   sync.Mutex
 	id        atomic.Int64
@@ -80,18 +81,19 @@ func Launch(ctx context.Context, spawner Spawner, spec LaunchSpec) (*Proc, error
 		Path: spec.RolePath,
 		Args: append(append([]string{}, spec.RoleArgs...),
 			"_bridge-chrome-child", spec.HostBinary, spec.DataDir, strconv.FormatBool(spec.Headed)),
-		Env:     chromeEnvironment(spec.Headed),
+		Env:     chromeEnvironment(spec.DataDir, spec.Headed),
 		Session: true,
 		Exec:    daemonkit.ServingSameUser(),
 	}, daemonkit.ChannelStdio, stderr)
 	if err != nil {
 		return nil, fmt.Errorf("start chrome session: %w", err)
 	}
+	p.child = child
+	p.handlers = trackHandlers(spec.DataDir)
 	transport, err := child.Conn()
 	if err != nil {
-		return nil, stopChild(ctx, child, fmt.Errorf("bridge: take chrome cdp pipe: %w", err))
+		return nil, errors.Join(stopChild(ctx, child, fmt.Errorf("bridge: take chrome cdp pipe: %w", err)), p.handlers.close())
 	}
-	p.child = child
 	p.transport = transport
 	go p.readLoop()
 	if _, err := (&Conn{proc: p}).Call(readyCtx, "", "Browser.getVersion", nil); err != nil {
@@ -99,6 +101,7 @@ func Launch(ctx context.Context, spawner Spawner, spec LaunchSpec) (*Proc, error
 			fmt.Errorf("cdp handshake (chrome stderr: %q): %w", stderr.String(), err),
 			transport.Close(),
 			stopChild(ctx, child, nil),
+			p.handlers.close(),
 		)
 	}
 	return p, nil
@@ -120,7 +123,8 @@ func (p *Proc) Close() error {
 	return p.CloseContext(context.Background())
 }
 
-// CloseContext settles the managed Chrome process within ctx and removes the
+// CloseContext settles the managed Chrome process within ctx, then every
+// crashpad handler Chrome double-forked out of its session, and removes the
 // data dir. A ctx carrying no deadline gets childSettlementTimeout, since
 // daemonkit's Stop refuses one that states no budget.
 func (p *Proc) CloseContext(ctx context.Context) error {
@@ -128,7 +132,7 @@ func (p *Proc) CloseContext(ctx context.Context) error {
 		ctx, cancel := budgeted(ctx, childSettlementTimeout)
 		defer cancel()
 		_, stopErr := p.child.Stop(ctx)
-		p.closeErr = errors.Join(p.transport.Close(), stopErr, p.child.StderrErr(), os.RemoveAll(p.dataDir)) //nolint:gosec // G703: dataDir is this session's own throwaway profile dir.
+		p.closeErr = errors.Join(p.transport.Close(), stopErr, p.child.StderrErr(), p.handlers.close(), os.RemoveAll(p.dataDir)) //nolint:gosec // G703: dataDir is this session's own throwaway profile dir.
 	})
 	return p.closeErr
 }

@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -21,7 +22,6 @@ import (
 const (
 	smokeChromeEnv = "COOKIESYNC_SMOKE_CHROME"
 	smokeRunEnv    = "COOKIESYNC_SMOKE_RUN"
-	crashpadComm   = "chrome_crashpad"
 )
 
 type smokeProcess struct {
@@ -95,10 +95,18 @@ func TestSmokeRealChromeSeedsReadsBackAndLeavesNoProcess(t *testing.T) {
 	if !containsPID(running, chromePID) {
 		t.Fatalf("chrome pid %d missing from its own process set %+v", chromePID, running)
 	}
+	tracked := proc.handlers.tracked()
+	if len(tracked) == 0 {
+		t.Errorf("no crashpad handler tracked; chrome did not put %s into a handler's --database", crashpadDatabase(proc.dataDir))
+	}
 	for _, p := range running {
-		// Crashpad's DoubleForkAndExec setsid()s its handler by design; the post-Close no-survivor loop below still proves it exits.
-		if p.sid != chromePID && p.comm != crashpadComm {
-			t.Errorf("chrome process %d (%s) runs in session %d, outside the daemonkit-owned session %d", p.pid, p.comm, p.sid, chromePID)
+		if p.sid != chromePID && !slices.Contains(tracked, p.pid) {
+			t.Errorf("chrome process %d (%s) runs in session %d, outside the daemonkit-owned session %d, and is not a tracked crashpad handler %v", p.pid, p.comm, p.sid, chromePID, tracked)
+		}
+	}
+	for _, pid := range tracked {
+		if !containsPID(running, pid) {
+			t.Errorf("tracked crashpad handler %d is not one of this chrome's processes %+v", pid, running)
 		}
 	}
 
