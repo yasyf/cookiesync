@@ -105,7 +105,7 @@ cookiesync doctor
 
 `requestor`, `auth --reason`, `bridge open --json`, and `bridge stop` keep their command contracts. `cookies` supports `playwright`, `webstorage`, `header`, `netscape`, and `json` output. Chrome profiles live under `$XDG_CONFIG_HOME/google-chrome`, defaulting to `~/.config/google-chrome`; Chromium is not registered yet, because the Mac that approves consent must resolve the same browser name. Chromium v10 cookies use a fixed key; v11 uses the Secret Service secret. The bridge runs headless when both `DISPLAY` and `WAYLAND_DISPLAY` are unset.
 
-Linux never approves consent. Local key release routes to an already configured, attended Mac peer or fails closed. Cached keys and grants stay in process memory and expire within five minutes. There is no automatic pairing. A standalone host with no peers fails closed on `auth` and `cookies` unless a live import names every requested host.
+Linux never approves consent. Local key release routes to an already configured, attended Mac peer or fails closed. Cached keys and grants stay in process memory and expire within five minutes. There is no automatic pairing. If your host has no peers, `auth` fails closed regardless of imports; `cookies` and `bridge open` also fail closed unless a live import names every requested host.
 
 Bring a Mac's cookies for a few hosts onto your VM without giving the VM a key.
 
@@ -113,7 +113,7 @@ Bring a Mac's cookies for a few hosts onto your VM without giving the VM a key.
 cookiesync cookies --browser chrome --profile Default --format playwright -- app.example.com api.example.com | ssh vm cookiesync import --ttl 1h --format playwright --browser chrome --profile Default -- app.example.com api.example.com
 ```
 
-The helper holds your import only in memory, bound to the browser, profile, named hosts, and `--ttl` (1s-24h). A helper restart or upgrade drops it. A new import for the same browser and profile replaces it.
+The helper holds your import only in memory, bound to the browser, profile, named hosts, and `--ttl`. The minimum `--ttl` is `1s` and the maximum is `24h`. Reads refuse your import at expiry. The helper's reaper runs every 30 s and purges expired imports. A helper restart or upgrade drops it. A new import for the same browser and profile replaces it.
 
 `cookies`, with or without `--browser`, and `bridge open` serve your import while every requested host is a named host. Any other host takes the normal path, which fails closed on a standalone VM.
 
@@ -121,7 +121,11 @@ The helper refuses your whole import if a cookie or origin reaches past the name
 
 `playwright` carries cookies and `localStorage`, while `webstorage` carries `localStorage` and `sessionStorage` with no cookies. You get `sessionStorage` only from a `webstorage` import.
 
-`bridge open` needs your local Chrome profile directory to exist and caps its lease at your import's remaining TTL.
+Your imported browser and profile identify a namespace in the helper's memory. You need no local profile for any imported browser and profile. On a host with no Chrome profile or native cookie store, you can run `import`, `cookies` with or without `--browser`, and `bridge open`. They use the import record without reading a native profile, contacting the broker, accessing a key ring, or creating a profile. A native profile, when present, serves only hosts your import does not name.
+
+A `bridge open` seeded from your import gets a lease no longer than the import's remaining TTL. The bridge closes when that lease expires.
+
+TTL expiry does not revoke cookies already returned by `cookies`, stored by your agent, or seeded into a bridge's Chrome. Each receiving process keeps its copy until it exits. TTL limits how long the helper serves your record, not the life of copies it hands out.
 
 ## Commands
 

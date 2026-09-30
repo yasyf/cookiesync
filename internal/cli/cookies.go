@@ -103,12 +103,6 @@ func runAuthAll(cmd *cobra.Command, reason string) error {
 	return nil
 }
 
-// ensureLocalEndpoints registers this host's installed browsers when the convergent
-// registry holds no local endpoint for self: one primary profile per browser — "Default"
-// when its Cookies store exists, else the most-recently-modified profile among
-// Profiles() (which already drops Arc's system profile). A browser with no cookie store
-// is skipped, and when nothing registers it errors, since there is nothing to
-// authenticate.
 func ensureLocalEndpoints(ctx context.Context) error {
 	self, _, err := mesh.Resolve(ctx)
 	if err != nil {
@@ -148,7 +142,7 @@ func ensureLocalEndpoints(ctx context.Context) error {
 		}
 		registered = true
 	}
-	if !registered {
+	if !registered && localBrowserRequired {
 		return errors.New("no installed browsers detected; run cookiesync browser add")
 	}
 	return nil

@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/yasyf/cookiesync/internal/paths"
@@ -44,5 +45,18 @@ func TestEnsureLocalEndpointsRegistersInstalledBrowsers(t *testing.T) {
 	}
 	if len(got) != 2 {
 		t.Fatalf("registered %d endpoints, want 2: %v", len(got), got)
+	}
+}
+
+// TestEnsureLocalEndpointsErrorsWithNoInstalledBrowsers proves an empty HOME (no browser
+// stores) errors rather than registering nothing silently.
+func TestEnsureLocalEndpointsErrorsWithNoInstalledBrowsers(t *testing.T) {
+	testutil.IsolateHostConfig(t, paths.Config)
+	t.Setenv("HOME", t.TempDir())
+	seedRegistry(t, "me@laptop")
+
+	err := ensureLocalEndpoints(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "no installed browsers detected") {
+		t.Fatalf("ensureLocalEndpoints with no browsers = %v, want 'no installed browsers detected'", err)
 	}
 }

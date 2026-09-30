@@ -60,16 +60,3 @@ func TestEnsureLocalEndpointsNoOpWhenLocalPresent(t *testing.T) {
 		t.Fatalf("ensureLocalEndpoints mutated the registry: %v", st.Endpoints())
 	}
 }
-
-// TestEnsureLocalEndpointsErrorsWithNoInstalledBrowsers proves an empty HOME (no browser
-// stores) errors rather than registering nothing silently.
-func TestEnsureLocalEndpointsErrorsWithNoInstalledBrowsers(t *testing.T) {
-	testutil.IsolateHostConfig(t, paths.Config)
-	t.Setenv("HOME", t.TempDir())
-	seedRegistry(t, "me@laptop")
-
-	err := ensureLocalEndpoints(context.Background())
-	if err == nil || !strings.Contains(err.Error(), "no installed browsers detected") {
-		t.Fatalf("ensureLocalEndpoints with no browsers = %v, want 'no installed browsers detected'", err)
-	}
-}
