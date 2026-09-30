@@ -24,6 +24,14 @@ for archive in "${archives[@]}"; do
   tar -xzf "$dir/$archive" -C "$target"
   test -f "$target/cookiesync"
 done
-file -b "$unpacked/cookiesync_darwin_amd64/cookiesync" | grep -Fq 'Mach-O 64-bit executable x86_64'
-file -b "$unpacked/cookiesync_darwin_arm64/cookiesync" | grep -Fq 'Mach-O 64-bit executable arm64'
+expect_macho() {
+  local description
+  description="$(file -b "$1")"
+  if [[ "$description" != *Mach-O\ 64-bit* || "$description" != *"$2"* ]]; then
+    echo "::error::$1 is not a Mach-O 64-bit $2 executable: $description" >&2
+    exit 1
+  fi
+}
+expect_macho "$unpacked/cookiesync_darwin_amd64/cookiesync" x86_64
+expect_macho "$unpacked/cookiesync_darwin_arm64/cookiesync" arm64
 bash "$scripts/verify-static-elf.sh" "$unpacked/cookiesync_linux_amd64/cookiesync" "$version"
