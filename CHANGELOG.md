@@ -6,6 +6,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.30.0] - 2026-09-30
+
 ### Added
 - **`cookiesync import` on Linux.** Pipe a Mac's
   `cookies --format playwright|webstorage -- HOST...` over ssh into the VM helper's
