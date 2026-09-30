@@ -61,12 +61,13 @@ func (d *Daemon) handleImport(ctx context.Context, params map[string]any) (any, 
 	if err != nil {
 		return nil, err
 	}
-	now := d.now()
-	rec, err := newImportRecord(hosts, parsed, now.Add(ttl))
+	rec, err := newImportRecord(hosts, parsed, d.now().Add(ttl).Round(0))
 	if err != nil {
 		return nil, err
 	}
-	d.imports.put(importKey{browser: browser, profile: profile}, rec)
+	if err := d.imports.hold(importKey{browser: browser, profile: profile}, rec); err != nil {
+		return nil, err
+	}
 	return map[string]any{
 		"protocol_version": cookie.ProtocolVersion,
 		"browser":          browser,

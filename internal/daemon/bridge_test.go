@@ -206,10 +206,11 @@ func TestBridgeOpenSeedsFromAnImport(t *testing.T) {
 	}
 
 	importTTL := time.Minute
+	importExpiresAt := time.Now().Add(importTTL)
 	d.imports.put(importKey{browser: "chrome", profile: profile}, importTestRecord([]string{"example.com"},
 		[]cookie.Cookie{{HostKey: "example.com", Name: "bridge_probe", Value: "ok", Path: "/", IsSecure: true, SameSite: 2}},
 		[]cookie.OriginStorage{{Origin: "https://example.com", LocalStorage: []cookie.WebStorageEntry{{Name: "token", Value: "abc"}}}},
-		time.Now().Add(importTTL)))
+		importExpiresAt))
 
 	ctx := context.Background()
 	res, err := dispatchSelf(t, d, "bridge_open", map[string]any{"browser": "chrome", "profile": profile, "headed": false})
@@ -233,8 +234,8 @@ func TestBridgeOpenSeedsFromAnImport(t *testing.T) {
 	if !ok {
 		t.Fatalf("session for the capability not registered")
 	}
-	if sess.expiry.After(time.Now().Add(importTTL)) {
-		t.Fatalf("session expiry %v outlives the import lease of %v", sess.expiry, importTTL)
+	if sess.expiry.After(importExpiresAt) {
+		t.Fatalf("session expiry %v outlives the import's absolute expiry %v", sess.expiry, importExpiresAt)
 	}
 	if got := open["seed"].(map[string]any)["attempted"]; got != float64(1) {
 		t.Fatalf("seed attempted = %v, want 1", got)
@@ -243,6 +244,66 @@ func TestBridgeOpenSeedsFromAnImport(t *testing.T) {
 	client := dialBridge(ctx, t, url)
 	if names := relayCookieNames(ctx, t, client); !contains(names, "bridge_probe") {
 		t.Fatalf("relay cookies = %v, want the imported bridge_probe", names)
+	}
+}
+
+// TestBridgeOpenRefusesAnImportThatExpiresDuringStartup advances the pinned clock
+// past the import's expiry between the seed and Chrome's launch: the open fails
+// naming the endpoint, the launched Chrome is torn down, and no session is left.
+func TestBridgeOpenRefusesAnImportThatExpiresDuringStartup(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping: launches a real Chrome")
+	}
+	if _, err := bridge.ResolveHostBinary(); err != nil {
+		t.Skipf("skipping: Chrome not installed: %v", err)
+	}
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	chrome, err := cookie.Lookup(cookie.BrowserName("chrome"))
+	if err != nil {
+		t.Fatalf("lookup chrome: %v", err)
+	}
+	profile := bridgeTestProfile(t, chrome)
+	fakeMesh(t, "me@laptop")
+
+	consent := &fakeConsent{key: cookie.DeriveKey(cookie.SafeStorageKey("peanuts"))}
+	st := stateWith("me@laptop", "")
+	d := New(consent, newFakeCache(), nil, staticProbe(liveSession(currentUser(t))), &recordingRunner{}, fixedState{st: st}, fixedState{st: st})
+	d.processes = testBridgeProcesses(t)
+	t.Cleanup(func() { d.closeAllBridges(context.Background()) })
+	d.seedSource = func(context.Context, cookie.Browser, string, cookie.AesKey) (cookie.StorageState, cookie.SeedCounts, error) {
+		t.Errorf("seedSource called: an open over a live import must never read the profile")
+		return cookie.StorageState{}, cookie.SeedCounts{}, errors.New("profile read forbidden")
+	}
+
+	start := time.Now()
+	clock := start
+	d.now = func() time.Time { return clock }
+	resolveChrome := d.hostBinary
+	d.hostBinary = func() (string, error) {
+		clock = start.Add(2 * time.Minute)
+		return resolveChrome()
+	}
+	d.imports.put(importKey{browser: "chrome", profile: profile}, importTestRecord([]string{"example.com"},
+		[]cookie.Cookie{{HostKey: "example.com", Name: "bridge_probe", Value: "ok", Path: "/", IsSecure: true, SameSite: 2}},
+		nil, start.Add(time.Minute)))
+
+	_, err = dispatchSelf(t, d, "bridge_open", map[string]any{"browser": "chrome", "profile": profile, "headed": false})
+	want := "import for " + endpointID("me@laptop", "chrome", profile) + " expired during bridge startup"
+	if err == nil || err.Error() != want {
+		t.Fatalf("bridge_open error = %v, want %q", err, want)
+	}
+	if got := bridgeCount(d); got != 0 {
+		t.Fatalf("sessions after the refused open = %d, want 0", got)
+	}
+	if got := consent.biometricCalls.Load(); got != 0 {
+		t.Fatalf("ObtainKeyBiometric calls = %d, want 0", got)
+	}
+	sessions, err := filepath.Glob(filepath.Join(d.processes.sessionsRoot, "*"))
+	if err != nil {
+		t.Fatalf("glob session dirs: %v", err)
+	}
+	if len(sessions) != 0 {
+		t.Fatalf("session dirs left behind by the torn-down Chrome: %v", sessions)
 	}
 }
 

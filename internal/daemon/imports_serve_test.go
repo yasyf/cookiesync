@@ -196,6 +196,7 @@ func TestImportOutOfScopeFallsThrough(t *testing.T) {
 		{"union foreign host", "get_cookies", map[string]any{"urls": []any{"example.com"}}},
 		{"union mixed", "get_cookies", map[string]any{"urls": []any{"app.example.test", "example.com"}}},
 		{"single peer-driven", "get_cookies", map[string]any{"browser": "chrome", "profile": "Default", "origin": "peer@mac", "urls": []any{"app.example.test"}}},
+		{"union peer-driven", "get_cookies", map[string]any{"origin": "peer@mac", "urls": []any{"app.example.test"}}},
 		{"single other profile", "get_cookies", map[string]any{"browser": "chrome", "profile": "Profile 1", "urls": []any{"app.example.test"}}},
 		{"storage union subdomain", "get_web_storage", map[string]any{"urls": []any{"sub.app.example.test"}}},
 		{"storage union mixed", "get_web_storage", map[string]any{"urls": []any{"app.example.test", "example.com"}}},
@@ -208,6 +209,43 @@ func TestImportOutOfScopeFallsThrough(t *testing.T) {
 			imported.d.imports.put(importServeKey, playwrightImportRecord(importT0.Add(time.Hour)))
 			control := newImportServeDaemon(t, staticProbe(SessionSnapshot{}))
 			assertFallsThrough(t, imported.dispatch(t, tt.method, tt.params), control.dispatch(t, tt.method, tt.params))
+		})
+	}
+}
+
+// TestImportHostAliasesFallThrough proves a request whose URL merely looks like a
+// named host — a fragment hiding userinfo, a neighbouring IPv6 literal — is not
+// covered, while the host the import actually names is served.
+func TestImportHostAliasesFallThrough(t *testing.T) {
+	tests := []struct {
+		name    string
+		hosts   []string
+		hostKey cookie.HostKey
+		served  []any
+		aliased []any
+	}{
+		{"fragment hiding userinfo", []string{"app.example.test"}, "app.example.test", []any{"https://app.example.test/"}, []any{"https://evil.test#@app.example.test"}},
+		{"neighbouring IPv6 literal", []string{"[2001:db8::1]"}, "[2001:db8::1]", []any{"https://[2001:db8::1]:8443/p"}, []any{"https://[2001:db8::2]"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fakeMesh(t, importTestSelf)
+			sid := cookie.Cookie{HostKey: tt.hostKey, Name: "sid", Value: "synthetic-session", Path: "/", IsSecure: true}
+			imported := newImportServeDaemon(t, staticProbe(SessionSnapshot{}))
+			imported.d.imports.put(importServeKey, importTestRecord(tt.hosts, []cookie.Cookie{sid}, nil, importT0.Add(time.Hour)))
+
+			raw, err := dispatchSelf(t, imported.d, "get_cookies", map[string]any{"urls": tt.served})
+			if err != nil {
+				t.Fatalf("get_cookies for the named host: %v", err)
+			}
+			if got := servedCookies(t, raw); !reflect.DeepEqual(got, []cookie.Cookie{sid}) {
+				t.Fatalf("cookies for the named host = %+v, want %+v", got, []cookie.Cookie{sid})
+			}
+			imported.assertUntouched(t)
+
+			control := newImportServeDaemon(t, staticProbe(SessionSnapshot{}))
+			params := map[string]any{"urls": tt.aliased}
+			assertFallsThrough(t, imported.dispatch(t, "get_cookies", params), control.dispatch(t, "get_cookies", params))
 		})
 	}
 }
@@ -333,9 +371,9 @@ func TestImportIsVMWide(t *testing.T) {
 	s.assertUntouched(t)
 }
 
-// TestBridgeSeedPrefersALiveImport drives bridgeSeed directly: a live import seeds
-// from memory with no tap and a lease capped at its remaining TTL; no import, or an
-// advertised (cross-host) open, runs the strict biometric release and the profile read.
+// TestBridgeSeedPrefersALiveImport drives bridgeSeed directly: an imported target
+// seeds from memory with no tap and a lease capped at its remaining TTL, or is refused
+// once the import lapsed; a target resolved on disk taps and reads the profile.
 func TestBridgeSeedPrefersALiveImport(t *testing.T) {
 	stale := cookie.Cookie{HostKey: "app.example.test", Name: "stale", Value: "old", Path: "/", ExpiresUTC: chromeMicrosAt(importT0.Add(-time.Second))}
 	imported := []cookie.Cookie{importCSRF, importPref, importSID, stale}
@@ -344,17 +382,20 @@ func TestBridgeSeedPrefersALiveImport(t *testing.T) {
 	tests := []struct {
 		name       string
 		expiresIn  time.Duration
-		advertise  string
+		imported   bool
 		wantState  cookie.StorageState
 		wantCounts cookie.SeedCounts
 		wantTTL    time.Duration
+		wantExpiry time.Time
+		wantErr    string
 		wantTaps   int32
 		wantReads  int32
 	}{
-		{"live import seeds without a tap", time.Minute, "", fromImport, cookie.SeedCounts{Attempted: 4, Expired: 1}, time.Minute, 0, 0},
-		{"lease caps a longer import", time.Hour, "", fromImport, cookie.SeedCounts{Attempted: 4, Expired: 1}, 10 * time.Minute, 0, 0},
-		{"no import taps and reads the profile", 0, "", fromProfile, cookie.SeedCounts{Attempted: 1}, 10 * time.Minute, 1, 1},
-		{"advertised open ignores the import", time.Minute, "host:1", fromProfile, cookie.SeedCounts{Attempted: 1}, 10 * time.Minute, 1, 1},
+		{"live import seeds without a tap", time.Minute, true, fromImport, cookie.SeedCounts{Attempted: 4, Expired: 1}, time.Minute, importT0.Add(time.Minute), "", 0, 0},
+		{"lease caps a longer import", time.Hour, true, fromImport, cookie.SeedCounts{Attempted: 4, Expired: 1}, 10 * time.Minute, importT0.Add(time.Hour), "", 0, 0},
+		{"no import taps and reads the profile", 0, false, fromProfile, cookie.SeedCounts{Attempted: 1}, 10 * time.Minute, time.Time{}, "", 1, 1},
+		{"a target resolved on disk ignores a live import", time.Minute, false, fromProfile, cookie.SeedCounts{Attempted: 1}, 10 * time.Minute, time.Time{}, "", 1, 1},
+		{"an import that lapsed after resolution is refused", 0, true, cookie.StorageState{}, cookie.SeedCounts{}, 0, time.Time{}, "import for chrome/Default expired before bridge startup", 0, 0},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -372,7 +413,16 @@ func TestBridgeSeedPrefersALiveImport(t *testing.T) {
 			if err != nil {
 				t.Fatalf("lookup chrome: %v", err)
 			}
-			state, counts, ttl, err := s.d.bridgeSeed(context.Background(), "req:a", "chrome", "Default", chrome, "", tt.advertise)
+			state, counts, ttl, expiry, err := s.d.bridgeSeed(context.Background(), "req:a", "chrome", "Default", chrome, "", tt.imported)
+			if tt.wantErr != "" {
+				if err == nil || err.Error() != tt.wantErr {
+					t.Fatalf("bridgeSeed error = %v, want %q", err, tt.wantErr)
+				}
+				if got := s.consent.biometricCalls.Load() + reads.Load(); got != 0 {
+					t.Fatalf("taps+reads after the refusal = %d, want 0", got)
+				}
+				return
+			}
 			if err != nil {
 				t.Fatalf("bridgeSeed: %v", err)
 			}
@@ -384,6 +434,9 @@ func TestBridgeSeedPrefersALiveImport(t *testing.T) {
 			}
 			if ttl != tt.wantTTL {
 				t.Fatalf("ttl = %v, want %v", ttl, tt.wantTTL)
+			}
+			if !expiry.Equal(tt.wantExpiry) {
+				t.Fatalf("import expiry = %v, want %v", expiry, tt.wantExpiry)
 			}
 			if got := s.consent.biometricCalls.Load(); got != tt.wantTaps {
 				t.Fatalf("ObtainKeyBiometric calls = %d, want %d", got, tt.wantTaps)

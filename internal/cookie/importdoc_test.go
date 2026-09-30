@@ -121,6 +121,28 @@ func TestParseRenderedMapsEveryField(t *testing.T) {
 	}
 }
 
+func TestParseRenderedExpiryAtTheChromeCeiling(t *testing.T) {
+	tests := []struct {
+		name    string
+		expires string
+		want    ChromeMicros
+	}{
+		{name: "the rendered ceiling parses back", expires: "9211727563254.0", want: 9223372036854000000},
+		{name: "half a second past the rendered ceiling still fits", expires: "9211727563254.5", want: 9223372036854500000},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := ParseRendered([]byte(playwrightWith(renderedCookieJSON(tt.expires, "true", `"Lax"`))), FormatPlaywright)
+			if err != nil {
+				t.Fatalf("ParseRendered: %v", err)
+			}
+			if len(got.Cookies) != 1 || got.Cookies[0].ExpiresUTC != tt.want {
+				t.Fatalf("ParseRendered cookies = %+v, want one cookie expiring at %d", got.Cookies, tt.want)
+			}
+		})
+	}
+}
+
 func TestParseRenderedRefuses(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -180,7 +202,7 @@ func TestParseRenderedRefuses(t *testing.T) {
 			name:   "lowercase sameSite",
 			doc:    playwrightWith(renderedCookieJSON("-1", "true", `"none"`)),
 			format: FormatPlaywright,
-			want:   `parse playwright document: cookies[0] sameSite "none" is not None, Lax, or Strict`,
+			want:   `parse playwright document: cookies[0] sameSite is not None, Lax, or Strict`,
 		},
 		{
 			name:   "sameSite None without secure",
@@ -192,37 +214,55 @@ func TestParseRenderedRefuses(t *testing.T) {
 			name:   "zero expiry",
 			doc:    playwrightWith(renderedCookieJSON("0", "true", `"Lax"`)),
 			format: FormatPlaywright,
-			want:   `parse playwright document: cookies[0] expires 0 is neither -1 nor a positive Unix time`,
+			want:   `parse playwright document: cookies[0] expires is neither -1 nor a positive Unix time`,
 		},
 		{
 			name:   "negative expiry other than -1",
 			doc:    playwrightWith(renderedCookieJSON("-2", "true", `"Lax"`)),
 			format: FormatPlaywright,
-			want:   `parse playwright document: cookies[0] expires -2 is neither -1 nor a positive Unix time`,
+			want:   `parse playwright document: cookies[0] expires is neither -1 nor a positive Unix time`,
 		},
 		{
 			name:   "quoted -1 expiry",
 			doc:    playwrightWith(renderedCookieJSON(`"-1"`, "true", `"Lax"`)),
 			format: FormatPlaywright,
-			want:   `parse playwright document: cookies[0] expires "-1" is neither -1 nor a positive Unix time`,
+			want:   `parse playwright document: cookies[0] expires is neither -1 nor a positive Unix time`,
 		},
 		{
 			name:   "null expiry",
 			doc:    playwrightWith(renderedCookieJSON("null", "true", `"Lax"`)),
 			format: FormatPlaywright,
-			want:   `parse playwright document: cookies[0] expires null is neither -1 nor a positive Unix time`,
+			want:   `parse playwright document: cookies[0] expires is neither -1 nor a positive Unix time`,
 		},
 		{
 			name:   "-1.0 session expiry on the second cookie",
 			doc:    playwrightWith(renderedCookieJSON("-1", "true", `"Lax"`) + ", " + renderedCookieJSON("-1.0", "true", `"Lax"`)),
 			format: FormatPlaywright,
-			want:   `parse playwright document: cookies[1] expires -1.0 is neither -1 nor a positive Unix time`,
+			want:   `parse playwright document: cookies[1] expires is neither -1 nor a positive Unix time`,
 		},
 		{
 			name:   "expiry past the Chrome timestamp range",
 			doc:    playwrightWith(renderedCookieJSON("1e13", "true", `"Lax"`)),
 			format: FormatPlaywright,
-			want:   `parse playwright document: cookies[0] expires 1e13 is neither -1 nor a positive Unix time`,
+			want:   `parse playwright document: cookies[0] expires is neither -1 nor a positive Unix time`,
+		},
+		{
+			name:   "expiry just past the Chrome ceiling",
+			doc:    playwrightWith(renderedCookieJSON("9211727563254.78", "true", `"Lax"`)),
+			format: FormatPlaywright,
+			want:   `parse playwright document: cookies[0] expires is neither -1 nor a positive Unix time`,
+		},
+		{
+			name:   "expiry carrying an object never echoes it",
+			doc:    playwrightWith(renderedCookieJSON(`{"value": "SECRET"}`, "true", `"Lax"`)),
+			format: FormatPlaywright,
+			want:   `parse playwright document: cookies[0] expires is neither -1 nor a positive Unix time`,
+		},
+		{
+			name:   "cookie path not rooted at /",
+			doc:    playwrightWith(`{"name": "sid", "value": "synthetic-session", "domain": "app.example.test", "path": "@evil.com/", "expires": -1, "httpOnly": true, "secure": true, "sameSite": "Lax"}`),
+			format: FormatPlaywright,
+			want:   `parse playwright document: cookies[0] path must start with /`,
 		},
 		{
 			name:   "cookie without path",

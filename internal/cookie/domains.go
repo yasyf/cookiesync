@@ -9,16 +9,23 @@ import "strings"
 // target host.
 
 // NormalizeHost returns the bare, lowercase host of a URL or domain, stripping the
-// scheme, path, query, port, userinfo, and any leading dot.
+// scheme, path, query, fragment, userinfo, port, and any leading dot; a bracketed
+// IPv6 literal keeps its brackets.
 func NormalizeHost(url string) Host {
 	v := strings.ToLower(strings.TrimSpace(url))
-	if i := strings.Index(v, "://"); i >= 0 {
-		v = v[i+len("://"):]
+	if scheme, rest, found := strings.Cut(v, "://"); found && !strings.ContainsAny(scheme, "/?#@") {
+		v = rest
 	}
-	v, _, _ = strings.Cut(v, "/")
-	v, _, _ = strings.Cut(v, "?")
-	if _, after, found := strings.Cut(v, "@"); found {
-		v = after
+	if i := strings.IndexAny(v, "/\\?#"); i >= 0 {
+		v = v[:i]
+	}
+	if i := strings.LastIndex(v, "@"); i >= 0 {
+		v = v[i+1:]
+	}
+	if strings.HasPrefix(v, "[") {
+		if end := strings.Index(v, "]"); end >= 0 {
+			return Host(v[:end+1])
+		}
 	}
 	v, _, _ = strings.Cut(v, ":")
 	return Host(strings.Trim(v, "."))

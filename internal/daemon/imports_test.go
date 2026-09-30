@@ -4,6 +4,7 @@ import (
 	"maps"
 	"reflect"
 	"slices"
+	"strconv"
 	"testing"
 	"time"
 
@@ -65,10 +66,24 @@ func TestNewImportRecordNeverWidens(t *testing.T) {
 			"import refused: origin https://evil.test is not a named host",
 		},
 		{
-			"a named host is normalized to its bare lowercase form",
-			[]string{"https://App.Example.Test/x"},
+			"a named origin is normalized to its bare lowercase host",
+			[]string{"https://App.Example.Test/"},
 			cookie.StorageState{},
 			[]string{"app.example.test"},
+			"",
+		},
+		{
+			"a named origin with a port is scoped by its host",
+			[]string{"https://app.example.test:8443"},
+			cookie.StorageState{},
+			[]string{"app.example.test"},
+			"",
+		},
+		{
+			"a named IPv6 literal keeps its brackets",
+			[]string{"https://[2001:DB8::1]:8443"},
+			cookie.StorageState{Cookies: []cookie.Cookie{{HostKey: "[2001:db8::1]", Name: "v6", Value: "x", Path: "/"}}},
+			[]string{"[2001:db8::1]"},
 			"",
 		},
 		{
@@ -76,7 +91,77 @@ func TestNewImportRecordNeverWidens(t *testing.T) {
 			[]string{"https://"},
 			cookie.StorageState{},
 			nil,
-			`import host "https://" names no host`,
+			`import host "https://" must be a bare host or an origin`,
+		},
+		{
+			"a named host with a path refuses the import",
+			[]string{"https://app.example.test/x"},
+			cookie.StorageState{},
+			nil,
+			`import host "https://app.example.test/x" must be a bare host or an origin`,
+		},
+		{
+			"a named host with userinfo refuses the import",
+			[]string{"https://alice@app.example.test"},
+			cookie.StorageState{},
+			nil,
+			`import host "https://alice@app.example.test" must be a bare host or an origin`,
+		},
+		{
+			"a named host with a query refuses the import",
+			[]string{"app.example.test?x=1"},
+			cookie.StorageState{},
+			nil,
+			`import host "app.example.test?x=1" must be a bare host or an origin`,
+		},
+		{
+			"a named host hiding a fragment alias refuses the import",
+			[]string{"https://evil.test#@app.example.test"},
+			cookie.StorageState{},
+			nil,
+			`import host "https://evil.test#@app.example.test" must be a bare host or an origin`,
+		},
+		{
+			"a named host hiding a backslash alias refuses the import",
+			[]string{`https://evil.com\@app.example.test`},
+			cookie.StorageState{},
+			nil,
+			`import host "https://evil.com\\@app.example.test" must be a bare host or an origin`,
+		},
+		{
+			"a named host with an unclosed IPv6 literal refuses the import",
+			[]string{"[2001:db8::1"},
+			cookie.StorageState{},
+			nil,
+			`import host "[2001:db8::1" must be a bare host or an origin`,
+		},
+		{
+			"an origin with a path refuses the import",
+			[]string{"app.example.test"},
+			cookie.StorageState{Origins: []cookie.OriginStorage{{Origin: "https://app.example.test/x", LocalStorage: theme}}},
+			nil,
+			"import refused: origin https://app.example.test/x is not a bare origin",
+		},
+		{
+			"an origin hiding a fragment alias refuses the import",
+			[]string{"app.example.test"},
+			cookie.StorageState{Origins: []cookie.OriginStorage{{Origin: "https://evil.test#@app.example.test", LocalStorage: theme}}},
+			nil,
+			"import refused: origin https://evil.test#@app.example.test is not a bare origin",
+		},
+		{
+			"an origin with userinfo refuses the import",
+			[]string{"app.example.test"},
+			cookie.StorageState{Origins: []cookie.OriginStorage{{Origin: "https://alice@app.example.test", LocalStorage: theme}}},
+			nil,
+			"import refused: origin https://alice@app.example.test is not a bare origin",
+		},
+		{
+			"an origin for another IPv6 literal refuses the import",
+			[]string{"[2001:db8::1]"},
+			cookie.StorageState{Origins: []cookie.OriginStorage{{Origin: "https://[2001:db8::2]", LocalStorage: theme}}},
+			nil,
+			"import refused: origin https://[2001:db8::2] is not a named host",
 		},
 	}
 	for _, tc := range tests {
@@ -118,6 +203,7 @@ func TestImportTTL(t *testing.T) {
 		{"25h", 0, "import ttl 25h is outside 1s..24h"},
 		{"1500ms", 0, `import ttl: invalid duration "1500ms": strconv.Atoi: parsing "1500m": invalid syntax`},
 		{"1d", 0, `import ttl: invalid duration unit in "1d" (want h, m, or s)`},
+		{"18446744075s", 0, `import ttl: invalid duration "18446744075s": overflows time.Duration`},
 	}
 	for _, tc := range tests {
 		t.Run(tc.text, func(t *testing.T) {
@@ -186,5 +272,45 @@ func TestImportStoreExpiryAndReplacement(t *testing.T) {
 	}
 	if _, present := store.records[arcKey]; present {
 		t.Fatalf("liveAll kept the expired record for %+v", arcKey)
+	}
+}
+
+func TestImportStoreHoldsAtMostSixteenRecords(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	key := func(i int) importKey { return importKey{browser: "chrome", profile: "Profile " + strconv.Itoa(i)} }
+	live := importRecord{hosts: map[cookie.Host]bool{"app.example.test": true}, expiresAt: now.Add(time.Hour)}
+	replacement := importRecord{hosts: map[cookie.Host]bool{"www.other.test": true}, expiresAt: now.Add(2 * time.Hour)}
+	const wantErr = "import refused: 16 records already held"
+	store := newImportStore()
+
+	for i := range importMaxRecords {
+		if err := store.hold(key(i), live); err != nil {
+			t.Fatalf("hold record %d: %v", i, err)
+		}
+	}
+	if err := store.hold(key(importMaxRecords), live); err == nil || err.Error() != wantErr {
+		t.Fatalf("hold of a 17th record error = %v, want %q", err, wantErr)
+	}
+	if _, present := store.records[key(importMaxRecords)]; present || len(store.records) != importMaxRecords {
+		t.Fatalf("store after the refusal holds %d records including the 17th = %v, want the 16 already held", len(store.records), present)
+	}
+
+	if err := store.hold(key(0), replacement); err != nil {
+		t.Fatalf("replacing a held key at the cap: %v", err)
+	}
+	if got := store.records[key(0)]; !reflect.DeepEqual(got, replacement) {
+		t.Fatalf("record after replacement = %+v, want %+v", got, replacement)
+	}
+
+	store.put(key(1), importRecord{hosts: map[cookie.Host]bool{"stale.test": true}, expiresAt: now})
+	if err := store.hold(key(importMaxRecords), live); err == nil || err.Error() != wantErr {
+		t.Fatalf("hold past an expired but unpurged record error = %v, want %q", err, wantErr)
+	}
+	store.purge(now)
+	if err := store.hold(key(importMaxRecords), live); err != nil {
+		t.Fatalf("hold after purge freed a slot: %v", err)
+	}
+	if len(store.records) != importMaxRecords {
+		t.Fatalf("store after the purge and hold holds %d records, want %d", len(store.records), importMaxRecords)
 	}
 }

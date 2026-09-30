@@ -3,7 +3,9 @@ package daemon
 import (
 	"cmp"
 	"fmt"
+	"net/url"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -12,8 +14,9 @@ import (
 )
 
 const (
-	importMinTTL = time.Second
-	importMaxTTL = 24 * time.Hour
+	importMinTTL     = time.Second
+	importMaxTTL     = 24 * time.Hour
+	importMaxRecords = 16
 )
 
 type importKey struct {
@@ -46,6 +49,16 @@ func (s *importStore) put(key importKey, rec importRecord) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.records[key] = rec
+}
+
+func (s *importStore) hold(key importKey, rec importRecord) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, replacing := s.records[key]; !replacing && len(s.records) >= importMaxRecords {
+		return fmt.Errorf("import refused: %d records already held", importMaxRecords)
+	}
+	s.records[key] = rec
+	return nil
 }
 
 func (s *importStore) live(key importKey, now time.Time) (importRecord, bool) {
@@ -100,11 +113,10 @@ func newImportStore() *importStore {
 func newImportRecord(hosts []string, parsed cookie.StorageState, expiresAt time.Time) (importRecord, error) {
 	named := make(map[cookie.Host]bool, len(hosts))
 	for _, raw := range hosts {
-		host := cookie.NormalizeHost(raw)
-		if host == "" {
-			return importRecord{}, fmt.Errorf("import host %q names no host", raw)
+		if !bareOrigin(raw) {
+			return importRecord{}, fmt.Errorf("import host %q must be a bare host or an origin", raw)
 		}
-		named[host] = true
+		named[cookie.NormalizeHost(raw)] = true
 	}
 	for _, c := range parsed.Cookies {
 		if !sentToNamedHost(c.HostKey, named) {
@@ -112,11 +124,26 @@ func newImportRecord(hosts []string, parsed cookie.StorageState, expiresAt time.
 		}
 	}
 	for _, o := range parsed.Origins {
+		if !bareOrigin(o.Origin) {
+			return importRecord{}, fmt.Errorf("import refused: origin %s is not a bare origin", o.Origin)
+		}
 		if !named[cookie.NormalizeHost(o.Origin)] {
 			return importRecord{}, fmt.Errorf("import refused: origin %s is not a named host", o.Origin)
 		}
 	}
 	return importRecord{hosts: named, cookies: parsed.Cookies, origins: parsed.Origins, expiresAt: expiresAt}, nil
+}
+
+func bareOrigin(raw string) bool {
+	text := strings.TrimSpace(raw)
+	if !strings.Contains(text, "://") {
+		text = "https://" + text
+	}
+	u, err := url.Parse(text)
+	if err != nil || strings.ContainsAny(text, `\?#`) {
+		return false
+	}
+	return u.User == nil && (u.Path == "" || u.Path == "/") && u.Hostname() != ""
 }
 
 func sentToNamedHost(hostKey cookie.HostKey, named map[cookie.Host]bool) bool {

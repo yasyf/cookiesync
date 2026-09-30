@@ -45,6 +45,10 @@ func unixSecondsToChromeMicros(seconds float64) ChromeMicros {
 }
 
 func chromeMicrosFromUnix(seconds float64) ChromeMicros {
+	return ChromeMicros(roundedChromeMicros(seconds).Int64())
+}
+
+func roundedChromeMicros(seconds float64) *big.Int {
 	exact := new(big.Rat).SetFloat64(seconds)
 	exact.Add(exact, new(big.Rat).SetInt64(windowsEpochOffset))
 	exact.Mul(exact, new(big.Rat).SetInt64(1_000_000))
@@ -52,7 +56,7 @@ func chromeMicrosFromUnix(seconds float64) ChromeMicros {
 	if half := rem.Lsh(rem, 1).Cmp(exact.Denom()); half > 0 || (half == 0 && micros.Bit(0) == 1) {
 		micros.Add(micros, big.NewInt(1))
 	}
-	return ChromeMicros(micros.Int64())
+	return micros
 }
 
 // chromeMicrosToUnix converts a Chrome timestamp to Unix seconds. A non-positive

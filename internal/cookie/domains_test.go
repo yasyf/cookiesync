@@ -16,6 +16,14 @@ func TestNormalizeHost(t *testing.T) {
 		{"strip-leading-dot", ".x.com", "x.com"},
 		{"trim-and-lowercase", "  HTTPS://X.COM/  ", "x.com"},
 		{"subdomain-kept", "sub.x.com", "sub.x.com"},
+		{"fragment-cut-before-userinfo", "https://evil.test#@app.example.test", "evil.test"},
+		{"fragment-scheme-is-not-a-scheme", "evil.test#@https://app.example.test", "evil.test"},
+		{"backslash-cut-before-userinfo", `https://evil.com\@example.test`, "evil.com"},
+		{"userinfo-with-path", "https://user:pw@app.example.test/x", "app.example.test"},
+		{"ipv6-keeps-brackets-drops-port", "https://[2001:db8::1]:8443/p", "[2001:db8::1]"},
+		{"ipv6-lowercased", "[2001:DB8::2]", "[2001:db8::2]"},
+		{"bare-host-port", "app.example.test:443", "app.example.test"},
+		{"query-and-fragment", "https://app.example.test?x=1#f", "app.example.test"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

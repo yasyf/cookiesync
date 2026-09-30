@@ -372,8 +372,10 @@ func (d *Daemon) handleGetCookies(ctx context.Context, params map[string]any) (a
 		if err != nil {
 			return nil, err
 		}
-		if reply, ok := d.importedCookiesUnion(urls); ok {
-			return reply, nil
+		if optionalString(params, "origin", "") == "" {
+			if reply, ok := d.importedCookiesUnion(urls); ok {
+				return reply, nil
+			}
 		}
 		return d.getCookiesAll(ctx, requestor, urls)
 	}

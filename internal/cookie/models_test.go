@@ -42,6 +42,7 @@ func TestChromeMicrosFromUnixInvertsTheRenderedSeconds(t *testing.T) {
 		{name: "one microsecond past a second", micros: 13400000000000001, wantMicros: 13400000000000002},
 		{name: "one microsecond short of a second", micros: 13400000000999999, wantMicros: 13400000000999998},
 		{name: "just below 2^34 seconds since 1601", micros: 17179869183999999, wantMicros: 17179869183999998},
+		{name: "the rendered ceiling", micros: 9223372036854000000, wantMicros: 9223372036854000000},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

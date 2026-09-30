@@ -4,11 +4,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"math"
 	"strconv"
+	"strings"
 )
-
-const maxRenderedExpiry = math.MaxInt64/1_000_000 - windowsEpochOffset
 
 var samesitePlaywright = map[string]int{"None": 0, "Lax": 1, "Strict": 2}
 
@@ -66,16 +64,19 @@ func (c renderedCookie) model(index int) (Cookie, error) {
 	); ok {
 		return Cookie{}, fmt.Errorf("cookies[%d] missing %q", index, key)
 	}
+	if !strings.HasPrefix(*c.Path, "/") {
+		return Cookie{}, fmt.Errorf("cookies[%d] path must start with /", index)
+	}
 	sameSite, ok := samesitePlaywright[*c.SameSite]
 	if !ok {
-		return Cookie{}, fmt.Errorf("cookies[%d] sameSite %q is not None, Lax, or Strict", index, *c.SameSite)
+		return Cookie{}, fmt.Errorf("cookies[%d] sameSite is not None, Lax, or Strict", index)
 	}
 	if sameSite == 0 && !*c.Secure {
 		return Cookie{}, fmt.Errorf("cookies[%d] is sameSite None without secure", index)
 	}
 	expires, ok := renderedExpiry(c.Expires)
 	if !ok {
-		return Cookie{}, fmt.Errorf("cookies[%d] expires %s is neither -1 nor a positive Unix time", index, c.Expires)
+		return Cookie{}, fmt.Errorf("cookies[%d] expires is neither -1 nor a positive Unix time", index)
 	}
 	return Cookie{
 		HostKey:    HostKey(*c.Domain),
@@ -215,10 +216,14 @@ func renderedExpiry(raw json.RawMessage) (ChromeMicros, bool) {
 		return 0, true
 	}
 	seconds, err := strconv.ParseFloat(string(raw), 64)
-	if err != nil || seconds <= 0 || seconds >= maxRenderedExpiry {
+	if err != nil || seconds <= 0 {
 		return 0, false
 	}
-	return chromeMicrosFromUnix(seconds), true
+	micros := roundedChromeMicros(seconds)
+	if !micros.IsInt64() {
+		return 0, false
+	}
+	return ChromeMicros(micros.Int64()), true
 }
 
 func firstMissing(fields ...presence) (string, bool) {

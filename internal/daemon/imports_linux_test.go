@@ -116,6 +116,37 @@ func TestImportRPCStoresTheDocument(t *testing.T) {
 	assertImportTouchedNothing(t, consent, cache)
 }
 
+func TestImportRPCStoresAWallClockExpiry(t *testing.T) {
+	now := time.Now()
+	d, _, _ := importDaemon(t, now)
+	if _, err := dispatchSelf(t, d, "import", importParams(readImportFixture(t))); err != nil {
+		t.Fatalf("import: %v", err)
+	}
+	if got, want := d.imports.records[importDefaultKey].expiresAt, now.Add(2*time.Minute).Round(0); got != want {
+		t.Fatalf("expiresAt = %v, want the wall-clock %v", got, want)
+	}
+}
+
+func TestImportRPCRefusesASeventeenthRecord(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	d, consent, cache := importDaemon(t, now)
+	held := map[importKey]importRecord{}
+	for i := range importMaxRecords {
+		key := importKey{browser: "chrome", profile: "Profile " + strconv.Itoa(i)}
+		held[key] = previousImportRecord(t, now)
+		d.imports.put(key, held[key])
+	}
+
+	_, err := dispatchSelf(t, d, "import", importParams(readImportFixture(t)))
+	if want := "import refused: 16 records already held"; err == nil || err.Error() != want {
+		t.Fatalf("import error = %v, want %q", err, want)
+	}
+	if !reflect.DeepEqual(d.imports.records, held) {
+		t.Fatalf("store after the refusal = %+v, want only the 16 records already held", d.imports.records)
+	}
+	assertImportTouchedNothing(t, consent, cache)
+}
+
 func TestImportRPCRefusesAndKeepsThePreviousRecord(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0)
 	fixture := readImportFixture(t)

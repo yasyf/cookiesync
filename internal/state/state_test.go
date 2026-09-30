@@ -277,6 +277,36 @@ func TestSettingsDurationRoundTrip(t *testing.T) {
 	}
 }
 
+func TestParseDurationRefusesOverflow(t *testing.T) {
+	cases := []struct {
+		text    string
+		dur     time.Duration
+		wantErr string
+	}{
+		{"9223372036s", 9223372036 * time.Second, ""},
+		{"-9223372036s", -9223372036 * time.Second, ""},
+		{"9223372037s", 0, `invalid duration "9223372037s": overflows time.Duration`},
+		{"-9223372037s", 0, `invalid duration "-9223372037s": overflows time.Duration`},
+		{"18446744075s", 0, `invalid duration "18446744075s": overflows time.Duration`},
+		{"153722868m", 0, `invalid duration "153722868m": overflows time.Duration`},
+		{"2562048h", 0, `invalid duration "2562048h": overflows time.Duration`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.text, func(t *testing.T) {
+			got, err := ParseDuration(tc.text)
+			if tc.wantErr != "" {
+				if err == nil || err.Error() != tc.wantErr {
+					t.Fatalf("ParseDuration(%q) error = %v, want %q", tc.text, err, tc.wantErr)
+				}
+				return
+			}
+			if err != nil || got != tc.dur {
+				t.Fatalf("ParseDuration(%q) = %v, %v, want %v", tc.text, got, err, tc.dur)
+			}
+		})
+	}
+}
+
 // TestDefaultSettingsSerialize proves the default settings persist as the Go-style
 // duration strings the Python on-disk form uses.
 func TestDefaultSettingsSerialize(t *testing.T) {
