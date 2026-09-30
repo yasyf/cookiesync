@@ -4,7 +4,7 @@ package bridge
 
 type handlerTracker struct{}
 
-func crashpadEnvironment(string, string) []string { return nil }
+func withCrashpadEnvironment(base []string, _, _ string) []string { return base }
 
 func trackHandlers(string, string) *handlerTracker { return &handlerTracker{} }
 

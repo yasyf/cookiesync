@@ -32,9 +32,12 @@ func crashpadEnvironment(dataDir, nonce string) []string {
 	return []string{"BREAKPAD_DUMP_LOCATION=" + crashpadDatabase(dataDir), launchEnv + "=" + nonce}
 }
 
+func withCrashpadEnvironment(base []string, dataDir, nonce string) []string {
+	return append(slices.DeleteFunc(base, carriesLaunch), crashpadEnvironment(dataDir, nonce)...)
+}
+
 type handlerRecord struct {
 	procStat
-	pid     int
 	cmdline []string
 	exe     string
 }
@@ -43,14 +46,69 @@ func (r handlerRecord) String() string {
 	return fmt.Sprintf("ppid %d pgid %d sid %d start %d exe %q argv %q", r.ppid, r.pgid, r.sid, r.start, r.exe, r.cmdline)
 }
 
+type pin struct {
+	pid   int
+	pidfd int
+}
+
+func pinCandidate(pid int) (pin, error) {
+	pidfd, err := unix.PidfdOpen(pid, 0)
+	if err != nil {
+		return pin{}, fmt.Errorf("bridge: pin crashpad candidate %d: %w", pid, err)
+	}
+	return pin{pid: pid, pidfd: pidfd}, nil
+}
+
+func (p pin) alive() (bool, error) {
+	fds := []unix.PollFd{exitPoll(p.pidfd)}
+	for {
+		_, err := unix.Poll(fds, 0)
+		if errors.Is(err, unix.EINTR) {
+			continue
+		}
+		if err != nil {
+			return false, fmt.Errorf("bridge: poll crashpad candidate %d: %w", p.pid, err)
+		}
+		return fds[0].Revents&unix.POLLIN == 0, nil
+	}
+}
+
+func (p pin) release() error {
+	return unix.Close(p.pidfd)
+}
+
 type ownedHandler struct {
 	handlerRecord
-	pidfd int
+	pin
 }
 
 type preservedCandidate struct {
 	handlerRecord
 	reason error
+}
+
+func (c preservedCandidate) present(pid int) (bool, error) {
+	candidate, err := pinCandidate(pid)
+	if errors.Is(err, unix.ESRCH) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = candidate.release() }()
+	stat, readErr := os.ReadFile(procPath(pid, "stat"))
+	alive, err := candidate.alive()
+	if err != nil || !alive {
+		return false, err
+	}
+	if readErr != nil {
+		return false, readErr
+	}
+	identity, err := parseProcStat(stat)
+	if err != nil {
+		return false, err
+	}
+	return identity.start == c.start, nil
 }
 
 type handlerTracker struct {
@@ -102,6 +160,7 @@ func (t *handlerTracker) discover() {
 }
 
 func (t *handlerTracker) adopt() {
+	t.expire()
 	entries, err := os.ReadDir("/proc")
 	if err != nil {
 		t.record(fmt.Errorf("bridge: list /proc: %w", err))
@@ -113,9 +172,30 @@ func (t *handlerTracker) adopt() {
 		if err != nil || t.owns(pid) || !t.serves(pid) {
 			continue
 		}
-		record, err := t.pin(pid)
-		if err != nil && t.serves(pid) {
-			preserved[pid] = preservedCandidate{handlerRecord: record, reason: err}
+		candidate, err := pinCandidate(pid)
+		if errors.Is(err, unix.ESRCH) {
+			continue
+		}
+		if err != nil {
+			t.record(err)
+			continue
+		}
+		record, verdict := t.examine(candidate)
+		alive, err := candidate.alive()
+		if err != nil {
+			t.record(err)
+		}
+		if !alive {
+			_ = candidate.release()
+			continue
+		}
+		if verdict == nil {
+			t.own(ownedHandler{handlerRecord: record, pin: candidate})
+			continue
+		}
+		_ = candidate.release()
+		if servesCrashpadDatabase(record.cmdline, t.database) {
+			preserved[pid] = preservedCandidate{handlerRecord: record, reason: verdict}
 		}
 	}
 	t.mu.Lock()
@@ -123,30 +203,31 @@ func (t *handlerTracker) adopt() {
 	t.preserved = preserved
 }
 
-func (t *handlerTracker) pin(pid int) (handlerRecord, error) {
-	pidfd, err := unix.PidfdOpen(pid, 0)
-	if err != nil {
-		return handlerRecord{pid: pid}, fmt.Errorf("pin: %w", err)
-	}
-	record, err := t.examine(pid)
-	if err != nil {
-		_ = unix.Close(pidfd)
-		return record, err
-	}
+func (t *handlerTracker) expire() {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	t.owned[pid] = ownedHandler{handlerRecord: record, pidfd: pidfd}
-	return record, nil
+	for pid, h := range t.owned {
+		alive, err := h.alive()
+		if err != nil {
+			t.err = errors.Join(t.err, err)
+			continue
+		}
+		if alive {
+			continue
+		}
+		delete(t.owned, pid)
+		t.err = errors.Join(t.err, h.release())
+	}
 }
 
-func (t *handlerTracker) examine(pid int) (handlerRecord, error) {
-	record := handlerRecord{pid: pid}
-	argv, err := readCmdline(pid)
+func (t *handlerTracker) examine(candidate pin) (handlerRecord, error) {
+	var record handlerRecord
+	argv, err := readCmdline(candidate.pid)
 	if err != nil {
 		return record, err
 	}
 	record.cmdline = argv
-	stat, err := os.ReadFile(procPath(pid, "stat"))
+	stat, err := os.ReadFile(procPath(candidate.pid, "stat"))
 	if err != nil {
 		return record, err
 	}
@@ -155,12 +236,12 @@ func (t *handlerTracker) examine(pid int) (handlerRecord, error) {
 		return record, err
 	}
 	record.procStat = identity
-	exe, err := os.Readlink(procPath(pid, "exe"))
+	exe, err := os.Readlink(procPath(candidate.pid, "exe"))
 	if err != nil {
 		return record, err
 	}
 	record.exe = exe
-	environ, err := os.ReadFile(procPath(pid, "environ"))
+	environ, err := os.ReadFile(procPath(candidate.pid, "environ"))
 	if err != nil {
 		return record, err
 	}
@@ -185,6 +266,12 @@ func (t *handlerTracker) owns(pid int) bool {
 	return ok
 }
 
+func (t *handlerTracker) own(h ownedHandler) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.owned[h.pid] = h
+}
+
 func (t *handlerTracker) record(err error) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -207,12 +294,21 @@ func (t *handlerTracker) close() error {
 	handlers := slices.SortedFunc(maps.Values(t.owned), func(a, b ownedHandler) int { return cmp.Compare(a.pid, b.pid) })
 	err := errors.Join(t.err, reap(handlers, t.exitTimeout, t.termGrace, t.killGrace))
 	for _, h := range handlers {
-		err = errors.Join(err, unix.Close(h.pidfd))
+		err = errors.Join(err, h.release())
 	}
-	for _, pid := range slices.Sorted(maps.Keys(t.preserved)) {
-		candidate := t.preserved[pid]
-		err = errors.Join(err, fmt.Errorf("bridge: refused to reap crashpad candidate %d serving %s%s (%s): %w",
-			pid, crashpadDatabaseArg, t.database, candidate.handlerRecord, candidate.reason))
+	return errors.Join(err, refusals(t.preserved, t.database))
+}
+
+func refusals(preserved map[int]preservedCandidate, database string) error {
+	var err error
+	for _, pid := range slices.Sorted(maps.Keys(preserved)) {
+		candidate := preserved[pid]
+		present, presentErr := candidate.present(pid)
+		if presentErr == nil && !present {
+			continue
+		}
+		err = errors.Join(err, presentErr, fmt.Errorf("bridge: refused to reap crashpad candidate %d serving %s%s (%s): %w",
+			pid, crashpadDatabaseArg, database, candidate.handlerRecord, candidate.reason))
 	}
 	return err
 }
@@ -227,6 +323,10 @@ func readCmdline(pid int) ([]string, error) {
 
 func procPath(pid int, file string) string {
 	return "/proc/" + strconv.Itoa(pid) + "/" + file
+}
+
+func exitPoll(pidfd int) unix.PollFd {
+	return unix.PollFd{Fd: int32(pidfd), Events: unix.POLLIN} //nolint:gosec // G115: a pidfd is a descriptor, which the kernel bounds to int32.
 }
 
 func reap(handlers []ownedHandler, exitTimeout, termGrace, killGrace time.Duration) error {
@@ -268,7 +368,7 @@ func awaitExit(handlers []ownedHandler, timeout time.Duration) ([]ownedHandler, 
 		}
 		fds := make([]unix.PollFd, len(pending))
 		for i, h := range pending {
-			fds[i] = unix.PollFd{Fd: int32(h.pidfd), Events: unix.POLLIN} //nolint:gosec // G115: a pidfd is a descriptor, which the kernel bounds to int32.
+			fds[i] = exitPoll(h.pidfd)
 		}
 		n, err := unix.Poll(fds, int(remaining.Milliseconds()))
 		if errors.Is(err, unix.EINTR) {

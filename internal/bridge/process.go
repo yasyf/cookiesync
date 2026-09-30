@@ -42,9 +42,9 @@ func bridgeEnvironment() []string {
 
 func chromeEnvironment(dataDir string, headed bool, nonce string) []string {
 	if headed {
-		return append(allowedEnvironment(chromeDisplayEnv), crashpadEnvironment(dataDir, nonce)...)
+		return withCrashpadEnvironment(allowedEnvironment(chromeDisplayEnv), dataDir, nonce)
 	}
-	return append(bridgeEnvironment(), crashpadEnvironment(dataDir, nonce)...)
+	return withCrashpadEnvironment(bridgeEnvironment(), dataDir, nonce)
 }
 
 func allowedEnvironment(extra []string) []string {

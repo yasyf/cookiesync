@@ -48,12 +48,16 @@ func servesCrashpadDatabase(argv []string, database string) bool {
 	return len(argv) > 1 && slices.Contains(argv[1:], crashpadDatabaseArg+database)
 }
 
+func carriesLaunch(entry string) bool {
+	return strings.HasPrefix(entry, launchEnv+"=")
+}
+
 func verifyLaunchEvidence(environ []byte, nonce string) error {
 	entries := splitNUL(environ)
 	if slices.Contains(entries, launchEnv+"="+nonce) {
 		return nil
 	}
-	if slices.ContainsFunc(entries, func(entry string) bool { return strings.HasPrefix(entry, launchEnv+"=") }) {
+	if slices.ContainsFunc(entries, carriesLaunch) {
 		return errors.New("its environment carries another launch's " + launchEnv)
 	}
 	return errors.New("its environment carries no " + launchEnv)
