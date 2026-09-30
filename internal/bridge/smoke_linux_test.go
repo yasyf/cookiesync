@@ -97,7 +97,7 @@ func TestSmokeRealChromeSeedsReadsBackAndLeavesNoProcess(t *testing.T) {
 	}
 	tracked := proc.handlers.tracked()
 	if len(tracked) == 0 {
-		t.Errorf("no crashpad handler tracked; chrome did not put %s into a handler's --database", crashpadDatabase(proc.dataDir))
+		t.Errorf("no crashpad handler tracked; chrome did not put %s into a handler's --database, or its handler did not inherit %s", crashpadDatabase(proc.dataDir), launchEnv)
 	}
 	for _, p := range running {
 		if p.sid != chromePID && !slices.Contains(tracked, p.pid) {
@@ -107,6 +107,13 @@ func TestSmokeRealChromeSeedsReadsBackAndLeavesNoProcess(t *testing.T) {
 	for _, pid := range tracked {
 		if !containsPID(running, pid) {
 			t.Errorf("tracked crashpad handler %d is not one of this chrome's processes %+v", pid, running)
+		}
+		environ, err := os.ReadFile(fmt.Sprintf("/proc/%d/environ", pid))
+		if err != nil {
+			t.Fatalf("read tracked crashpad handler %d environment: %v", pid, err)
+		}
+		if err := verifyLaunchEvidence(environ, proc.handlers.nonce); err != nil {
+			t.Errorf("tracked crashpad handler %d did not inherit this launch's environment through crashpad's double fork: %v", pid, err)
 		}
 	}
 

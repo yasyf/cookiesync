@@ -69,6 +69,10 @@ func Launch(ctx context.Context, spawner Spawner, spec LaunchSpec) (*Proc, error
 	if err != nil {
 		return nil, err
 	}
+	nonce, err := newLaunchNonce()
+	if err != nil {
+		return nil, err
+	}
 	p := &Proc{
 		dataDir:     spec.DataDir,
 		browserUUID: uuid,
@@ -81,7 +85,7 @@ func Launch(ctx context.Context, spawner Spawner, spec LaunchSpec) (*Proc, error
 		Path: spec.RolePath,
 		Args: append(append([]string{}, spec.RoleArgs...),
 			"_bridge-chrome-child", spec.HostBinary, spec.DataDir, strconv.FormatBool(spec.Headed)),
-		Env:     chromeEnvironment(spec.DataDir, spec.Headed),
+		Env:     chromeEnvironment(spec.DataDir, spec.Headed, nonce),
 		Session: true,
 		Exec:    daemonkit.ServingSameUser(),
 	}, daemonkit.ChannelStdio, stderr)
@@ -89,7 +93,7 @@ func Launch(ctx context.Context, spawner Spawner, spec LaunchSpec) (*Proc, error
 		return nil, fmt.Errorf("start chrome session: %w", err)
 	}
 	p.child = child
-	p.handlers = trackHandlers(spec.DataDir)
+	p.handlers = trackHandlers(spec.DataDir, nonce)
 	transport, err := child.Conn()
 	if err != nil {
 		return nil, errors.Join(stopChild(ctx, child, fmt.Errorf("bridge: take chrome cdp pipe: %w", err)), p.handlers.close())
@@ -124,9 +128,10 @@ func (p *Proc) Close() error {
 }
 
 // CloseContext settles the managed Chrome process within ctx, then every
-// crashpad handler Chrome double-forked out of its session, and removes the
-// data dir. A ctx carrying no deadline gets childSettlementTimeout, since
-// daemonkit's Stop refuses one that states no budget.
+// crashpad handler carrying this launch's evidence, and removes the data dir;
+// a look-alike without that evidence is left running and named in the error.
+// A ctx carrying no deadline gets childSettlementTimeout, which daemonkit's
+// Stop requires.
 func (p *Proc) CloseContext(ctx context.Context) error {
 	p.closeOnce.Do(func() {
 		ctx, cancel := budgeted(ctx, childSettlementTimeout)

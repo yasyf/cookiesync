@@ -51,15 +51,17 @@ func TestChromeEnvironmentForwardsTheDisplayOnlyWhenHeaded(t *testing.T) {
 	withheld := []string{"DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus", "XDG_CURRENT_DESKTOP=GNOME"}
 
 	const dataDir = "/home/u/.config/cookiesync/bridge/sessions/0123456789abcdef"
+	const nonce = "launch-nonce"
 	const database = "BREAKPAD_DUMP_LOCATION=" + dataDir + "/Crashpad"
+	const launch = "COOKIESYNC_BRIDGE_LAUNCH=" + nonce
 
-	headed := chromeEnvironment(dataDir, true)
-	for _, variable := range append(display, database) {
+	headed := chromeEnvironment(dataDir, true, nonce)
+	for _, variable := range append(display, database, launch) {
 		if !slices.Contains(headed, variable) {
 			t.Errorf("headed chrome environment lacks %q: %q", variable, headed)
 		}
 	}
-	headless := chromeEnvironment(dataDir, false)
+	headless := chromeEnvironment(dataDir, false, nonce)
 	for _, variable := range display {
 		if slices.Contains(headless, variable) {
 			t.Errorf("headless chrome environment carries %q: %q", variable, headless)
@@ -70,7 +72,7 @@ func TestChromeEnvironmentForwardsTheDisplayOnlyWhenHeaded(t *testing.T) {
 			t.Errorf("chrome environment carries %q, which would steer chrome's password store", variable)
 		}
 	}
-	if bridge := append(bridgeEnvironment(), database); !slices.Equal(bridge, headless) {
-		t.Errorf("headless chrome environment = %q, want the bridge environment plus the session crash database %q", headless, bridge)
+	if bridge := append(bridgeEnvironment(), database, launch); !slices.Equal(bridge, headless) {
+		t.Errorf("headless chrome environment = %q, want the bridge environment plus the session crash database and launch %q", headless, bridge)
 	}
 }

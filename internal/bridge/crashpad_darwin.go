@@ -4,8 +4,8 @@ package bridge
 
 type handlerTracker struct{}
 
-func crashpadEnvironment(string) []string { return nil }
+func crashpadEnvironment(string, string) []string { return nil }
 
-func trackHandlers(string) *handlerTracker { return &handlerTracker{} }
+func trackHandlers(string, string) *handlerTracker { return &handlerTracker{} }
 
 func (*handlerTracker) close() error { return nil }

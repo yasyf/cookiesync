@@ -4,20 +4,29 @@ package bridge
 
 import (
 	"errors"
+	"fmt"
+	"maps"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"slices"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 func TestHandlerTrackerReapsOnlyItsSessionsHandlers(t *testing.T) {
 	session, other := t.TempDir(), t.TempDir()
-	plain := startHandlerDouble(t, session, "read line")
-	stubborn := startHandlerDouble(t, session, "trap '' TERM; read line")
-	foreign := startHandlerDouble(t, other, "read line")
+	handler := handlerDoubleExe(t)
+	nonce := launchNonce(t)
+	plain := startHandlerDouble(t, handler, session, crashpadEnvironment(session, nonce), "read line")
+	stubborn := startHandlerDouble(t, handler, session, crashpadEnvironment(session, nonce), "trap '' TERM; read line")
+	foreign := startHandlerDouble(t, handler, other, crashpadEnvironment(other, nonce), "read line")
 
-	tracker := trackHandlers(session)
+	tracker := trackHandlers(session, nonce)
 	tracker.exitTimeout, tracker.termGrace, tracker.killGrace = 200*time.Millisecond, 500*time.Millisecond, 500*time.Millisecond
 	want := []int{plain.Process.Pid, stubborn.Process.Pid}
 	slices.Sort(want)
@@ -38,14 +47,103 @@ func TestHandlerTrackerReapsOnlyItsSessionsHandlers(t *testing.T) {
 	if sig := exitSignal(t, stubborn); sig != syscall.SIGKILL {
 		t.Errorf("TERM-ignoring double exited on %v, want SIGKILL", sig)
 	}
-	if err := foreign.Process.Signal(syscall.Signal(0)); err != nil {
-		t.Errorf("foreign double under %s is gone: %v", other, err)
-	}
+	endLiveDouble(t, foreign)
 }
 
-func startHandlerDouble(t *testing.T, dataDir, script string) *exec.Cmd {
+func TestHandlerTrackerPreservesCandidatesItDidNotLaunch(t *testing.T) {
+	session := t.TempDir()
+	database := crashpadDatabase(session)
+	handler := handlerDoubleExe(t)
+	nonce, another := launchNonce(t), launchNonce(t)
+	owned := startHandlerDouble(t, handler, session, crashpadEnvironment(session, nonce), "read line")
+	unlaunched := startHandlerDouble(t, handler, session, nil, "read line")
+	stranger := startHandlerDouble(t, handler, session, crashpadEnvironment(session, another), "read line")
+	shell := startHandlerDouble(t, "/bin/sh", session, crashpadEnvironment(session, nonce), "read line")
+	shellExe, err := filepath.EvalSymlinks("/bin/sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tracker := trackHandlers(session, nonce)
+	tracker.exitTimeout, tracker.termGrace, tracker.killGrace = 200*time.Millisecond, 500*time.Millisecond, 500*time.Millisecond
+	if got, want := tracker.tracked(), []int{owned.Process.Pid}; !slices.Equal(got, want) {
+		t.Fatalf("tracked = %v, want only the launched handler double %v", got, want)
+	}
+
+	refusals := map[int]string{
+		unlaunched.Process.Pid: refusal(t, unlaunched, handler, database, "its environment carries no COOKIESYNC_BRIDGE_LAUNCH"),
+		stranger.Process.Pid:   refusal(t, stranger, handler, database, "its environment carries another launch's COOKIESYNC_BRIDGE_LAUNCH"),
+		shell.Process.Pid:      refusal(t, shell, shellExe, database, "its executable "+shellExe+" is not chrome_crashpad_handler"),
+	}
+	lines := make([]string, 0, len(refusals))
+	for _, pid := range slices.Sorted(maps.Keys(refusals)) {
+		lines = append(lines, refusals[pid])
+	}
+	want := strings.Join(lines, "\n")
+	err = tracker.close()
+	if err == nil || err.Error() != want {
+		t.Fatalf("close error = %v\nwant the refusal naming every unowned candidate:\n%s", err, want)
+	}
+	if sig := exitSignal(t, owned); sig != syscall.SIGTERM {
+		t.Errorf("launched double exited on %v, want SIGTERM", sig)
+	}
+	endLiveDouble(t, unlaunched)
+	endLiveDouble(t, stranger)
+	endLiveDouble(t, shell)
+}
+
+func refusal(t *testing.T, cmd *exec.Cmd, exe, database, reason string) string {
 	t.Helper()
-	cmd := exec.Command("/bin/sh", "-c", script, "crashpad-double", crashpadDatabaseArg+crashpadDatabase(dataDir)) //nolint:gosec // G204: a test-owned shell double whose only variable argument is the test's own temp database path.
+	pid := cmd.Process.Pid
+	stat, err := os.ReadFile(procPath(pid, "stat"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity, err := parseProcStat(stat)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return fmt.Sprintf("bridge: refused to reap crashpad candidate %d serving --database=%s (ppid %d pgid %d sid %d start %d exe %q argv %q): %s",
+		pid, database, os.Getpid(), unix.Getpgrp(), sessionID(t), identity.start, exe, cmd.Args, reason)
+}
+
+func sessionID(t *testing.T) int {
+	t.Helper()
+	sid, err := unix.Getsid(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return sid
+}
+
+func launchNonce(t *testing.T) string {
+	t.Helper()
+	nonce, err := newLaunchNonce()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return nonce
+}
+
+func handlerDoubleExe(t *testing.T) string {
+	t.Helper()
+	shell, err := os.ReadFile("/bin/sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	exe := filepath.Join(t.TempDir(), crashpadHandlerExe)
+	writeExecutable(t, exe, string(shell))
+	exe, err = filepath.EvalSymlinks(exe)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return exe
+}
+
+func startHandlerDouble(t *testing.T, exe, dataDir string, env []string, script string) *exec.Cmd {
+	t.Helper()
+	cmd := exec.Command(exe, "-c", script, "crashpad-double", crashpadDatabaseArg+crashpadDatabase(dataDir)) //nolint:gosec // G204: a test-owned shell double whose variable arguments are the test's own executable copy and temp database path.
+	cmd.Env = append(os.Environ(), env...)
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		t.Fatal(err)
@@ -58,6 +156,16 @@ func startHandlerDouble(t *testing.T, dataDir, script string) *exec.Cmd {
 		_ = cmd.Wait()
 	})
 	return cmd
+}
+
+func endLiveDouble(t *testing.T, cmd *exec.Cmd) {
+	t.Helper()
+	if err := cmd.Process.Signal(syscall.SIGUSR1); err != nil {
+		t.Fatalf("end double %d: %v", cmd.Process.Pid, err)
+	}
+	if sig := exitSignal(t, cmd); sig != syscall.SIGUSR1 {
+		t.Errorf("double %d died of %v before the test ended it, want SIGUSR1", cmd.Process.Pid, sig)
+	}
 }
 
 func exitSignal(t *testing.T, cmd *exec.Cmd) syscall.Signal {
