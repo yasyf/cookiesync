@@ -84,7 +84,7 @@ func TestInstallWithoutSupervisorNamesSupervise(t *testing.T) {
 		t.Fatalf("install did not initialize state before ensuring: %v", err)
 	}
 	xdg := os.Getenv("XDG_CONFIG_HOME")
-	if _, err := os.Stat(filepath.Join(xdg, "synckit", "manifests", "cookiesync.json")); !os.IsNotExist(err) {
+	if _, err := os.Stat(filepath.Join(xdg, "synckit", "manifests", "cookiesync.json")); !os.IsNotExist(err) { //nolint:gosec // G703: XDG_CONFIG_HOME is set by this test.
 		t.Fatalf("install wrote a synckit manifest on Linux: %v", err)
 	}
 }
