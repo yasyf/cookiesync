@@ -136,7 +136,7 @@ TTL expiry does not revoke cookies already returned by `cookies`, stored by your
 | `doctor` | Check the key helper, resident helper, synckit mesh and manifest, and state. |
 | `browser add/ls/rm` | Track, list, and untrack the browser profiles synced across hosts. |
 | `browser profiles <browser>` | List this host's profiles for a browser that hold a cookie store. |
-| `auth` | Release the Safe Storage key behind one Touch ID tap and cache it for a short window; omit `--browser` to prime every registered browser at once. |
+| `auth` | Release the Safe Storage key behind one Touch ID tap and cache it for a short window; omit `--browser` to prime every registered browser at once. `--wait <d>` holds until a Mac with a live session can approve, then prompts once; a denial exits 3 and a timeout exits 4. |
 | `cookies <url>...` | Stream cookies for one or more URLs as `playwright`, `netscape`, `header`, `json`, or `webstorage`; omit `--browser` to union every registered browser and host. |
 | `import --ttl <d> --format <f> --browser <b> --profile <p> -- <host>...` | Linux only. Hold a Mac-exported cookies or web-storage document in memory for the named hosts until the TTL lapses. |
 | `route-consent <target>` | Route the consent gate to a host that already has a live, unlocked session. |

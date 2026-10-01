@@ -6,6 +6,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **`cookiesync auth --wait <duration>`.** When no Mac has a live session, `auth`
+  waits in the daemon until one does, prompts once, and exits 0 on approval, 3 on a
+  denial, and 4 when the wait runs out, each with a one-line reason on stderr. The
+  daemon checks this Mac's session every 5s and each peer's `whoami` every 15s.
+
 ## [0.30.0] - 2026-09-30
 
 ### Added

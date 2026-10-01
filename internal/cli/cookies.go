@@ -19,19 +19,36 @@ import (
 
 func newAuthCmd() *cobra.Command {
 	var browser, profile, reason, ttl string
+	var wait time.Duration
 	cmd := &cobra.Command{
 		Use:   "auth",
 		Short: "Release the Safe Storage key behind one Touch ID tap and cache it for a short window.",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			return runAuth(cmd, browser, profile, reason, ttl)
+			return runAuth(cmd, browser, profile, reason, ttl, wait)
 		},
 	}
 	cmd.Flags().StringVar(&browser, "browser", "", "The browser to authenticate; omitted authenticates every registered local browser behind one tap, and a cold session routes the prompt per browser to a live peer.")
 	cmd.Flags().StringVar(&profile, "profile", "Default", "The profile to authenticate (requires --browser).")
 	cmd.Flags().StringVar(&reason, "reason", "", "What the Touch ID prompt should say you're unlocking the cookies to do.")
 	cmd.Flags().StringVar(&ttl, "ttl", "", "Override the cache TTL (Go-style duration, e.g. 15m).")
+	cmd.Flags().DurationVar(&wait, "wait", 0, fmt.Sprintf("Wait up to this long (e.g. 30m) for a Mac with a live session, then prompt once; exits %d when denied and %d when none came live in time.", authDeniedExit, authTimeoutExit))
 	return cmd
+}
+
+const (
+	authDeniedExit  = 3
+	authTimeoutExit = 4
+)
+
+var rpcCallJSON = rpc.CallJSON
+
+type primeReply struct {
+	Status    string   `json:"status"`
+	Reason    string   `json:"reason"`
+	Endpoint  string   `json:"endpoint"`
+	Endpoints []string `json:"endpoints"`
+	Warnings  []string `json:"warnings"`
 }
 
 // runAuth optionally overrides the cache TTL, then primes the cached key(s) via the
@@ -39,9 +56,12 @@ func newAuthCmd() *cobra.Command {
 // Python run_auth path); with --browser omitted it auto-registers this host's installed
 // browsers when the registry has none, primes every registered local browser behind one
 // tap, and reports each warmed endpoint on stdout with per-browser skips on stderr.
-func runAuth(cmd *cobra.Command, browser, profile, reason, ttl string) error {
+func runAuth(cmd *cobra.Command, browser, profile, reason, ttl string, wait time.Duration) error {
 	if cmd.Flags().Changed("profile") && browser == "" {
 		return errors.New("--profile requires --browser")
+	}
+	if wait < 0 {
+		return errors.New("--wait must not be negative")
 	}
 	if ttl != "" {
 		d, err := state.ParseDuration(ttl)
@@ -53,7 +73,7 @@ func runAuth(cmd *cobra.Command, browser, profile, reason, ttl string) error {
 		}
 	}
 	if browser == "" {
-		return runAuthAll(cmd, reason)
+		return runAuthAll(cmd, reason, wait)
 	}
 	params := map[string]any{"browser": browser, "profile": profile}
 	if reason != "" {
@@ -62,10 +82,8 @@ func runAuth(cmd *cobra.Command, browser, profile, reason, ttl string) error {
 	if r, ok := resolveRequestor(); ok {
 		params["requestor"] = r
 	}
-	var result struct {
-		Endpoint string `json:"endpoint"`
-	}
-	if err := rpc.CallJSON(cmd.Context(), "prime_auth", params, &result); err != nil {
+	result, err := primeAuth(cmd, params, wait)
+	if err != nil {
 		return err
 	}
 	cmd.Printf("Authenticated %s.\n", result.Endpoint)
@@ -75,7 +93,7 @@ func runAuth(cmd *cobra.Command, browser, profile, reason, ttl string) error {
 // runAuthAll auto-registers this host's installed browsers when the registry has no
 // local endpoint, then primes every registered local browser in one daemon call. It
 // prints each warmed endpoint id on stdout and each per-browser skip on stderr.
-func runAuthAll(cmd *cobra.Command, reason string) error {
+func runAuthAll(cmd *cobra.Command, reason string, wait time.Duration) error {
 	if err := ensureLocalEndpoints(cmd.Context()); err != nil {
 		return err
 	}
@@ -86,11 +104,8 @@ func runAuthAll(cmd *cobra.Command, reason string) error {
 	if r, ok := resolveRequestor(); ok {
 		params["requestor"] = r
 	}
-	var result struct {
-		Endpoints []string `json:"endpoints"`
-		Warnings  []string `json:"warnings"`
-	}
-	if err := rpc.CallJSON(cmd.Context(), "prime_auth", params, &result); err != nil {
+	result, err := primeAuth(cmd, params, wait)
+	if err != nil {
 		return err
 	}
 	cmd.Printf("Authenticated %d endpoint(s):\n", len(result.Endpoints))
@@ -101,6 +116,33 @@ func runAuthAll(cmd *cobra.Command, reason string) error {
 		cmd.PrintErrln(warning)
 	}
 	return nil
+}
+
+func primeAuth(cmd *cobra.Command, params map[string]any, wait time.Duration) (primeReply, error) {
+	var reply primeReply
+	if wait == 0 {
+		return reply, rpcCallJSON(cmd.Context(), "prime_auth", params, &reply)
+	}
+	deadline := time.Now().Add(wait)
+	for remaining := wait; remaining > 0; remaining = time.Until(deadline) {
+		params["wait"] = remaining.Seconds()
+		reply = primeReply{}
+		if err := rpcCallJSON(cmd.Context(), "prime_auth", params, &reply); err != nil {
+			return reply, err
+		}
+		switch reply.Status {
+		case "approved":
+			return reply, nil
+		case "denied":
+			cmd.PrintErrf("cookiesync: %s\n", reply.Reason)
+			return reply, statusError(authDeniedExit)
+		case "waiting":
+		default:
+			return reply, fmt.Errorf("prime_auth answered unexpected status %q", reply.Status)
+		}
+	}
+	cmd.PrintErrf("cookiesync: no Mac with a live session came up to approve within %s\n", wait)
+	return reply, statusError(authTimeoutExit)
 }
 
 func ensureLocalEndpoints(ctx context.Context) error {

@@ -16,7 +16,10 @@ import (
 	"github.com/yasyf/cookiesync/internal/state"
 	consentkit "github.com/yasyf/synckit/consent"
 	"github.com/yasyf/synckit/hostregistry"
+	synckit "github.com/yasyf/synckit/rpc"
 )
+
+const awaitSlice = synckit.DispatchTimeout / 2
 
 // unionSSHConcurrency bounds the concurrent ssh dials getCookiesAll's remote leg makes,
 // so a wide mesh does not open one ssh process per remote endpoint at once.
@@ -192,12 +195,9 @@ func sessionSummary(ctx context.Context, probe Probe) (map[string]any, error) {
 	}, nil
 }
 
-// handlePrimeAuth obtains the Safe Storage key and caches it under the endpoint TTL.
-// With a "browser" param it primes that one endpoint via the broker — behind one Touch
-// ID tap when a session is live, else by routing the gate to the active peer — and
-// emits the frozen {"primed": true, "endpoint": str}. With no "browser" it primes every
-// registered local browser via LocalKeys(PrimeAll), emitting
-// {"primed": true, "endpoints": [...], "warnings": [...]}.
+// handlePrimeAuth caches the Safe Storage key for one "browser" endpoint, or for
+// every registered local browser when "browser" is absent, first parking up to
+// "wait" seconds for an approver when set.
 func (d *Daemon) handlePrimeAuth(ctx context.Context, params map[string]any) (any, error) {
 	requestor, err := requestorID(ctx, params)
 	if err != nil {
@@ -205,10 +205,46 @@ func (d *Daemon) handlePrimeAuth(ctx context.Context, params map[string]any) (an
 	}
 	reason := optionalString(params, "reason", consentReason)
 	browser := optionalString(params, "browser", "")
-	if browser == "" {
-		return d.primeAuthAll(ctx, requestor, reason)
-	}
 	profile := optionalString(params, "profile", defaultProfile)
+	prime := func(ctx context.Context) (map[string]any, error) {
+		if browser == "" {
+			return d.primeAuthAll(ctx, requestor, reason)
+		}
+		return d.primeAuthOne(ctx, requestor, browser, profile, reason)
+	}
+	raw, waiting := params["wait"]
+	if !waiting {
+		return prime(ctx)
+	}
+	seconds, ok := raw.(float64)
+	if !ok {
+		return nil, fmt.Errorf("wait must be a number of seconds, got %T", raw)
+	}
+	return d.primeAuthAwaiting(ctx, secondsToDuration(seconds), prime)
+}
+
+func (d *Daemon) primeAuthAwaiting(ctx context.Context, wait time.Duration, prime func(context.Context) (map[string]any, error)) (any, error) {
+	actx, cancel := context.WithTimeout(ctx, min(wait, awaitSlice))
+	defer cancel()
+	if err := d.broker.AwaitApprover(actx); err != nil {
+		if ctx.Err() == nil && errors.Is(err, context.DeadlineExceeded) {
+			return map[string]any{"status": "waiting"}, nil
+		}
+		return nil, err
+	}
+	reply, err := prime(ctx)
+	switch auth.Classify(err) {
+	case consentkit.VerdictOK:
+		reply["status"] = "approved"
+		return reply, nil
+	case consentkit.VerdictDenied:
+		return map[string]any{"status": "denied", "reason": err.Error()}, nil
+	default:
+		return nil, err
+	}
+}
+
+func (d *Daemon) primeAuthOne(ctx context.Context, requestor, browser, profile, reason string) (map[string]any, error) {
 	req := auth.Req{Requestor: requestor, Browser: browser, Profile: profile, Reason: reason, Mode: auth.ModeLocal}
 	if _, _, err := d.broker.Key(ctx, req); err != nil {
 		return nil, err
