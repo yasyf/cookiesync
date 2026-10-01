@@ -6,6 +6,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.31.0] - 2026-10-01
+
 ### Added
 - **`cookiesync auth --wait <duration>`.** When no Mac has a live session, `auth`
   waits in the daemon until one does, prompts once, and exits 0 on approval, 3 on a
