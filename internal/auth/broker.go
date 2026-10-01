@@ -71,6 +71,11 @@ type Broker struct {
 	// off this path); defaults to probe — production pins presence.Console.
 	KeybagProbe Probe
 
+	// LocalAwaitInterval and PeerAwaitInterval pace AwaitApprover's re-reads
+	// of this host's session and of the approver candidates' whoami.
+	LocalAwaitInterval time.Duration
+	PeerAwaitInterval  time.Duration
+
 	batchFlight singleflight.Group
 
 	promptGate sync.Mutex
@@ -82,13 +87,15 @@ type Broker struct {
 // router.Nonce / router timeouts — after construction to pin them.
 func NewBroker(consent cookie.Consent, c Cache, probe Probe, runner SSHRunner, st StateLoader) *Broker {
 	return &Broker{
-		consent:     consent,
-		cache:       c,
-		probe:       probe,
-		state:       st,
-		Router:      consentkit.NewRouter(runner, "cookiesync rpc whoami"),
-		grants:      consentkit.NewGrants(),
-		KeybagProbe: probe,
+		consent:            consent,
+		cache:              c,
+		probe:              probe,
+		state:              st,
+		Router:             consentkit.NewRouter(runner, "cookiesync rpc whoami"),
+		grants:             consentkit.NewGrants(),
+		KeybagProbe:        probe,
+		LocalAwaitInterval: 5 * time.Second,
+		PeerAwaitInterval:  15 * time.Second,
 	}
 }
 

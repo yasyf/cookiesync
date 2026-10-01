@@ -6,6 +6,7 @@ import (
 
 	"github.com/yasyf/cookiesync/internal/cookie"
 	"github.com/yasyf/cookiesync/internal/mesh"
+	"github.com/yasyf/cookiesync/internal/state"
 	"github.com/yasyf/synckit/hostregistry"
 )
 
@@ -56,16 +57,7 @@ func (b *Broker) routedConsent(ctx context.Context, method consentMethod, browse
 		return nil, err
 	}
 	endpoint := endpointID(self, browserID, profile)
-	candidates := make([]string, 0, len(peers)+1)
-	if st.ConsentRouteTo != "" {
-		candidates = append(candidates, st.ConsentRouteTo)
-	}
-	for _, peer := range peers {
-		if peer != st.ConsentRouteTo {
-			candidates = append(candidates, peer)
-		}
-	}
-	if _, err := b.Router.Route(ctx, candidates, endpoint, func(_, nonce string) (string, []byte, error) {
+	if _, err := b.Router.Route(ctx, approvers(st, peers), endpoint, func(_, nonce string) (string, []byte, error) {
 		cmd := fmt.Sprintf(
 			"cookiesync rpc %s --browser %s --profile %s --nonce %s --endpoint %s",
 			method, hostregistry.ShellQuote(browserID), hostregistry.ShellQuote(profile),
@@ -76,4 +68,17 @@ func (b *Broker) routedConsent(ctx context.Context, method consentMethod, browse
 		return nil, err
 	}
 	return b.consent.ObtainKeyUnprompted(ctx, browser)
+}
+
+func approvers(st *state.State, peers []string) []string {
+	candidates := make([]string, 0, len(peers)+1)
+	if st.ConsentRouteTo != "" {
+		candidates = append(candidates, st.ConsentRouteTo)
+	}
+	for _, peer := range peers {
+		if peer != st.ConsentRouteTo {
+			candidates = append(candidates, peer)
+		}
+	}
+	return candidates
 }
