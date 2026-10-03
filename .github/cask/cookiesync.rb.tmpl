@@ -8,7 +8,7 @@
 # enclosing bundle, so the `binary` symlink into Contents/MacOS/cookiesync carries
 # that durable identity to every exec: the interactive CLI AND the synckit-driven
 # resident helper LaunchAgent (com.github.yasyf.synckit.helper.cookiesync), whose
-# plist Program is this same /opt/homebrew/bin/cookiesync symlink.
+# plist Program is the bundle-inner binary this symlink resolves to.
 #
 # The whole .app must stay intact — splitting it apart severs the bundle identity the
 # grant is keyed to — so the cask stages the bundle in place and only symlinks the
@@ -40,19 +40,20 @@ cask "cookiesync" do
   # quarantine strip on the bundle keeps a first exec friction-free even if the staple
   # check is skipped.
   #
-  # brew upgrade swaps the staged bundle on disk but never touches launchd, so the
-  # resident helper (com.github.yasyf.synckit.helper.cookiesync) keeps serving the old
-  # dispatcher until reboot. Kick it after every (re)install so upgrades self-deploy.
-  # must_succeed: false keeps first install a no-op — the agent only exists after
-  # `cookiesync install` + `synckitd install`.
+  # The helper plist names the versioned Caskroom bundle, which brew upgrade deletes,
+  # and a kickstart never rereads a plist. Rerun `cookiesync install` once the helper
+  # agent exists so synckitd rerenders and reloads it against this version.
   postflight do
     system_command "/usr/bin/xattr",
                    args:         ["-dr", "com.apple.quarantine", "#{staged_path}/CookieSync.app"],
                    must_succeed: false
-    system_command "/bin/launchctl",
-                   args:         ["kickstart", "-k", "gui/#{Process.uid}/com.github.yasyf.synckit.helper.cookiesync"],
-                   must_succeed: false,
-                   print_stderr: false
+    helper_plist = File.expand_path("~/Library/LaunchAgents/com.github.yasyf.synckit.helper.cookiesync.plist")
+    if File.exist?(helper_plist)
+      system_command "#{HOMEBREW_PREFIX}/bin/cookiesync",
+                     args:         ["install"],
+                     env:          { "PATH" => "#{HOMEBREW_PREFIX}/bin:/usr/bin:/bin:/usr/sbin:/sbin" },
+                     must_succeed: false
+    end
   end
 
   caveats <<~EOS
