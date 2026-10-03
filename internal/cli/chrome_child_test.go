@@ -45,22 +45,37 @@ func echoChromeMain() {
 }
 
 // holdCDPDescriptorsLikeTheRuntime parks a goroutine in a blocking read on a
-// close-on-exec pipe at fds 3 and 4, the shape of darwin's runtime signal pipe.
-// Mapping anything over those fds before exec wakes it, and it leaves a marker.
+// close-on-exec pipe whose write end is fd 4, the shape of darwin's runtime signal
+// pipe. Mapping anything over fd 4 before exec wakes it, and it leaves a marker.
 func holdCDPDescriptorsLikeTheRuntime() {
 	var fds [2]int
 	if err := unix.Pipe(fds[:]); err != nil {
 		panic(err)
 	}
-	if fds != [2]int{3, 4} {
-		panic(fmt.Sprintf("runtime stand-in pipe landed on fds %v, want [3 4]", fds))
+	read, write := fds[0], fds[1]
+	if read == 4 {
+		moved, err := unix.Dup(read)
+		if err != nil {
+			panic(err)
+		}
+		read = moved
+		if err := unix.Dup2(write, 4); err != nil {
+			panic(err)
+		}
+		if err := unix.Close(write); err != nil {
+			panic(err)
+		}
+		write = 4
 	}
-	unix.CloseOnExec(fds[0])
-	unix.CloseOnExec(fds[1])
+	if write != 4 {
+		panic(fmt.Sprintf("runtime stand-in pipe landed on fds %v; fd 4 is already held", fds))
+	}
+	unix.CloseOnExec(read)
+	unix.CloseOnExec(write)
 	parked := make(chan struct{})
 	go func() {
 		close(parked)
-		n, err := unix.Read(fds[0], make([]byte, 1))
+		n, err := unix.Read(read, make([]byte, 1))
 		_ = os.WriteFile(os.Getenv(clobberMarkerEnv), fmt.Appendf(nil, "read %d %v", n, err), 0o600) //nolint:gosec // test-owned marker path.
 	}()
 	<-parked
