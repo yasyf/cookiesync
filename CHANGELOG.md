@@ -6,6 +6,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.31.2] - 2026-10-03
+
+### Fixed
+- **`brew upgrade --cask cookiesync` no longer kills the resident helper.** The helper's
+  LaunchAgent names the versioned Caskroom bundle, so an upgrade that deleted the old
+  bundle left launchd failing it with exit 78. The cask's postflight only kickstarted
+  the agent, and `cookiesync install` only rewrote the manifest, so neither repaired it.
+  `cookiesync install` now runs `synckitd install` when synckitd is on PATH, which
+  rerenders and reloads the helper plist against the current bundle. The cask postflight
+  runs `cookiesync install` whenever the helper agent already exists.
+
 ## [0.31.1] - 2026-10-02
 
 ### Fixed

@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -130,6 +132,7 @@ func TestKeyCacheCheckRendersEveryDaemonState(t *testing.T) {
 func TestInstallWritesManifest(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("PATH", t.TempDir())
 
 	out := runRootCmd(t, "install")
 	if !strings.Contains(out, "Registered cookiesync manifest") {
@@ -174,11 +177,62 @@ func TestInstallWritesManifest(t *testing.T) {
 	}
 }
 
+// TestInstallConvergesSynckitdAgents proves install reruns 'synckitd install' after
+// writing the manifest, so a cask upgrade's rerun rewrites the helper plist that still
+// names the deleted bundle, and that a failed converge fails install.
+func TestInstallConvergesSynckitdAgents(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		exit    int
+		wantErr bool
+	}{
+		{name: "converges", exit: 0},
+		{name: "converge fails", exit: 7, wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("HOME", t.TempDir())
+			t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+			bin := t.TempDir()
+			t.Setenv("PATH", bin)
+			calls := filepath.Join(t.TempDir(), "calls")
+			script := fmt.Sprintf("#!/bin/sh\necho \"$@\" >> %q\necho converged synckitd agents\nexit %d\n", calls, tc.exit)
+			if err := os.WriteFile(filepath.Join(bin, "synckitd"), []byte(script), 0o700); err != nil { //nolint:gosec // test-owned fake synckitd
+				t.Fatalf("write fake synckitd: %v", err)
+			}
+
+			var out bytes.Buffer
+			root := newRoot("test")
+			root.SetOut(&out)
+			root.SetErr(&out)
+			root.SetArgs([]string{"install"})
+			err := root.ExecuteContext(context.Background())
+			if tc.wantErr != (err != nil) {
+				t.Fatalf("install err = %v, wantErr %v\n%s", err, tc.wantErr, out.String())
+			}
+
+			got, readErr := os.ReadFile(calls) //nolint:gosec // test-owned call log
+			if readErr != nil {
+				t.Fatalf("synckitd never ran: %v\n%s", readErr, out.String())
+			}
+			if string(got) != "install\n" {
+				t.Fatalf("synckitd argv log = %q, want exactly one \"install\"", got)
+			}
+			if !strings.Contains(out.String(), "converged synckitd agents") {
+				t.Fatalf("install output = %q, want synckitd's output passed through", out.String())
+			}
+			if strings.Contains(out.String(), "Run 'synckitd install'") {
+				t.Fatalf("install output = %q, want no manual-install hint once synckitd ran", out.String())
+			}
+		})
+	}
+}
+
 // TestUninstallRemovesManifest proves uninstall removes the registered manifest and emits
 // the frozen line, and is a no-op (not an error) when no manifest is registered.
 func TestUninstallRemovesManifest(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("PATH", t.TempDir())
 
 	runRootCmd(t, "install")
 	if got := runRootCmd(t, "uninstall"); !strings.Contains(got, "Removed cookiesync manifest") {

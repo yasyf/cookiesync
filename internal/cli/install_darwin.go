@@ -2,8 +2,10 @@ package cli
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"time"
 
@@ -19,7 +21,7 @@ import (
 
 const (
 	helperServeShort = "Run the resident cookiesync helper: serve the SE key cache and Touch ID consent over the RPC socket."
-	installShort     = "Note the signed key helper, then register cookiesync's synckit manifest."
+	installShort     = "Note the signed key helper, register cookiesync's synckit manifest, then converge synckitd's agents."
 	uninstallShort   = "Remove cookiesync's synckit manifest."
 )
 
@@ -60,11 +62,11 @@ func manifestPath() (string, error) {
 	return filepath.Join(dir, "manifests", "cookiesync.json"), nil
 }
 
-// runInstall notes the signed key helper's presence, then writes cookiesync's synckit
-// manifest. The helper is fetched via Homebrew (brew install yasyf/tap/cookiesync) and
-// is what the helper's Secure-Enclave key vault runs inside; a missing helper is
-// surfaced here (run doctor to recheck) but does not block the manifest. Convergence is
-// driven by synckitd, which the user installs separately.
+// runInstall notes the signed key helper's presence, writes cookiesync's synckit
+// manifest, then runs 'synckitd install' when synckitd is on PATH. That rerenders the
+// resident helper's plist against the cookiesync binary PATH resolves now, so a cask
+// upgrade that deleted the previous bundle leaves no plist naming it. Without synckitd,
+// install points the user at it instead.
 func runInstall(cmd *cobra.Command, _ []string) error {
 	if err := state.New(paths.Config).Initialize(cmd.Context()); err != nil {
 		return fmt.Errorf("initialize cookie-sync state: %w", err)
@@ -78,7 +80,24 @@ func runInstall(cmd *cobra.Command, _ []string) error {
 		return err
 	}
 	cmd.Printf("Registered cookiesync manifest at %s.\n", path)
-	cmd.Println("Run 'synckitd install' to start the host mesh, watch supervisor, and reconcile tick.")
+	return convergeSynckitd(cmd)
+}
+
+func convergeSynckitd(cmd *cobra.Command) error {
+	synckitd, err := exec.LookPath("synckitd")
+	if errors.Is(err, exec.ErrNotFound) {
+		cmd.Println("Run 'synckitd install' to start the host mesh, watch supervisor, and reconcile tick.")
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("resolve synckitd: %w", err)
+	}
+	install := exec.CommandContext(cmd.Context(), synckitd, "install") //nolint:gosec // synckitd resolved from PATH
+	install.Stdout = cmd.OutOrStdout()
+	install.Stderr = cmd.ErrOrStderr()
+	if err := install.Run(); err != nil {
+		return fmt.Errorf("converge synckitd agents with %s install: %w", synckitd, err)
+	}
 	return nil
 }
 
