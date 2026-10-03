@@ -2,7 +2,6 @@ package bridge
 
 import (
 	"errors"
-	"fmt"
 	"os"
 	"path/filepath"
 
@@ -10,19 +9,12 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// ChromeChildVerb is the role argument that turns a cookiesync process into the
-// Chrome fd adapter. Its entry point dispatches it before the process installs
-// any signal handler: on darwin the Go runtime's signal note is a close-on-exec
-// pipe at the lowest free descriptors, which in a stdio-only child are fds 3
-// and 4, exactly the CDP descriptors Chrome reads.
-const ChromeChildVerb = "_bridge-chrome-child"
+// chromeFDTrampoline maps the session onto Chrome's CDP fds 3 and 4 inside /bin/sh.
+// A dup2 from Go would overwrite descriptors the runtime still owns there, such as
+// darwin's signal pipe or the netpoller, and crash before exec.
+const chromeFDTrampoline = `exec "$0" "$@" 3<&0 4>&1`
 
-const (
-	cdpCommandFD = 3
-	cdpEventFD   = 4
-)
-
-// RunChromeChild maps the daemonkit session onto Chrome's CDP descriptors and execs it.
+// RunChromeChild execs Chrome with the daemonkit session as its CDP pipe.
 func RunChromeChild(binary, dataDir string, headed bool) error {
 	if !filepath.IsAbs(binary) || filepath.Clean(binary) != binary {
 		return errors.New("bridge: chrome binary must be an exact absolute path")
@@ -33,19 +25,8 @@ func RunChromeChild(binary, dataDir string, headed bool) error {
 	if err := daemonkit.CloseInheritedFDs(); err != nil {
 		return err
 	}
-	for _, fd := range []int{cdpCommandFD, cdpEventFD} {
-		if _, err := unix.FcntlInt(uintptr(fd), unix.F_GETFD, 0); err == nil {
-			return fmt.Errorf("bridge: fd %d is held by this process; run %s before anything opens a descriptor", fd, ChromeChildVerb)
-		}
-	}
-	if err := unix.Dup2(int(os.Stdin.Fd()), cdpCommandFD); err != nil {
-		return fmt.Errorf("bridge: map chrome command fd: %w", err)
-	}
-	if err := unix.Dup2(int(os.Stdout.Fd()), cdpEventFD); err != nil {
-		return fmt.Errorf("bridge: map chrome event fd: %w", err)
-	}
-	argv := append([]string{binary}, chromeArgs(dataDir, headed)...)
-	return unix.Exec(binary, argv, os.Environ())
+	argv := append([]string{"/bin/sh", "-c", chromeFDTrampoline, binary}, chromeArgs(dataDir, headed)...)
+	return unix.Exec("/bin/sh", argv, os.Environ())
 }
 
 func chromeArgs(dataDir string, headed bool) []string {

@@ -1,19 +1,24 @@
 package cli
 
 import (
-	"fmt"
 	"strconv"
+
+	"github.com/spf13/cobra"
 
 	"github.com/yasyf/cookiesync/internal/bridge"
 )
 
-func runChromeChild(args []string) error {
-	if len(args) != 3 {
-		return fmt.Errorf("%s takes <binary> <data-dir> <headed>, got %d args", bridge.ChromeChildVerb, len(args))
+func newBridgeChromeChildCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:    "_bridge-chrome-child <binary> <data-dir> <headed>",
+		Hidden: true,
+		Args:   cobra.ExactArgs(3),
+		RunE: func(_ *cobra.Command, args []string) error {
+			headed, err := strconv.ParseBool(args[2])
+			if err != nil {
+				return err
+			}
+			return bridge.RunChromeChild(args[0], args[1], headed)
+		},
 	}
-	headed, err := strconv.ParseBool(args[2])
-	if err != nil {
-		return err
-	}
-	return bridge.RunChromeChild(args[0], args[1], headed)
 }

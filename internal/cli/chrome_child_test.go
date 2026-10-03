@@ -4,18 +4,21 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"slices"
 	"testing"
 	"time"
 
-	"github.com/yasyf/cookiesync/internal/bridge"
+	"golang.org/x/sys/unix"
 )
 
 const (
 	chromeChildRoleEnv = "COOKIESYNC_TEST_CHROME_CHILD_ROLE"
 	echoChromeEnv      = "COOKIESYNC_TEST_ECHO_CHROME"
+	clobberMarkerEnv   = "COOKIESYNC_TEST_CLOBBER_MARKER"
 )
 
 func TestMain(m *testing.M) {
@@ -24,6 +27,7 @@ func TestMain(m *testing.M) {
 		os.Exit(0)
 	}
 	if os.Getenv(chromeChildRoleEnv) != "" {
+		holdCDPDescriptorsLikeTheRuntime()
 		Execute("test")
 		os.Exit(0)
 	}
@@ -40,19 +44,43 @@ func echoChromeMain() {
 	}
 }
 
-// TestChromeChildEntryKeepsCDPDescriptors proves the production entry point
-// hands Chrome the session's stdio on fds 3 and 4. Dispatched after the root's
-// signal handler, the runtime's signal pipe held those descriptors, and mapping
-// over them crashed the adapter with "signal_recv: inconsistent state".
-func TestChromeChildEntryKeepsCDPDescriptors(t *testing.T) {
+// holdCDPDescriptorsLikeTheRuntime parks a goroutine in a blocking read on a
+// close-on-exec pipe at fds 3 and 4, the shape of darwin's runtime signal pipe.
+// Mapping anything over those fds before exec wakes it, and it leaves a marker.
+func holdCDPDescriptorsLikeTheRuntime() {
+	var fds [2]int
+	if err := unix.Pipe(fds[:]); err != nil {
+		panic(err)
+	}
+	if fds != [2]int{3, 4} {
+		panic(fmt.Sprintf("runtime stand-in pipe landed on fds %v, want [3 4]", fds))
+	}
+	unix.CloseOnExec(fds[0])
+	unix.CloseOnExec(fds[1])
+	parked := make(chan struct{})
+	go func() {
+		close(parked)
+		n, err := unix.Read(fds[0], make([]byte, 1))
+		_ = os.WriteFile(os.Getenv(clobberMarkerEnv), fmt.Appendf(nil, "read %d %v", n, err), 0o600)
+	}()
+	<-parked
+	time.Sleep(50 * time.Millisecond)
+}
+
+// TestChromeChildKeepsRuntimeDescriptors proves the production entry hands Chrome
+// the session's stdio on fds 3 and 4 without touching descriptors the Go runtime
+// holds there. Mapping them with dup2 from Go closed darwin's signal pipe and
+// crashed the adapter with "signal_recv: inconsistent state".
+func TestChromeChildKeepsRuntimeDescriptors(t *testing.T) {
 	executable, err := os.Executable()
 	if err != nil {
 		t.Fatal(err)
 	}
+	marker := filepath.Join(t.TempDir(), "clobbered")
 	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, executable, bridge.ChromeChildVerb, executable, t.TempDir(), "false") //nolint:gosec // re-execs this test binary.
-	cmd.Env = append(os.Environ(), chromeChildRoleEnv+"=1", echoChromeEnv+"=1")
+	cmd := exec.CommandContext(ctx, executable, "_bridge-chrome-child", executable, t.TempDir(), "false") //nolint:gosec // re-execs this test binary.
+	cmd.Env = append(os.Environ(), chromeChildRoleEnv+"=1", echoChromeEnv+"=1", clobberMarkerEnv+"="+marker)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	commands, err := cmd.StdinPipe()
@@ -73,5 +101,8 @@ func TestChromeChildEntryKeepsCDPDescriptors(t *testing.T) {
 	waitErr := cmd.Wait()
 	if string(frame) != "ping\x00" || waitErr != nil {
 		t.Fatalf("echoed frame = %q (want %q), exit %v; stderr: %s", frame, "ping\x00", waitErr, stderr.String())
+	}
+	if got, err := os.ReadFile(marker); err == nil {
+		t.Fatalf("the adapter overwrote a runtime-held descriptor before exec: %s", got)
 	}
 }
