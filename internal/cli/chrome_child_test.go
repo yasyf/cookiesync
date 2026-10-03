@@ -61,7 +61,7 @@ func holdCDPDescriptorsLikeTheRuntime() {
 	go func() {
 		close(parked)
 		n, err := unix.Read(fds[0], make([]byte, 1))
-		_ = os.WriteFile(os.Getenv(clobberMarkerEnv), fmt.Appendf(nil, "read %d %v", n, err), 0o600)
+		_ = os.WriteFile(os.Getenv(clobberMarkerEnv), fmt.Appendf(nil, "read %d %v", n, err), 0o600) //nolint:gosec // test-owned marker path.
 	}()
 	<-parked
 	time.Sleep(50 * time.Millisecond)
@@ -102,7 +102,7 @@ func TestChromeChildKeepsRuntimeDescriptors(t *testing.T) {
 	if string(frame) != "ping\x00" || waitErr != nil {
 		t.Fatalf("echoed frame = %q (want %q), exit %v; stderr: %s", frame, "ping\x00", waitErr, stderr.String())
 	}
-	if got, err := os.ReadFile(marker); err == nil {
+	if got, err := os.ReadFile(marker); err == nil { //nolint:gosec // test-owned marker path.
 		t.Fatalf("the adapter overwrote a runtime-held descriptor before exec: %s", got)
 	}
 }
