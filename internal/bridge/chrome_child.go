@@ -2,7 +2,6 @@ package bridge
 
 import (
 	"errors"
-	"fmt"
 	"os"
 	"path/filepath"
 
@@ -10,7 +9,12 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// RunChromeChild maps the daemonkit session onto Chrome's CDP descriptors and execs it.
+// chromeFDTrampoline maps the session onto Chrome's CDP fds 3 and 4 inside /bin/sh.
+// A dup2 from Go would overwrite descriptors the runtime still owns there, such as
+// darwin's signal pipe or the netpoller, and crash before exec.
+const chromeFDTrampoline = `exec "$0" "$@" 3<&0 4>&1`
+
+// RunChromeChild execs Chrome with the daemonkit session as its CDP pipe.
 func RunChromeChild(binary, dataDir string, headed bool) error {
 	if !filepath.IsAbs(binary) || filepath.Clean(binary) != binary {
 		return errors.New("bridge: chrome binary must be an exact absolute path")
@@ -21,14 +25,8 @@ func RunChromeChild(binary, dataDir string, headed bool) error {
 	if err := daemonkit.CloseInheritedFDs(); err != nil {
 		return err
 	}
-	if err := unix.Dup2(int(os.Stdin.Fd()), 3); err != nil {
-		return fmt.Errorf("bridge: map chrome command fd: %w", err)
-	}
-	if err := unix.Dup2(int(os.Stdout.Fd()), 4); err != nil {
-		return fmt.Errorf("bridge: map chrome event fd: %w", err)
-	}
-	argv := append([]string{binary}, chromeArgs(dataDir, headed)...)
-	return unix.Exec(binary, argv, os.Environ())
+	argv := append([]string{"/bin/sh", "-c", chromeFDTrampoline, binary}, chromeArgs(dataDir, headed)...)
+	return unix.Exec("/bin/sh", argv, os.Environ())
 }
 
 func chromeArgs(dataDir string, headed bool) []string {

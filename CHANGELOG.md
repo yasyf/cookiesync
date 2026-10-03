@@ -6,6 +6,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.31.1] - 2026-10-02
+
+### Fixed
+- **`bridge open` no longer crashes with `signal_recv: inconsistent state`.** The
+  Chrome fd adapter maps Chrome's CDP pipes onto fds 3 and 4 inside `/bin/sh` before
+  exec. Doing it with `dup2` from Go overwrote descriptors the runtime still held
+  there, such as its macOS signal pipe, and killed the adapter mid-launch.
+
 ## [0.31.0] - 2026-10-01
 
 ### Added
