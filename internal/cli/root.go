@@ -12,6 +12,7 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/yasyf/daemonkit/version"
 
+	"github.com/yasyf/cookiesync/internal/bridge"
 	"github.com/yasyf/cookiesync/internal/tui"
 )
 
@@ -25,6 +26,10 @@ func (e statusError) Error() string { return "" }
 // Execute builds and runs the cookiesync root command under a context canceled on
 // SIGINT/SIGTERM, exiting non-zero on error.
 func Execute(stampedVersion string) {
+	if len(os.Args) > 1 && os.Args[1] == bridge.ChromeChildVerb {
+		fmt.Fprintf(os.Stderr, "cookiesync: %v\n", runChromeChild(os.Args[2:]))
+		os.Exit(1)
+	}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
@@ -66,7 +71,6 @@ func newRoot(version string) *cobra.Command {
 		newRequestorCmd(),
 		newRPCCmd(),
 		newHelperServeCmd(),
-		newBridgeChromeChildCmd(),
 		newInstallCmd(),
 		newUninstallCmd(),
 		newDoctorCmd(),

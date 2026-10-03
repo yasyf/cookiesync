@@ -6,6 +6,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.31.1] - 2026-10-02
+
+### Fixed
+- **`bridge open` no longer crashes with `signal_recv: inconsistent state`.** The
+  Chrome fd adapter now runs before cookiesync installs its signal handler. On macOS
+  that handler's runtime pipe took fds 3 and 4, and mapping Chrome's CDP pipes over
+  them killed the adapter mid-launch.
+
 ## [0.31.0] - 2026-10-01
 
 ### Added

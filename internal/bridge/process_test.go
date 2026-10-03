@@ -110,7 +110,7 @@ func TestChromeChildRole(t *testing.T) {
 		if arg != chromeChildTestMarker {
 			continue
 		}
-		if len(os.Args) != i+5 || os.Args[i+1] != "_bridge-chrome-child" {
+		if len(os.Args) != i+5 || os.Args[i+1] != ChromeChildVerb {
 			t.Fatalf("chrome child test args = %v", os.Args[i:])
 		}
 		headed := os.Args[i+4] == "true"

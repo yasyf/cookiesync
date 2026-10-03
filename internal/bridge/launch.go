@@ -84,7 +84,7 @@ func Launch(ctx context.Context, spawner Spawner, spec LaunchSpec) (*Proc, error
 	child, err := spawner.Spawn(readyCtx, daemonkit.Cmd{
 		Path: spec.RolePath,
 		Args: append(append([]string{}, spec.RoleArgs...),
-			"_bridge-chrome-child", spec.HostBinary, spec.DataDir, strconv.FormatBool(spec.Headed)),
+			ChromeChildVerb, spec.HostBinary, spec.DataDir, strconv.FormatBool(spec.Headed)),
 		Env:     chromeEnvironment(spec.DataDir, spec.Headed, nonce),
 		Session: true,
 		Exec:    daemonkit.ServingSameUser(),
