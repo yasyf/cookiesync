@@ -16,6 +16,7 @@ import (
 
 	"github.com/yasyf/cookiesync/internal/paths"
 	"github.com/yasyf/cookiesync/internal/state"
+	"github.com/yasyf/cookiesync/internal/testutil"
 	"github.com/yasyf/cookiesync/internal/transfer"
 	"github.com/yasyf/synckit/manifest"
 )
@@ -134,7 +135,7 @@ func TestKeyCacheCheckRendersEveryDaemonState(t *testing.T) {
 // synckit manifest with the cookiesync action contract, against a temp config home.
 func TestInstallWritesManifest(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
-	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	testutil.IsolateHostConfig(t, paths.Config)
 	t.Setenv("PATH", t.TempDir())
 
 	out := runRootCmd(t, "install")
@@ -182,7 +183,7 @@ func TestInstallWritesManifest(t *testing.T) {
 
 func TestInstallWritesPersistedWatchDebounce(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
-	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	testutil.IsolateHostConfig(t, paths.Config)
 	t.Setenv("PATH", t.TempDir())
 	if err := state.New(paths.Config).Initialize(context.Background()); err != nil {
 		t.Fatalf("initialize state: %v", err)
@@ -237,7 +238,7 @@ func TestInstallConvergesSynckitdAgents(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Setenv("HOME", t.TempDir())
-			t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+			testutil.IsolateHostConfig(t, paths.Config)
 			bin := t.TempDir()
 			t.Setenv("PATH", bin)
 			calls := filepath.Join(t.TempDir(), "calls")
@@ -277,7 +278,7 @@ func TestInstallConvergesSynckitdAgents(t *testing.T) {
 // the frozen line, and is a no-op (not an error) when no manifest is registered.
 func TestUninstallRemovesManifest(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
-	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	testutil.IsolateHostConfig(t, paths.Config)
 	t.Setenv("PATH", t.TempDir())
 
 	runRootCmd(t, "install")
