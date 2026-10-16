@@ -62,7 +62,9 @@ yasyf@yasyf:arc:Default
 yasyf@yasyf:chrome:Profile 3
 ```
 
-Every listed endpoint converges continuously. The daemon watches each cookie store, holds a three-second settle window, then replays the refreshed session tokens onto your other hosts. The morning Okta dance happens once, on whichever Mac you're at.
+Every listed endpoint converges continuously. The daemon watches each cookie store, waits 10 seconds by default for a burst of writes to settle, then replays the refreshed session tokens onto your other hosts. The morning Okta dance happens once, on whichever Mac you're at.
+
+The settle window is `cookie_sync.settings.watch_debounce` in `~/.config/cookiesync/state.json`. `cookiesync install` copies it into the synckit manifest, so rerun install after you change it. A `state.json` written by 0.31.2 or earlier keeps the three seconds it stored.
 
 ## How it works
 
