@@ -314,7 +314,7 @@ func TestDefaultSettingsSerialize(t *testing.T) {
 	want := settingsJSON{
 		Interval:      "15m",
 		IdleThreshold: "5m",
-		WatchDebounce: "3s",
+		WatchDebounce: "10s",
 		AuthTTL:       "1h",
 	}
 	if got != want {

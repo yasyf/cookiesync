@@ -3,6 +3,7 @@ package cli
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -13,6 +14,8 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/yasyf/cookiesync/internal/paths"
+	"github.com/yasyf/cookiesync/internal/state"
 	"github.com/yasyf/cookiesync/internal/transfer"
 	"github.com/yasyf/synckit/manifest"
 )
@@ -160,8 +163,8 @@ func TestInstallWritesManifest(t *testing.T) {
 	if m.Name != "cookiesync" || m.Binary != "cookiesync" {
 		t.Fatalf("manifest name/binary = %q/%q, want cookiesync/cookiesync", m.Name, m.Binary)
 	}
-	if time.Duration(m.Watch.Debounce) != watchDebounce {
-		t.Fatalf("manifest watch debounce = %v, want %v", time.Duration(m.Watch.Debounce), watchDebounce)
+	if got := time.Duration(m.Watch.Debounce); got != 10*time.Second {
+		t.Fatalf("manifest watch debounce = %v, want the 10s default", got)
 	}
 	if m.Service.Kind != "resident" {
 		t.Fatalf("manifest service kind = %q, want resident", m.Service.Kind)
@@ -174,6 +177,49 @@ func TestInstallWritesManifest(t *testing.T) {
 	}
 	if m.Helper.SessionType != manifest.SessionTypeAqua {
 		t.Fatalf("manifest helper session = %q, want Aqua", m.Helper.SessionType)
+	}
+}
+
+func TestInstallWritesPersistedWatchDebounce(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("PATH", t.TempDir())
+	if err := state.New(paths.Config).Initialize(context.Background()); err != nil {
+		t.Fatalf("initialize state: %v", err)
+	}
+	statePath, err := paths.Config.Path()
+	if err != nil {
+		t.Fatalf("state path: %v", err)
+	}
+	raw, err := os.ReadFile(statePath) //nolint:gosec // path is the test-controlled state.json under a temp config home.
+	if err != nil {
+		t.Fatalf("read state: %v", err)
+	}
+	var envelope map[string]any
+	if err := json.Unmarshal(raw, &envelope); err != nil {
+		t.Fatalf("decode state: %v", err)
+	}
+	envelope["cookie_sync"].(map[string]any)["settings"].(map[string]any)["watch_debounce"] = "45s"
+	raw, err = json.Marshal(envelope)
+	if err != nil {
+		t.Fatalf("encode state: %v", err)
+	}
+	if err := os.WriteFile(statePath, raw, 0o600); err != nil {
+		t.Fatalf("write state: %v", err)
+	}
+
+	runRootCmd(t, "install")
+
+	path, err := manifestPath()
+	if err != nil {
+		t.Fatalf("manifestPath: %v", err)
+	}
+	m, err := manifest.Load(path)
+	if err != nil {
+		t.Fatalf("written manifest does not strictly load: %v", err)
+	}
+	if got := time.Duration(m.Watch.Debounce); got != 45*time.Second {
+		t.Fatalf("manifest watch debounce = %v, want the persisted 45s", got)
 	}
 }
 

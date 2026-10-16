@@ -25,16 +25,9 @@ const (
 	uninstallShort   = "Remove cookiesync's synckit manifest."
 )
 
-// watchDebounce is the settle window synckitd holds a local store's write burst for
-// before converging cookiesync — long enough for a rollback-journal commit's writes to
-// the Cookies DB to land as one change.
-const watchDebounce = 3 * time.Second
-
-// cookiesyncManifest is the synckit manifest synckitd reads to drive cookiesync: the
-// watch backend that fingerprints local stores, the exact resident transfer service,
-// and the resident helper to keep alive. The service declares no socket: synckitd
-// derives it from the helper's launchd label.
-func cookiesyncManifest() manifest.Manifest {
+// cookiesyncManifest is the manifest synckitd drives cookiesync from. The service
+// declares no socket: synckitd derives it from the helper's launchd label.
+func cookiesyncManifest(watchDebounce time.Duration) manifest.Manifest {
 	return manifest.Manifest{
 		Name:   "cookiesync",
 		Binary: "cookiesync",
@@ -62,17 +55,19 @@ func manifestPath() (string, error) {
 	return filepath.Join(dir, "manifests", "cookiesync.json"), nil
 }
 
-// runInstall notes the signed key helper's presence, writes cookiesync's synckit
-// manifest, then runs 'synckitd install' when synckitd is on PATH. That rerenders the
-// resident helper's plist against the cookiesync binary PATH resolves now, so a cask
-// upgrade that deleted the previous bundle leaves no plist naming it. Without synckitd,
-// install points the user at it instead.
+// runInstall writes the synckit manifest from the persisted watch_debounce, then runs
+// 'synckitd install' (when on PATH) to rerender the helper plist after a cask upgrade.
 func runInstall(cmd *cobra.Command, _ []string) error {
-	if err := state.New(paths.Config).Initialize(cmd.Context()); err != nil {
+	store := state.New(paths.Config)
+	if err := store.Initialize(cmd.Context()); err != nil {
 		return fmt.Errorf("initialize cookie-sync state: %w", err)
 	}
+	st, err := store.Load(cmd.Context())
+	if err != nil {
+		return fmt.Errorf("load cookie-sync state: %w", err)
+	}
 	noteHelper(cmd)
-	if err := writeManifest(cookiesyncManifest()); err != nil {
+	if err := writeManifest(cookiesyncManifest(st.Settings.WatchDebounce)); err != nil {
 		return err
 	}
 	path, err := manifestPath()

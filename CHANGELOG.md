@@ -6,6 +6,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **`cookiesync install` writes the persisted watch debounce into the synckit
+  manifest.** Install hardcoded a 3s debounce, so re-running it overwrote a tuned
+  value in `~/.config/synckit/manifests/cookiesync.json`. It now reads
+  `cookie_sync.settings.watch_debounce` from `state.json`. New state defaults the
+  setting to 10s. A `state.json` created by an earlier release keeps the value it
+  stored, 3s unless edited.
+
 ## [0.31.2] - 2026-10-03
 
 ### Fixed
