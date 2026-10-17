@@ -1,1 +1,1 @@
-{"v":1,"lamport":4,"session":"8d9186e0-fba7-4817-bcc6-e16df6c05e3e","ops":[{"kind":"set_criterion_status","id":"c18e4808d480d164b09390ccfdd40755","status":"met","note":"DefaultSettings.WatchDebounce = 10s"}]}
+{"v":1,"lamport":5,"session":"8d9186e0-fba7-4817-bcc6-e16df6c05e3e","ops":[{"kind":"set_criterion_status","id":"9e63b5b4c28884a0e2ea69316c8dd505","status":"met","note":"doctor_darwin_test.go TestInstallWritesPersistedWatchDebounce (45s) and the 10s default; settings_test.go covers the setter; tests touch no service"}]}
