@@ -62,7 +62,15 @@ yasyf@yasyf:arc:Default
 yasyf@yasyf:chrome:Profile 3
 ```
 
-Every listed endpoint converges continuously. The daemon watches each cookie store, holds a three-second settle window, then replays the refreshed session tokens onto your other hosts. The morning Okta dance happens once, on whichever Mac you're at.
+Every listed endpoint converges continuously. The daemon watches each cookie store, waits 10 seconds by default for a burst of writes to settle, then replays the refreshed session tokens onto your other hosts. The morning Okta dance happens once, on whichever Mac you're at.
+
+The settle window is `cookie_sync.settings.watch_debounce` in `~/.config/cookiesync/state.json`. Set it with `cookiesync settings watch-debounce <duration>`, which writes only that key and leaves the synckit manifest and the running services alone. `cookiesync install` copies the stored value into the manifest, so rerun install after you change it.
+
+A `state.json` written by 0.31.2 or earlier still stores three seconds, and the next install copies that over any debounce tuned in the manifest. On those hosts, store the value you want once before the next install:
+
+```bash
+cookiesync settings watch-debounce 10s
+```
 
 ## How it works
 
@@ -140,6 +148,7 @@ TTL expiry does not revoke cookies already returned by `cookies`, stored by your
 | `cookies <url>...` | Stream cookies for one or more URLs as `playwright`, `netscape`, `header`, `json`, or `webstorage`; omit `--browser` to union every registered browser and host. |
 | `import --ttl <d> --format <f> --browser <b> --profile <p> -- <host>...` | Linux only. Hold a Mac-exported cookies or web-storage document in memory for the named hosts until the TTL lapses. |
 | `route-consent <target>` | Route the consent gate to a host that already has a live, unlocked session. |
+| `settings watch-debounce <d>` | Store the watch debounce in `state.json` without touching the manifest or any service; the next `install` writes it into the synckit manifest. |
 | `self` | Print this host's SSH target, as the synckit host mesh reports it. |
 | `rpc <method>` | Low-level RPC client for the resident daemon (extract, apply, sync, reconcile). |
 

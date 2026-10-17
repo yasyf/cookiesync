@@ -203,10 +203,10 @@ func TestHandleAuthStatusReturnsWhileAHealIsMidFlight(t *testing.T) {
 	d.broker.KeybagProbe = staticProbe(liveSession(currentUser(t)))
 
 	id := endpointID("me@laptop", "chrome", "Default")
-	putDone := make(chan error, 1)
+	putDone := make(chan struct{})
 	go func() {
-		_, err := keyCache.Put(context.Background(), id, []byte("k"), 5*time.Minute)
-		putDone <- err
+		defer close(putDone)
+		_, _ = keyCache.Put(context.Background(), id, []byte("k"), 5*time.Minute)
 	}()
 	t.Cleanup(func() {
 		_ = os.WriteFile(releasePath, nil, 0o600)

@@ -13,6 +13,9 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/yasyf/cookiesync/internal/paths"
+	"github.com/yasyf/cookiesync/internal/state"
+	"github.com/yasyf/cookiesync/internal/testutil"
 	"github.com/yasyf/cookiesync/internal/transfer"
 	"github.com/yasyf/synckit/manifest"
 )
@@ -131,7 +134,7 @@ func TestKeyCacheCheckRendersEveryDaemonState(t *testing.T) {
 // synckit manifest with the cookiesync action contract, against a temp config home.
 func TestInstallWritesManifest(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
-	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	testutil.IsolateHostConfig(t, paths.Config)
 	t.Setenv("PATH", t.TempDir())
 
 	out := runRootCmd(t, "install")
@@ -160,8 +163,8 @@ func TestInstallWritesManifest(t *testing.T) {
 	if m.Name != "cookiesync" || m.Binary != "cookiesync" {
 		t.Fatalf("manifest name/binary = %q/%q, want cookiesync/cookiesync", m.Name, m.Binary)
 	}
-	if time.Duration(m.Watch.Debounce) != watchDebounce {
-		t.Fatalf("manifest watch debounce = %v, want %v", time.Duration(m.Watch.Debounce), watchDebounce)
+	if got := time.Duration(m.Watch.Debounce); got != 10*time.Second {
+		t.Fatalf("manifest watch debounce = %v, want the 10s default", got)
 	}
 	if m.Service.Kind != "resident" {
 		t.Fatalf("manifest service kind = %q, want resident", m.Service.Kind)
@@ -174,6 +177,59 @@ func TestInstallWritesManifest(t *testing.T) {
 	}
 	if m.Helper.SessionType != manifest.SessionTypeAqua {
 		t.Fatalf("manifest helper session = %q, want Aqua", m.Helper.SessionType)
+	}
+}
+
+func TestInstallWritesPersistedWatchDebounce(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	testutil.IsolateHostConfig(t, paths.Config)
+	t.Setenv("PATH", t.TempDir())
+	if err := state.New(paths.Config).Initialize(context.Background()); err != nil {
+		t.Fatalf("initialize state: %v", err)
+	}
+	envelope := readStateEnvelope(t)
+	stateSettings(envelope)["watch_debounce"] = "45s"
+	writeStateEnvelope(t, envelope)
+
+	runRootCmd(t, "install")
+
+	path, err := manifestPath()
+	if err != nil {
+		t.Fatalf("manifestPath: %v", err)
+	}
+	m, err := manifest.Load(path)
+	if err != nil {
+		t.Fatalf("written manifest does not strictly load: %v", err)
+	}
+	if got := time.Duration(m.Watch.Debounce); got != 45*time.Second {
+		t.Fatalf("manifest watch debounce = %v, want the persisted 45s", got)
+	}
+}
+
+func TestSettingsWatchDebounceReachesTheManifestOnInstall(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	testutil.IsolateHostConfig(t, paths.Config)
+	t.Setenv("PATH", t.TempDir())
+	seedPreReleaseState(t)
+
+	runRootCmd(t, "settings", "watch-debounce", "20s")
+
+	path, err := manifestPath()
+	if err != nil {
+		t.Fatalf("manifestPath: %v", err)
+	}
+	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("stat manifest after settings = %v, want no manifest written", err)
+	}
+
+	runRootCmd(t, "install")
+
+	m, err := manifest.Load(path)
+	if err != nil {
+		t.Fatalf("written manifest does not strictly load: %v", err)
+	}
+	if got := time.Duration(m.Watch.Debounce); got != 20*time.Second {
+		t.Fatalf("manifest watch debounce = %v, want the stored 20s", got)
 	}
 }
 
@@ -191,7 +247,7 @@ func TestInstallConvergesSynckitdAgents(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Setenv("HOME", t.TempDir())
-			t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+			testutil.IsolateHostConfig(t, paths.Config)
 			bin := t.TempDir()
 			t.Setenv("PATH", bin)
 			calls := filepath.Join(t.TempDir(), "calls")
@@ -231,7 +287,7 @@ func TestInstallConvergesSynckitdAgents(t *testing.T) {
 // the frozen line, and is a no-op (not an error) when no manifest is registered.
 func TestUninstallRemovesManifest(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
-	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	testutil.IsolateHostConfig(t, paths.Config)
 	t.Setenv("PATH", t.TempDir())
 
 	runRootCmd(t, "install")
