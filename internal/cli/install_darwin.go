@@ -25,8 +25,6 @@ const (
 	uninstallShort   = "Remove cookiesync's synckit manifest."
 )
 
-// cookiesyncManifest is the manifest synckitd drives cookiesync from. The service
-// declares no socket: synckitd derives it from the helper's launchd label.
 func cookiesyncManifest(watchDebounce time.Duration) manifest.Manifest {
 	return manifest.Manifest{
 		Name:   "cookiesync",
@@ -35,6 +33,7 @@ func cookiesyncManifest(watchDebounce time.Duration) manifest.Manifest {
 		Watch: manifest.WatchSpec{
 			Debounce: codec.Duration(watchDebounce),
 		},
+		// No socket: synckitd derives it from the helper's launchd label.
 		Service: manifest.ServiceSpec{
 			Kind: "resident", SchemaFingerprint: transfer.Fingerprint,
 		},
@@ -55,8 +54,6 @@ func manifestPath() (string, error) {
 	return filepath.Join(dir, "manifests", "cookiesync.json"), nil
 }
 
-// runInstall writes the synckit manifest from the persisted watch_debounce, then runs
-// 'synckitd install' (when on PATH) to rerender the helper plist after a cask upgrade.
 func runInstall(cmd *cobra.Command, _ []string) error {
 	store := state.New(paths.Config)
 	if err := store.Initialize(cmd.Context()); err != nil {
@@ -75,6 +72,8 @@ func runInstall(cmd *cobra.Command, _ []string) error {
 		return err
 	}
 	cmd.Printf("Registered cookiesync manifest at %s.\n", path)
+	// Rerenders the helper plist against the binary PATH resolves now, so a cask
+	// upgrade that deleted the previous bundle leaves no plist naming it.
 	return convergeSynckitd(cmd)
 }
 
