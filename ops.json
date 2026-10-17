@@ -1,1 +1,1 @@
-{"v":1,"lamport":3,"session":"8d9186e0-fba7-4817-bcc6-e16df6c05e3e","ops":[{"kind":"set_criterion_status","id":"0f9ef74206a350b6d594713a3ba1d876","status":"met","note":"install_darwin.go reads state.Settings.WatchDebounce (#10, 7918737)"}]}
+{"v":1,"lamport":4,"session":"8d9186e0-fba7-4817-bcc6-e16df6c05e3e","ops":[{"kind":"set_criterion_status","id":"c18e4808d480d164b09390ccfdd40755","status":"met","note":"DefaultSettings.WatchDebounce = 10s"}]}
