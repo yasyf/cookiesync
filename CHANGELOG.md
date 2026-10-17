@@ -6,13 +6,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **`cookiesync settings watch-debounce <duration>`.** Stores
+  `cookie_sync.settings.watch_debounce` in `state.json` and changes nothing else: no
+  manifest write, no `synckitd` call, no service restart. It takes the `auth --ttl`
+  duration grammar (`10s`, `2m`) and refuses zero and negative values. The next
+  `cookiesync install` writes the stored value into the synckit manifest.
+
 ### Changed
 - **`cookiesync install` writes the persisted watch debounce into the synckit
   manifest.** Install hardcoded a 3s debounce, so re-running it overwrote a tuned
   value in `~/.config/synckit/manifests/cookiesync.json`. It now reads
   `cookie_sync.settings.watch_debounce` from `state.json`. New state defaults the
   setting to 10s. A `state.json` created by an earlier release keeps the value it
-  stored, 3s unless edited.
+  stored, 3s unless edited, and the next install writes that over the manifest. On
+  those hosts, run `cookiesync settings watch-debounce 10s` (or your tuned value)
+  once before the next install.
 
 ## [0.31.2] - 2026-10-03
 

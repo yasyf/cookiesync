@@ -241,6 +241,19 @@ func (s *Store) SetAuthTTL(ctx context.Context, ttl time.Duration) error {
 	})
 }
 
+// SetWatchDebounce overrides the watch debounce setting, leaving the other cadence
+// knobs untouched.
+func (s *Store) SetWatchDebounce(ctx context.Context, debounce time.Duration) error {
+	return s.cfg.UpdateProduct(ctx, func(raw json.RawMessage) (json.RawMessage, error) {
+		st, err := stateFromProduct(raw)
+		if err != nil {
+			return nil, err
+		}
+		st.Settings.WatchDebounce = debounce
+		return encodeState(st)
+	})
+}
+
 func stateFromProduct(encoded json.RawMessage) (*State, error) {
 	var persisted stateJSON
 	if err := hostregistry.DecodeExactJSON(encoded, &persisted); err != nil {

@@ -3,7 +3,6 @@ package cli
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -188,26 +187,9 @@ func TestInstallWritesPersistedWatchDebounce(t *testing.T) {
 	if err := state.New(paths.Config).Initialize(context.Background()); err != nil {
 		t.Fatalf("initialize state: %v", err)
 	}
-	statePath, err := paths.Config.Path()
-	if err != nil {
-		t.Fatalf("state path: %v", err)
-	}
-	raw, err := os.ReadFile(statePath) //nolint:gosec // path is the test-controlled state.json under a temp config home.
-	if err != nil {
-		t.Fatalf("read state: %v", err)
-	}
-	var envelope map[string]any
-	if err := json.Unmarshal(raw, &envelope); err != nil {
-		t.Fatalf("decode state: %v", err)
-	}
-	envelope["cookie_sync"].(map[string]any)["settings"].(map[string]any)["watch_debounce"] = "45s"
-	raw, err = json.Marshal(envelope)
-	if err != nil {
-		t.Fatalf("encode state: %v", err)
-	}
-	if err := os.WriteFile(statePath, raw, 0o600); err != nil {
-		t.Fatalf("write state: %v", err)
-	}
+	envelope := readStateEnvelope(t)
+	stateSettings(envelope)["watch_debounce"] = "45s"
+	writeStateEnvelope(t, envelope)
 
 	runRootCmd(t, "install")
 
@@ -221,6 +203,33 @@ func TestInstallWritesPersistedWatchDebounce(t *testing.T) {
 	}
 	if got := time.Duration(m.Watch.Debounce); got != 45*time.Second {
 		t.Fatalf("manifest watch debounce = %v, want the persisted 45s", got)
+	}
+}
+
+func TestSettingsWatchDebounceReachesTheManifestOnInstall(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	testutil.IsolateHostConfig(t, paths.Config)
+	t.Setenv("PATH", t.TempDir())
+	seedPreReleaseState(t)
+
+	runRootCmd(t, "settings", "watch-debounce", "20s")
+
+	path, err := manifestPath()
+	if err != nil {
+		t.Fatalf("manifestPath: %v", err)
+	}
+	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("stat manifest after settings = %v, want no manifest written", err)
+	}
+
+	runRootCmd(t, "install")
+
+	m, err := manifest.Load(path)
+	if err != nil {
+		t.Fatalf("written manifest does not strictly load: %v", err)
+	}
+	if got := time.Duration(m.Watch.Debounce); got != 20*time.Second {
+		t.Fatalf("manifest watch debounce = %v, want the stored 20s", got)
 	}
 }
 
