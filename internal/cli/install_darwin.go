@@ -26,6 +26,8 @@ const (
 	uninstallShort   = "Remove cookiesync's synckit manifest."
 )
 
+var ensureHelper = rpc.Ensure
+
 func cookiesyncManifest(watchDebounce time.Duration) manifest.Manifest {
 	return manifest.Manifest{
 		Name:   "cookiesync",
@@ -76,7 +78,7 @@ func runInstall(cmd *cobra.Command, _ []string) error {
 	if err := convergeSynckitd(cmd); err != nil {
 		return err
 	}
-	ensured, err := rpc.Ensure(cmd.Context(), cmd.Root().Version)
+	ensured, err := ensureHelper(cmd.Context(), cmd.Root().Version)
 	if err != nil {
 		return fmt.Errorf("ensure the resident helper: %w", err)
 	}
