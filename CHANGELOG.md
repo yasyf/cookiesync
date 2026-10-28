@@ -10,14 +10,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- The Homebrew cask strips quarantine with a `postflight_steps` stanza instead of the Ruby `postflight` block Homebrew 7 deprecated, so `brew upgrade` no longer warns. It no longer reruns `cookiesync install` after an upgrade: Homebrew's step sandbox refuses the synckitd socket, and synckitd's reconcile tick now re-points the helper at the upgraded bundle (yasyf/synckit#16).
+- The Homebrew cask strips quarantine with a `postflight_steps` stanza instead of the Ruby `postflight` block Homebrew 7 deprecated, so `brew upgrade` no longer warns. It no longer reruns `cookiesync install` after an upgrade, because Homebrew's step sandbox refuses the synckitd socket.
+- **A `brew upgrade` no longer strands the resident helper.** Its LaunchAgent names `/opt/homebrew/bin/cookiesync` instead of the versioned `CookieSync.app` inside the Caskroom, which the upgrade deletes. Within one 15-minute synckitd reconcile tick, launchd reloads the helper onto the upgraded build (yasyf/synckit#16, yasyf/synckit#18).
 
 ### Changed
 - **Any process running as the same user can now connect to the resident helper.**
   Daemon connections and bridge children no longer undergo peer or executable
   verification. Helper build identity now uses the running version, including an
   executable-mtime version for development builds, instead of hashing the binary.
-- Builds against daemonkit 0.35.1 and synckit 0.47.0 with Go 1.26.10.
+- Builds against daemonkit 0.35.4 and synckit 0.48.0 with Go 1.26.10.
 
 ## [0.32.0] - 2026-10-17
 
