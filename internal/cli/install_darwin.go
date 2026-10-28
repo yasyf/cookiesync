@@ -12,6 +12,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/yasyf/cookiesync/internal/paths"
+	"github.com/yasyf/cookiesync/internal/rpc"
 	"github.com/yasyf/cookiesync/internal/state"
 	"github.com/yasyf/cookiesync/internal/transfer"
 	"github.com/yasyf/synckit/codec"
@@ -72,7 +73,15 @@ func runInstall(cmd *cobra.Command, _ []string) error {
 		return err
 	}
 	cmd.Printf("Registered cookiesync manifest at %s.\n", path)
-	return convergeSynckitd(cmd)
+	if err := convergeSynckitd(cmd); err != nil {
+		return err
+	}
+	ensured, err := rpc.Ensure(cmd.Context(), cmd.Root().Version)
+	if err != nil {
+		return fmt.Errorf("ensure the resident helper: %w", err)
+	}
+	cmd.Printf("Resident helper serving (%s).\n", ensured.Did)
+	return nil
 }
 
 func convergeSynckitd(cmd *cobra.Command) error {

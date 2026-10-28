@@ -58,6 +58,8 @@ import (
 // matching the Python DEFAULT_PROFILE.
 const defaultProfile = "Default"
 
+const helperCommand = "helper-serve"
+
 // settleRecoveryCloseBudget bounds the key cache's close when recovery fails
 // during preparation, after the activation context is already spent.
 const settleRecoveryCloseBudget = 10 * time.Second

@@ -17,10 +17,6 @@ import (
 // caller-supplied reason.
 const consentReason = "sync them across your machines"
 
-// helperCommand is the cookiesync subcommand the supervisor runs as the
-// resident helper.
-const helperCommand = "helper-serve"
-
 func hostPlatform() platform {
 	return platform{
 		sealer:  cache.NoEnclave{},
