@@ -41,8 +41,8 @@ func unattended(context.Context) (SessionSnapshot, error) {
 // runs it: the label every client opens, the stable program path, and the
 // helper-serve role. It is the spec daemonkit.Supervise is keyed by and
 // Client.Ensure applies.
-func HelperSpec() (daemonkit.Daemon, error) {
-	program, err := daemonkit.Stable()
+func HelperSpec(build string) (daemonkit.Daemon, error) {
+	program, err := daemonkit.Stable(build)
 	if err != nil {
 		return daemonkit.Daemon{}, err
 	}

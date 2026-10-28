@@ -217,7 +217,7 @@ func TestPeerSessionRequestorOverSocket(t *testing.T) {
 	}
 	prepareHelperRuntime(t, executable)
 	fakeMesh(t, self)
-	runtime, err := newHelperRuntime(executable, func(daemonkit.Ctx) (*Daemon, func(context.Context) error, error) {
+	runtime, err := newHelperRuntime(executable, "test", func(daemonkit.Ctx) (*Daemon, func(context.Context) error, error) {
 		return d, func(context.Context) error { return nil }, nil
 	})
 	if err != nil {

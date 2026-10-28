@@ -41,7 +41,7 @@ func TestRPCBridgeOpenForwardsTheWindowMode(t *testing.T) {
 			var gotMethod string
 			var gotParams map[string]any
 			orig := rpcCall
-			rpcCall = func(_ context.Context, method string, params map[string]any) (any, error) {
+			rpcCall = func(_ context.Context, _ string, method string, params map[string]any) (any, error) {
 				gotMethod, gotParams = method, params
 				return map[string]any{}, nil
 			}

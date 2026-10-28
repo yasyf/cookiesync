@@ -14,7 +14,7 @@ func fakePrimeAuth(t *testing.T, park time.Duration, replies ...map[string]any) 
 	t.Helper()
 	var waits []float64
 	orig := rpcCallJSON
-	rpcCallJSON = func(_ context.Context, method string, params map[string]any, out any) error {
+	rpcCallJSON = func(_ context.Context, _ string, method string, params map[string]any, out any) error {
 		if method != "prime_auth" {
 			t.Fatalf("method = %s, want prime_auth", method)
 		}

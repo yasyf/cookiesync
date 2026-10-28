@@ -16,7 +16,7 @@ import (
 )
 
 // stubOpenBridge swaps the openBridge seam for the duration of a test.
-func stubOpenBridge(t *testing.T, fn func(context.Context, string, string, string, bridge.WindowMode) (bridgeOpenResult, error)) {
+func stubOpenBridge(t *testing.T, fn func(context.Context, string, string, string, string, bridge.WindowMode) (bridgeOpenResult, error)) {
 	t.Helper()
 	orig := openBridge
 	openBridge = fn
@@ -24,7 +24,7 @@ func stubOpenBridge(t *testing.T, fn func(context.Context, string, string, strin
 }
 
 // stubStopBridge swaps the stopBridge seam for the duration of a test.
-func stubStopBridge(t *testing.T, fn func(context.Context, string) error) {
+func stubStopBridge(t *testing.T, fn func(context.Context, string, string) error) {
 	t.Helper()
 	orig := stopBridge
 	stopBridge = fn
@@ -35,7 +35,7 @@ func stubStopBridge(t *testing.T, fn func(context.Context, string) error) {
 // bridgeOpenJSON object (no human lines), carries the url, and never leaks the
 // management capability openBridge persists client-side.
 func TestBridgeOpenJSON(t *testing.T) {
-	stubOpenBridge(t, func(_ context.Context, host, browser, profile string, window bridge.WindowMode) (bridgeOpenResult, error) {
+	stubOpenBridge(t, func(_ context.Context, _ string, host, browser, profile string, window bridge.WindowMode) (bridgeOpenResult, error) {
 		if host != "" || browser != "chrome" || profile != bridgeDefaultProfile || window != bridge.WindowAuto {
 			t.Fatalf("openBridge args = %q/%q/%q window=%v, want ''/chrome/Default window=auto", host, browser, profile, window)
 		}
@@ -79,7 +79,7 @@ func TestBridgeOpenJSON(t *testing.T) {
 
 func TestBareBridgeOpenAndStopShareTheDefaultTarget(t *testing.T) {
 	var openedKey string
-	stubOpenBridge(t, func(_ context.Context, host, browser, profile string, window bridge.WindowMode) (bridgeOpenResult, error) {
+	stubOpenBridge(t, func(_ context.Context, _ string, host, browser, profile string, window bridge.WindowMode) (bridgeOpenResult, error) {
 		if window != bridge.WindowAuto {
 			t.Fatalf("bare open window = %v, want auto", window)
 		}
@@ -87,7 +87,7 @@ func TestBareBridgeOpenAndStopShareTheDefaultTarget(t *testing.T) {
 		return bridgeOpenResult{URL: "ws://127.0.0.1:9222/tok/devtools/browser/uuid", Browser: browser, Profile: profile}, nil
 	})
 	var stoppedKey string
-	stubStopBridge(t, func(_ context.Context, key string) error {
+	stubStopBridge(t, func(_ context.Context, _ string, key string) error {
 		stoppedKey = key
 		return nil
 	})
@@ -181,7 +181,7 @@ func TestBridgeOpenWindowFlags(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			got := bridge.WindowMode(-1)
-			stubOpenBridge(t, func(_ context.Context, _, _, _ string, window bridge.WindowMode) (bridgeOpenResult, error) {
+			stubOpenBridge(t, func(_ context.Context, _, _, _, _ string, window bridge.WindowMode) (bridgeOpenResult, error) {
 				got = window
 				return bridgeOpenResult{}, nil
 			})
@@ -304,10 +304,10 @@ func TestInvalidBridgeCapabilityStateFailsLoudlyAndRemains(t *testing.T) {
 	if err := os.WriteFile(path, []byte(invalid), 0o600); err != nil {
 		t.Fatalf("write invalid capability: %v", err)
 	}
-	if _, err := openBridge(t.Context(), "", "chrome", bridgeDefaultProfile, bridge.WindowHeadless); err == nil {
+	if _, err := openBridge(t.Context(), "test", "", "chrome", bridgeDefaultProfile, bridge.WindowHeadless); err == nil {
 		t.Fatal("openBridge accepted invalid persisted capability")
 	}
-	if err := stopBridge(t.Context(), key); err == nil {
+	if err := stopBridge(t.Context(), "test", key); err == nil {
 		t.Fatal("stopBridge accepted invalid persisted capability")
 	}
 	if _, err := listCaps(); err == nil {
@@ -381,7 +381,7 @@ func TestBridgePluginManifest(t *testing.T) {
 func TestBridgePluginLaunch(t *testing.T) {
 	var gotHost, gotBrowser, gotProfile string
 	var gotWindow bridge.WindowMode
-	stubOpenBridge(t, func(_ context.Context, host, browser, profile string, window bridge.WindowMode) (bridgeOpenResult, error) {
+	stubOpenBridge(t, func(_ context.Context, _ string, host, browser, profile string, window bridge.WindowMode) (bridgeOpenResult, error) {
 		gotHost, gotBrowser, gotProfile, gotWindow = host, browser, profile, window
 		return bridgeOpenResult{
 			URL:        "ws://127.0.0.1:9222/devtools/browser/tok",
@@ -433,7 +433,7 @@ func TestBridgePluginLaunch(t *testing.T) {
 func TestBridgePluginLaunchBadEngine(t *testing.T) {
 	for _, engine := range []string{"", "lightpanda", "firefox"} {
 		t.Run("engine="+engine, func(t *testing.T) {
-			stubOpenBridge(t, func(context.Context, string, string, string, bridge.WindowMode) (bridgeOpenResult, error) {
+			stubOpenBridge(t, func(context.Context, string, string, string, string, bridge.WindowMode) (bridgeOpenResult, error) {
 				t.Fatal("a bad engine must not open a bridge")
 				return bridgeOpenResult{}, nil
 			})
@@ -458,7 +458,7 @@ func TestBridgePluginLaunchBadEngine(t *testing.T) {
 // success:false envelope carrying the error and exit 0 (nil return) — a valid
 // protocol response is a successful program run.
 func TestBridgePluginLaunchError(t *testing.T) {
-	stubOpenBridge(t, func(_ context.Context, _, _, _ string, _ bridge.WindowMode) (bridgeOpenResult, error) {
+	stubOpenBridge(t, func(_ context.Context, _, _, _, _ string, _ bridge.WindowMode) (bridgeOpenResult, error) {
 		return bridgeOpenResult{}, errBoom
 	})
 	req := `{"protocol":"agent-browser.plugin.v1","type":"browser.launch","request":{"launchOptions":{"engine":"chrome"}}}`
@@ -481,7 +481,7 @@ func TestBridgePluginLaunchError(t *testing.T) {
 // leaks no capability.
 func TestBridgePluginClose(t *testing.T) {
 	var gotKey string
-	stubStopBridge(t, func(_ context.Context, key string) error {
+	stubStopBridge(t, func(_ context.Context, _ string, key string) error {
 		gotKey = key
 		return nil
 	})
@@ -505,7 +505,7 @@ func TestBridgePluginClose(t *testing.T) {
 // TestBridgePluginUnknownType proves an unrecognized type yields a success:false
 // envelope and exit 0 (nil return), without touching a bridge.
 func TestBridgePluginUnknownType(t *testing.T) {
-	stubOpenBridge(t, func(context.Context, string, string, string, bridge.WindowMode) (bridgeOpenResult, error) {
+	stubOpenBridge(t, func(context.Context, string, string, string, string, bridge.WindowMode) (bridgeOpenResult, error) {
 		t.Fatal("unknown type must not open a bridge")
 		return bridgeOpenResult{}, nil
 	})
@@ -526,7 +526,7 @@ func TestBridgePluginUnknownType(t *testing.T) {
 // TestBridgePluginBadProtocol proves a mismatched protocol tag yields a
 // success:false envelope and exit 0 (nil return), not a panic or non-zero exit.
 func TestBridgePluginBadProtocol(t *testing.T) {
-	stubOpenBridge(t, func(context.Context, string, string, string, bridge.WindowMode) (bridgeOpenResult, error) {
+	stubOpenBridge(t, func(context.Context, string, string, string, string, bridge.WindowMode) (bridgeOpenResult, error) {
 		t.Fatal("a bad protocol must not open a bridge")
 		return bridgeOpenResult{}, nil
 	})
@@ -557,7 +557,7 @@ func (e *stubError) Error() string { return e.msg }
 func runPlugin(t *testing.T, req string) string {
 	t.Helper()
 	var out bytes.Buffer
-	if err := runBridgePlugin(context.Background(), strings.NewReader(req), &out); err != nil {
+	if err := runBridgePlugin(context.Background(), "test", strings.NewReader(req), &out); err != nil {
 		t.Fatalf("runBridgePlugin(%s) = %v, want nil", req, err)
 	}
 	return out.String()

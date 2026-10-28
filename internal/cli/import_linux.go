@@ -76,7 +76,7 @@ func runImport(cmd *cobra.Command, hosts []string, format, ttl, browser, profile
 	if len(body) > synckit.MaxPayload {
 		return fmt.Errorf("import request exceeds the %d-byte RPC payload limit (synckit rpc.MaxPayload)", synckit.MaxPayload)
 	}
-	result, err := rpcCall(cmd.Context(), "import", params)
+	result, err := rpcCall(cmd.Context(), cmd.Root().Version, "import", params)
 	if err != nil {
 		return err
 	}

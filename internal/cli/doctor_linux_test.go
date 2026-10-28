@@ -69,7 +69,7 @@ func TestLinuxDoctorWordingNamesNoMacBackend(t *testing.T) {
 func TestCheckSupervisorWithoutSupervisorFails(t *testing.T) {
 	isolateDaemonkit(t)
 
-	got := checkSupervisor(context.Background())
+	got := checkSupervisor(context.Background(), "test")
 	if got.ok || got.label != "supervisor" {
 		t.Fatalf("checkSupervisor = %+v, want a failing supervisor line", got)
 	}

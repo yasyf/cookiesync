@@ -84,7 +84,7 @@ func newBridgePluginCmd() *cobra.Command {
 		Hidden: true,
 		Args:   cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			return runBridgePlugin(cmd.Context(), cmd.InOrStdin(), cmd.OutOrStdout())
+			return runBridgePlugin(cmd.Context(), cmd.Root().Version, cmd.InOrStdin(), cmd.OutOrStdout())
 		},
 	}
 }
@@ -93,7 +93,7 @@ func newBridgePluginCmd() *cobra.Command {
 // dispatches on its type, and writes exactly one JSON response to out. A protocol
 // failure emits a success:false envelope and still exits 0; only a stdout write
 // failure returns non-nil.
-func runBridgePlugin(ctx context.Context, in io.Reader, out io.Writer) error {
+func runBridgePlugin(ctx context.Context, build string, in io.Reader, out io.Writer) error {
 	raw, err := io.ReadAll(in)
 	if err != nil {
 		return err
@@ -117,9 +117,9 @@ func runBridgePlugin(ctx context.Context, in io.Reader, out io.Writer) error {
 			},
 		})
 	case "browser.launch":
-		return pluginLaunch(ctx, out, req.Request)
+		return pluginLaunch(ctx, build, out, req.Request)
 	case "browser.close":
-		return pluginClose(ctx, out, req.Request)
+		return pluginClose(ctx, build, out, req.Request)
 	default:
 		return pluginFail(out, fmt.Errorf("unsupported plugin request type %q", req.Type))
 	}
@@ -132,7 +132,7 @@ var engineBrowser = map[string]string{"chrome": "chrome"}
 // pluginLaunch maps a browser.launch to a fresh local `bridge open` (default
 // profile) and returns its ws:// endpoint as cdpUrl. directPage stays false so
 // agent-browser runs its own target discovery and attaches the seeded page.
-func pluginLaunch(ctx context.Context, out io.Writer, body json.RawMessage) error {
+func pluginLaunch(ctx context.Context, build string, out io.Writer, body json.RawMessage) error {
 	var lr pluginLaunchRequest
 	if err := json.Unmarshal(body, &lr); err != nil {
 		return pluginFail(out, fmt.Errorf("parse browser.launch request: %w", err))
@@ -145,7 +145,7 @@ func pluginLaunch(ctx context.Context, out io.Writer, body json.RawMessage) erro
 	if lr.LaunchOptions.Headed {
 		window = bridge.WindowHeaded
 	}
-	resp, err := openBridge(ctx, "", browser, bridgeDefaultProfile, window)
+	resp, err := openBridge(ctx, build, "", browser, bridgeDefaultProfile, window)
 	if err != nil {
 		return pluginFail(out, err)
 	}
@@ -161,12 +161,12 @@ func pluginLaunch(ctx context.Context, out io.Writer, body json.RawMessage) erro
 }
 
 // pluginClose maps a browser.close to `bridge stop` for the echoed endpoint.
-func pluginClose(ctx context.Context, out io.Writer, body json.RawMessage) error {
+func pluginClose(ctx context.Context, build string, out io.Writer, body json.RawMessage) error {
 	var cl pluginCleanup
 	if err := json.Unmarshal(body, &cl); err != nil {
 		return pluginFail(out, fmt.Errorf("parse browser.close request: %w", err))
 	}
-	if err := stopBridge(ctx, cl.Endpoint); err != nil {
+	if err := stopBridge(ctx, build, cl.Endpoint); err != nil {
 		return pluginFail(out, err)
 	}
 	return writePluginJSON(out, pluginOKResponse{Protocol: agentBrowserProtocol, Success: true})

@@ -104,8 +104,8 @@ func OpenTunnel(ctx context.Context, spawner Spawner, spec TunnelSpec) (*Tunnel,
 
 // dialTunnel starts one ssh forward to addr and proves it up. The spawn and the
 // proof carry separate budgets: tunnelProveTimeout bounds the proving alone, so
-// shrinking it in a test still leaves the launch itself — record store, exec
-// verification, session setup — room to complete, and one slow launch never
+// shrinking it in a test still leaves the launch itself — record store, session
+// setup — room to complete, and one slow launch never
 // consumes the candidate's whole allowance.
 func dialTunnel(ctx context.Context, spawner Spawner, addr string, spec TunnelSpec) (*Tunnel, error) {
 	stderr := &lockedBuffer{}
@@ -122,7 +122,6 @@ func dialTunnel(ctx context.Context, spawner Spawner, addr string, spec TunnelSp
 		Args:    argv,
 		Env:     bridgeEnvironment(),
 		Session: true,
-		Exec:    daemonkit.ServingSameUser(),
 	}, daemonkit.ChannelNone, stderr)
 	if err != nil {
 		return nil, fmt.Errorf("start ssh tunnel to %s: %w", addr, err)

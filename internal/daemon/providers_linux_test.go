@@ -180,7 +180,7 @@ func TestLinuxCacheOpensInTheMemoryTier(t *testing.T) {
 }
 
 func TestHelperSpecRunsHelperServeUnderTheClientLabel(t *testing.T) {
-	spec, err := HelperSpec()
+	spec, err := HelperSpec("test")
 	if err != nil {
 		t.Fatalf("HelperSpec: %v", err)
 	}

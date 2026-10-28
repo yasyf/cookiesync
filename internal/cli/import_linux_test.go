@@ -37,8 +37,13 @@ func serveImportHelper(t *testing.T) *synckit.Client {
 	t.Cleanup(func() { _ = os.RemoveAll(home) })
 	t.Setenv("DAEMONKIT_HOME", home)
 
+	program, err := daemonkit.Stable("test")
+	if err != nil {
+		t.Fatalf("daemonkit.Stable: %v", err)
+	}
 	runtime, err := helperruntime.New(helperruntime.Config{
 		App:        helperruntime.App{Name: paths.ToolName},
+		Program:    program,
 		Dispatcher: daemon.New(nil, nil, nil, nil, nil, nil, nil).Dispatcher(),
 		Prepare:    func(daemonkit.Ctx) (helperruntime.Product, error) { return idleProduct{}, nil },
 	})
@@ -60,7 +65,7 @@ func serveImportHelper(t *testing.T) *synckit.Client {
 		}
 	})
 
-	spec, err := daemon.HelperSpec()
+	spec, err := daemon.HelperSpec("test")
 	if err != nil {
 		t.Fatalf("daemon.HelperSpec: %v", err)
 	}
@@ -114,7 +119,7 @@ func TestImportSendsTheDocumentVerbatim(t *testing.T) {
 	var calls []map[string]any
 	var methods []string
 	orig := rpcCall
-	rpcCall = func(_ context.Context, method string, params map[string]any) (any, error) {
+	rpcCall = func(_ context.Context, _ string, method string, params map[string]any) (any, error) {
 		methods = append(methods, method)
 		calls = append(calls, params)
 		return map[string]any{
@@ -215,7 +220,7 @@ func TestImportRefusesBeforeAnyRPC(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			orig := rpcCall
-			rpcCall = func(_ context.Context, method string, _ map[string]any) (any, error) {
+			rpcCall = func(_ context.Context, _ string, method string, _ map[string]any) (any, error) {
 				t.Fatalf("import called %s for a refused request", method)
 				return nil, nil
 			}
@@ -257,7 +262,7 @@ func TestImportRequestFitsTheHelperFrame(t *testing.T) {
 	lane := serveImportHelper(t)
 	var sent []int
 	orig := rpcCall
-	rpcCall = func(ctx context.Context, method string, params map[string]any) (any, error) {
+	rpcCall = func(ctx context.Context, _ string, method string, params map[string]any) (any, error) {
 		req := &synckit.Request{Method: method, Params: params}
 		body, err := synckit.EncodeRequest(req)
 		if err != nil {
