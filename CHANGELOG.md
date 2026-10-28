@@ -6,6 +6,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.34.0] - 2026-10-28
+
 ### Changed
 
 - **cookiesync owns its resident helper's LaunchAgent on macOS, as it already
