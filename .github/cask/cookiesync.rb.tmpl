@@ -40,20 +40,11 @@ cask "cookiesync" do
   # quarantine strip on the bundle keeps a first exec friction-free even if the staple
   # check is skipped.
   #
-  # The helper plist names the versioned Caskroom bundle, which brew upgrade deletes,
-  # and a kickstart never rereads a plist. Rerun `cookiesync install` once the helper
-  # agent exists so synckitd rerenders and reloads it against this version.
-  postflight do
-    system_command "/usr/bin/xattr",
-                   args:         ["-dr", "com.apple.quarantine", "#{staged_path}/CookieSync.app"],
-                   must_succeed: false
-    helper_plist = File.expand_path("~/Library/LaunchAgents/com.github.yasyf.synckit.helper.cookiesync.plist")
-    if File.exist?(helper_plist)
-      system_command "#{HOMEBREW_PREFIX}/bin/cookiesync",
-                     args:         ["install"],
-                     env:          { "PATH" => "#{HOMEBREW_PREFIX}/bin:/usr/bin:/bin:/usr/sbin:/sbin" },
-                     must_succeed: false
-    end
+  # The helper plist names the versioned Caskroom bundle, which brew upgrade deletes.
+  # synckitd's reconcile tick sees the plist drift from this version's bundle and
+  # reinstalls its agents within 15 minutes, so the cask only strips quarantine.
+  postflight_steps do
+    run "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "{{staged_path}}/CookieSync.app"], must_succeed: false
   end
 
   caveats <<~EOS

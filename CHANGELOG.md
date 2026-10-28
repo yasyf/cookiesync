@@ -6,6 +6,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- The Homebrew cask strips quarantine with a `postflight_steps` stanza instead of the Ruby `postflight` block Homebrew 7 deprecated, so `brew upgrade` no longer warns. It no longer reruns `cookiesync install` after an upgrade: Homebrew's step sandbox refuses the synckitd socket, and synckitd's reconcile tick now re-points the helper at the upgraded bundle (yasyf/synckit#16).
+
 ### Changed
 - **Any process running as the same user can now connect to the resident helper.**
   Daemon connections and bridge children no longer undergo peer or executable
