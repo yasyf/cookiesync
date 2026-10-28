@@ -11,6 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Daemon connections and bridge children no longer undergo peer or executable
   verification. Helper build identity now uses the running version, including an
   executable-mtime version for development builds, instead of hashing the binary.
+- Builds against daemonkit 0.35.1 and synckit 0.47.0 with Go 1.26.10.
 
 ## [0.32.0] - 2026-10-17
 

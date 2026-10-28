@@ -2,7 +2,7 @@ module github.com/yasyf/cookiesync
 
 go 1.26.5
 
-toolchain go1.26.9
+toolchain go1.26.10
 
 require (
 	github.com/charmbracelet/bubbles v1.0.0
@@ -13,8 +13,8 @@ require (
 	github.com/godbus/dbus/v5 v5.2.2
 	github.com/spf13/cobra v1.10.2
 	github.com/syndtr/goleveldb v1.0.0
-	github.com/yasyf/daemonkit v0.34.1-0.20261028043932-567e3df37f44
-	github.com/yasyf/synckit v0.46.1-0.20261028042517-18536ed9b209
+	github.com/yasyf/daemonkit v0.35.1
+	github.com/yasyf/synckit v0.47.0
 	golang.org/x/crypto v0.57.0
 	golang.org/x/sync v0.23.0
 	golang.org/x/sys v0.48.0
