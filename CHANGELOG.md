@@ -6,6 +6,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.34.1] - 2026-10-28
+
+### Changed
+
+- After a `brew upgrade`, the resident helper is replaced when the next
+  cookiesync command calls it: that command's `Ensure` sees the helper serving
+  another build and replaces it. synckitd's reconcile tick no longer drains the
+  helper, as 0.34.0's notes said it did; Ensure is the only path that reloads
+  it (yasyf/synckit#25).
+- Builds against synckit 0.51.0.
+
 ## [0.34.0] - 2026-10-28
 
 ### Changed
