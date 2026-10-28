@@ -60,6 +60,8 @@ jobs:
             test -n "${!name}" || { echo "::error::required secret $name is empty"; exit 1; }
           done
 
+      - uses: yasyf/homebrew-tap/.github/actions/stapler-retry@6fcdeeacb07f32bdabb3830d5d0290f8de48c813
+
       - name: Import Developer ID certificate
         id: developer-id
         uses: yasyf/homebrew-tap/.github/actions/import-developer-id@19c3d5013032ad9c88f9a8f1170d1f366c19b8d9
@@ -133,7 +135,7 @@ jobs:
 
       - name: Wrap the CLI in CookieSync.app
         id: wrap
-        uses: yasyf/homebrew-tap/.github/actions/wrap-daemon-bundle@19c3d5013032ad9c88f9a8f1170d1f366c19b8d9
+        uses: yasyf/homebrew-tap/.github/actions/wrap-daemon-bundle@6fcdeeacb07f32bdabb3830d5d0290f8de48c813
         with:
           binary: ${{ steps.build.outputs.binary }}
           bundle-id: com.github.yasyf.cookiesync
@@ -165,7 +167,7 @@ jobs:
           app="$smoke/CookieSync.app"
           test -d "$app"
           codesign --verify --deep --strict --verbose=2 "$app"
-          xcrun stapler validate "$app"
+          stapler-retry.sh validate "$app"
           spctl --assess --type execute --verbose=4 "$app"
           "$app/Contents/MacOS/cookiesync" --version | grep -Fq "${GITHUB_REF_NAME#v}"
 
@@ -262,7 +264,7 @@ jobs:
           app="$app_smoke/CookieSync.app"
           test -d "$app"
           codesign --verify --deep --strict --verbose=2 "$app"
-          xcrun stapler validate "$app"
+          stapler-retry.sh validate "$app"
           spctl --assess --type execute --verbose=4 "$app"
           "$app/Contents/MacOS/cookiesync" --version | grep -Fq "${TAG#v}"
 
