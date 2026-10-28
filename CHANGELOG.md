@@ -8,12 +8,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **cookiesync owns its resident helper's LaunchAgent on macOS, as it already
+  does on Linux.** `cookiesync install`, and every command that calls the
+  helper, runs daemonkit's `Ensure` with `daemonkit.Installed`: the program is
+  `/opt/homebrew/bin/cookiesync`, the Homebrew link into CookieSync.app, and
+  the build is this binary's version. Ensure starts a missing helper and
+  replaces one serving another build, so the first command after an upgrade
+  runs against the new helper. synckitd no longer writes the helper's plist.
 - After a `brew upgrade`, synckitd's reconcile tick sees the resident helper
   serving a version other than the installed `cookiesync --version`. It drains
   the helper, and launchd relaunches it on the upgraded build within 15
   minutes. 0.33.0 relied on a hash of the binary in the helper's plist; synckit
   0.49.0 compares versions instead (yasyf/synckit#21).
-- Builds against synckit 0.49.0.
+- Builds against daemonkit 0.36.0 and synckit 0.50.0.
 
 ## [0.33.0] - 2026-10-28
 

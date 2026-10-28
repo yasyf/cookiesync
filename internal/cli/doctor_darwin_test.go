@@ -7,11 +7,13 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/spf13/cobra"
+	"github.com/yasyf/daemonkit"
 
 	"github.com/yasyf/cookiesync/internal/paths"
 	"github.com/yasyf/cookiesync/internal/state"
@@ -130,9 +132,22 @@ func TestKeyCacheCheckRendersEveryDaemonState(t *testing.T) {
 	}
 }
 
+func useHelperEnsure(t *testing.T) *[]string {
+	t.Helper()
+	var builds []string
+	previous := ensureHelper
+	ensureHelper = func(_ context.Context, build string) (daemonkit.Ensured, error) {
+		builds = append(builds, build)
+		return daemonkit.Ensured{}, nil
+	}
+	t.Cleanup(func() { ensureHelper = previous })
+	return &builds
+}
+
 // TestInstallWritesManifest proves install emits the frozen lines and writes a valid
 // synckit manifest with the cookiesync action contract, against a temp config home.
 func TestInstallWritesManifest(t *testing.T) {
+	useHelperEnsure(t)
 	t.Setenv("HOME", t.TempDir())
 	testutil.IsolateHostConfig(t, paths.Config)
 	t.Setenv("PATH", t.TempDir())
@@ -181,6 +196,7 @@ func TestInstallWritesManifest(t *testing.T) {
 }
 
 func TestInstallWritesPersistedWatchDebounce(t *testing.T) {
+	useHelperEnsure(t)
 	t.Setenv("HOME", t.TempDir())
 	testutil.IsolateHostConfig(t, paths.Config)
 	t.Setenv("PATH", t.TempDir())
@@ -207,6 +223,7 @@ func TestInstallWritesPersistedWatchDebounce(t *testing.T) {
 }
 
 func TestSettingsWatchDebounceReachesTheManifestOnInstall(t *testing.T) {
+	useHelperEnsure(t)
 	t.Setenv("HOME", t.TempDir())
 	testutil.IsolateHostConfig(t, paths.Config)
 	t.Setenv("PATH", t.TempDir())
@@ -233,9 +250,9 @@ func TestSettingsWatchDebounceReachesTheManifestOnInstall(t *testing.T) {
 	}
 }
 
-// TestInstallConvergesSynckitdAgents proves install reruns 'synckitd install' after
-// writing the manifest, so a cask upgrade's rerun rewrites the helper plist that still
-// names the deleted bundle, and that a failed converge fails install.
+// TestInstallConvergesSynckitdAgents proves install runs 'synckitd install' after
+// writing the manifest and then ensures the resident helper, and that a failed
+// converge fails install before the helper is ensured.
 func TestInstallConvergesSynckitdAgents(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
@@ -248,6 +265,7 @@ func TestInstallConvergesSynckitdAgents(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Setenv("HOME", t.TempDir())
 			testutil.IsolateHostConfig(t, paths.Config)
+			ensured := useHelperEnsure(t)
 			bin := t.TempDir()
 			t.Setenv("PATH", bin)
 			calls := filepath.Join(t.TempDir(), "calls")
@@ -264,6 +282,13 @@ func TestInstallConvergesSynckitdAgents(t *testing.T) {
 			err := root.ExecuteContext(context.Background())
 			if tc.wantErr != (err != nil) {
 				t.Fatalf("install err = %v, wantErr %v\n%s", err, tc.wantErr, out.String())
+			}
+			wantEnsured := []string{"test"}
+			if tc.wantErr {
+				wantEnsured = nil
+			}
+			if !slices.Equal(*ensured, wantEnsured) {
+				t.Fatalf("ensured the helper at %v, want %v: after synckitd converges, never after it fails", *ensured, wantEnsured)
 			}
 
 			got, readErr := os.ReadFile(calls) //nolint:gosec // test-owned call log
@@ -286,6 +311,7 @@ func TestInstallConvergesSynckitdAgents(t *testing.T) {
 // TestUninstallRemovesManifest proves uninstall removes the registered manifest and emits
 // the frozen line, and is a no-op (not an error) when no manifest is registered.
 func TestUninstallRemovesManifest(t *testing.T) {
+	useHelperEnsure(t)
 	t.Setenv("HOME", t.TempDir())
 	testutil.IsolateHostConfig(t, paths.Config)
 	t.Setenv("PATH", t.TempDir())
