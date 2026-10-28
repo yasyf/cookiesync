@@ -72,8 +72,6 @@ func runInstall(cmd *cobra.Command, _ []string) error {
 		return err
 	}
 	cmd.Printf("Registered cookiesync manifest at %s.\n", path)
-	// Rerenders the helper plist against the binary PATH resolves now, so a cask
-	// upgrade that deleted the previous bundle leaves no plist naming it.
 	return convergeSynckitd(cmd)
 }
 
