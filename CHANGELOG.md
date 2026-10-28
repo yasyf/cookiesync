@@ -6,6 +6,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- After a `brew upgrade`, synckitd's reconcile tick sees the resident helper
+  serving a version other than the installed `cookiesync --version`. It drains
+  the helper, and launchd relaunches it on the upgraded build within 15
+  minutes. 0.33.0 relied on a hash of the binary in the helper's plist; synckit
+  0.49.0 compares versions instead (yasyf/synckit#21).
+- Builds against synckit 0.49.0.
+
 ## [0.33.0] - 2026-10-28
 
 ### Fixed
