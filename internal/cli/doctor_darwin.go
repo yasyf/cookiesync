@@ -25,11 +25,11 @@ const (
 const vaultName = "cookiesync"
 
 // realDoctorEnv wires the production health checks.
-func realDoctorEnv() doctorEnv {
+func realDoctorEnv(build string) doctorEnv {
 	return doctorEnv{
 		helper:   checkHelper,
 		socket:   checkSocket,
-		keyCache: checkKeyCache,
+		keyCache: func(ctx context.Context) check { return checkKeyCache(ctx, build) },
 		mesh:     checkMesh,
 		host: func(ctx context.Context) []check {
 			var checks []check

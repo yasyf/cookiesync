@@ -87,7 +87,6 @@ func Launch(ctx context.Context, spawner Spawner, spec LaunchSpec) (*Proc, error
 			"_bridge-chrome-child", spec.HostBinary, spec.DataDir, strconv.FormatBool(spec.Headed)),
 		Env:     chromeEnvironment(spec.DataDir, spec.Headed, nonce),
 		Session: true,
-		Exec:    daemonkit.ServingSameUser(),
 	}, daemonkit.ChannelStdio, stderr)
 	if err != nil {
 		return nil, fmt.Errorf("start chrome session: %w", err)

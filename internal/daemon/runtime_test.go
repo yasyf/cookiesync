@@ -60,10 +60,6 @@ func helperClient(t *testing.T) *daemonkit.Client {
 const readinessProbe = "__cookiesync_readiness_probe__"
 
 // awaitBusinessReady blocks until the helper dispatches over its business lane.
-// Readiness is observed there rather than through Control.WaitReady because
-// these tests serve the runtime in the test's own process, and daemonkit
-// refuses to pin its own pid on the control lane — the business lane runs the
-// same-EUID floor and the Trust.Serving verify, but no self-pin.
 func awaitBusinessReady(ctx context.Context, client *daemonkit.Client) error {
 	lane := synckit.NewClient(synckit.ClientConfig{
 		Open: func(context.Context) (*daemonkit.Business, error) { return client.Business(), nil },
@@ -148,7 +144,7 @@ func TestHelperRuntimeActivatesAfterOwnershipAndClosesGeneration(t *testing.T) {
 		}, nil
 	}
 
-	runtime, err := newHelperRuntime(executable, builder)
+	runtime, err := newHelperRuntime(executable, "test", builder)
 	if err != nil {
 		t.Fatalf("newHelperRuntime: %v", err)
 	}
@@ -196,7 +192,7 @@ func TestHelperRuntimeDrainsKeepaliveBeforeAdmissionSettlement(t *testing.T) {
 	builder := func(daemonkit.Ctx) (*Daemon, func(context.Context) error, error) {
 		return d, func(context.Context) error { return nil }, nil
 	}
-	runtime, err := newHelperRuntime(executable, builder)
+	runtime, err := newHelperRuntime(executable, "test", builder)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -282,7 +278,7 @@ func TestHelperRuntimeSettlesBridgeRecoveryBeforeReadiness(t *testing.T) {
 	builder := func(daemonkit.Ctx) (*Daemon, func(context.Context) error, error) {
 		return d, func(context.Context) error { return nil }, nil
 	}
-	runtime, err := newHelperRuntime(executable, builder)
+	runtime, err := newHelperRuntime(executable, "test", builder)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -349,7 +345,7 @@ func TestHelperRuntimeReclaimsBridgeProcessesBeforeTheBuilderRuns(t *testing.T) 
 		}
 		return nil, nil, errBuilder
 	}
-	runtime, err := newHelperRuntime(executable, builder)
+	runtime, err := newHelperRuntime(executable, "test", builder)
 	if err != nil {
 		t.Fatal(err)
 	}

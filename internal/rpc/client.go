@@ -1,6 +1,6 @@
 // Package rpc is cookiesync's client to the resident daemon. It is a thin domain
 // wrapper over the shared synckit/rpc transport: the generic
-// {method, params} -> {ok, result, error} framing, dispatch, peer verification, frame
+// {method, params} -> {ok, result, error} framing, dispatch, frame
 // bound, and timeouts live in synckit; this package only opens the cookiesync helper's
 // business lane and turns a daemon error response into a Go error. The cross-host CLI
 // surface (`cookiesync rpc <method> ...`) and the SSH command strings are the frozen
@@ -10,6 +10,7 @@ package rpc
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/yasyf/daemonkit"
 	synckit "github.com/yasyf/synckit/rpc"
@@ -20,11 +21,12 @@ import (
 // supervisor, so a call fails with the supervisor hint when none runs. A daemon-side
 // failure surfaces as a Go error carrying the daemon's message; an unreachable daemon is
 // wrapped with the hint to install it. params may be nil for a no-arg method.
-func Call(ctx context.Context, method string, params map[string]any) (any, error) {
-	resident, err := open(ctx)
+func Call(ctx context.Context, build, method string, params map[string]any) (any, error) {
+	resident, err := open(ctx, build)
 	if err != nil {
 		return nil, err
 	}
+	defer closeClient(ctx, resident)
 	if params == nil {
 		params = map[string]any{}
 	}
@@ -44,10 +46,16 @@ func Call(ctx context.Context, method string, params map[string]any) (any, error
 
 // CallJSON invokes method and decodes the result into out via a JSON round-trip, for
 // callers that want the typed result rather than the generic any-tree.
-func CallJSON(ctx context.Context, method string, params map[string]any, out any) error {
-	result, err := Call(ctx, method, params)
+func CallJSON(ctx context.Context, build, method string, params map[string]any, out any) error {
+	result, err := Call(ctx, build, method, params)
 	if err != nil {
 		return err
 	}
 	return decode(result, out)
+}
+
+func closeClient(ctx context.Context, resident *daemonkit.Client) {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+	_ = resident.Close(ctx)
 }

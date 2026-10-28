@@ -241,12 +241,12 @@ func (d *Daemon) register(dispatcher *synckit.Dispatcher) {
 // Serve runs the resident helper as one exact daemonkit generation. The
 // Secure Enclave key, bridge owner, dispatcher, and readiness are constructed
 // only after listener takeover has established exclusive ownership.
-func Serve(ctx context.Context) error {
+func Serve(ctx context.Context, build string) error {
 	rolePath, err := helperRolePath()
 	if err != nil {
 		return err
 	}
-	runtime, err := newHelperRuntime(rolePath, buildDaemon) //nolint:contextcheck // Runtime.Run owns ctx; construction has no request-scoped work.
+	runtime, err := newHelperRuntime(rolePath, build, buildDaemon) //nolint:contextcheck // Runtime.Run owns ctx; construction has no request-scoped work.
 	if err != nil {
 		return err
 	}
@@ -274,9 +274,9 @@ type helperBuilder func(daemonkit.Ctx) (*Daemon, func(context.Context) error, er
 // newHelperRuntime composes the resident helper. MaxFrame is left unstated so
 // the spec takes synckit's rpc.MaxFrame, the one number both ends of every
 // session must agree on.
-func newHelperRuntime(rolePath string, builder helperBuilder) (*helperruntime.Runtime, error) {
+func newHelperRuntime(rolePath, build string, builder helperBuilder) (*helperruntime.Runtime, error) {
 	dispatcher := synckit.NewDispatcher()
-	program, err := daemonkit.Stable()
+	program, err := daemonkit.Stable(build)
 	if err != nil {
 		return nil, err
 	}

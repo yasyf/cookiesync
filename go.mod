@@ -2,7 +2,7 @@ module github.com/yasyf/cookiesync
 
 go 1.26.5
 
-toolchain go1.26.9
+toolchain go1.26.10
 
 require (
 	github.com/charmbracelet/bubbles v1.0.0
@@ -13,8 +13,8 @@ require (
 	github.com/godbus/dbus/v5 v5.2.2
 	github.com/spf13/cobra v1.10.2
 	github.com/syndtr/goleveldb v1.0.0
-	github.com/yasyf/daemonkit v0.32.2
-	github.com/yasyf/synckit v0.37.0
+	github.com/yasyf/daemonkit v0.35.1
+	github.com/yasyf/synckit v0.47.0
 	golang.org/x/crypto v0.57.0
 	golang.org/x/sync v0.23.0
 	golang.org/x/sys v0.48.0
@@ -38,9 +38,11 @@ require (
 	github.com/dustin/go-humanize v1.0.1 // indirect
 	github.com/ebitengine/purego v0.10.1 // indirect
 	github.com/erikgeiser/coninput v0.0.0-20211004153227-1c3628e74d0f // indirect
+	github.com/fsnotify/fsnotify v1.10.1 // indirect
 	github.com/golang/snappy v0.0.0-20180518054509-2e65f85255db // indirect
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/inconshreveable/mousetrap v1.1.0 // indirect
+	github.com/klauspost/compress v1.20.1 // indirect
 	github.com/lucasb-eyer/go-colorful v1.3.0 // indirect
 	github.com/mattn/go-isatty v0.0.20 // indirect
 	github.com/mattn/go-localereader v0.0.1 // indirect
@@ -61,6 +63,7 @@ require (
 	golang.org/x/net v0.60.0 // indirect
 	golang.org/x/text v0.42.0 // indirect
 	golang.org/x/tools v0.49.0 // indirect
+	howett.net/plist v1.0.1 // indirect
 	modernc.org/libc v1.72.3 // indirect
 	modernc.org/mathutil v1.7.1 // indirect
 	modernc.org/memory v1.11.0 // indirect

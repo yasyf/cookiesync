@@ -9,7 +9,7 @@ import (
 	"github.com/yasyf/cookiesync/internal/paths"
 )
 
-func open(context.Context) (*daemonkit.Client, error) {
+func open(context.Context, string) (*daemonkit.Client, error) {
 	spec, err := helperruntime.Spec(paths.ToolName, daemonkit.Program{}, 0)
 	if err != nil {
 		return nil, err

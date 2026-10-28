@@ -18,7 +18,7 @@ func newSuperviseCmd() *cobra.Command {
 		Hidden: true,
 		Args:   cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			spec, err := daemon.HelperSpec()
+			spec, err := daemon.HelperSpec(cmd.Root().Version)
 			if err != nil {
 				return err
 			}

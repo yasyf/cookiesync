@@ -20,11 +20,11 @@ const (
 	socketHint  = "run 'cookiesync install' under a running 'cookiesync supervise' to start the resident helper (cookiesync helper-serve)"
 )
 
-func realDoctorEnv() doctorEnv {
+func realDoctorEnv(build string) doctorEnv {
 	return doctorEnv{
-		helper:   checkSupervisor,
+		helper:   func(ctx context.Context) check { return checkSupervisor(ctx, build) },
 		socket:   checkSocket,
-		keyCache: checkKeyCache,
+		keyCache: func(ctx context.Context) check { return checkKeyCache(ctx, build) },
 		mesh:     checkMesh,
 		host: func(context.Context) []check {
 			return []check{checkBrowserRoots(), checkBridgeChrome()}
@@ -35,8 +35,8 @@ func realDoctorEnv() doctorEnv {
 	}
 }
 
-func checkSupervisor(ctx context.Context) check {
-	ensured, err := rpc.Ensure(ctx)
+func checkSupervisor(ctx context.Context, build string) check {
+	ensured, err := rpc.Ensure(ctx, build)
 	if err != nil {
 		return check{label: "supervisor", detail: err.Error()}
 	}

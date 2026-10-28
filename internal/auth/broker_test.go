@@ -3,13 +3,13 @@ package auth
 import (
 	"context"
 	"errors"
-	"os/exec"
 	"reflect"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/yasyf/cookiesync/internal/cookie"
+	"github.com/yasyf/daemonkit"
 	consentkit "github.com/yasyf/synckit/consent"
 	"github.com/yasyf/synckit/hostregistry"
 	"github.com/yasyf/synckit/presence"
@@ -218,11 +218,7 @@ func hardRouteLocalRelease(t *testing.T, runner SSHRunner) localReleaseOutcome {
 // release proceeds through Touch ID exactly as it does when the peer answers a
 // locked whoami, instead of bricking every local release on this host.
 func TestKeyHardRouteWhoamiSSHErrorMatchesNotLivePeer(t *testing.T) {
-	exit1 := exec.Command("/bin/sh", "-c", "exit 1").Run()
-	var exitErr *exec.ExitError
-	if !errors.As(exit1, &exitErr) {
-		t.Fatalf("fabricate exit-1: %v", exit1)
-	}
+	exit1 := &daemonkit.ExitError{Exit: daemonkit.Exit{Code: 1}}
 	notLive := &approverMesh{}
 	flaky := &whoamiErrMesh{
 		approverMesh: &approverMesh{},

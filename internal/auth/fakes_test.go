@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"os"
-	"os/exec"
 	"os/user"
 	"strings"
 	"sync"
@@ -14,6 +13,7 @@ import (
 	"github.com/yasyf/cookiesync/internal/cache"
 	"github.com/yasyf/cookiesync/internal/cookie"
 	"github.com/yasyf/cookiesync/internal/state"
+	"github.com/yasyf/daemonkit"
 	"github.com/yasyf/synckit/cregistry"
 	"github.com/yasyf/synckit/hostregistry"
 	"github.com/yasyf/synckit/presence"
@@ -304,18 +304,10 @@ func (r *approverMesh) Run(ctx context.Context, target, cmd string, _ []byte) (s
 	return "", sshTransportFailure(target)
 }
 
-var (
-	exit255Once sync.Once
-	exit255Err  error
-)
-
 // sshTransportFailure fabricates ExecSSH's connection-failure shape: an
-// *hostregistry.SSHError wrapping a real exit-255 *exec.ExitError.
+// *hostregistry.SSHError wrapping an exit-255 *daemonkit.ExitError.
 func sshTransportFailure(addr string) error {
-	exit255Once.Do(func() {
-		exit255Err = exec.Command("/bin/sh", "-c", "exit 255").Run()
-	})
-	return &hostregistry.SSHError{Addr: addr, Stderr: "connect refused", Err: exit255Err}
+	return &hostregistry.SSHError{Addr: addr, Stderr: "connect refused", Err: &daemonkit.ExitError{Exit: daemonkit.Exit{Code: 255}}}
 }
 
 // consentTargets lists the targets that received a request_consent, in order.

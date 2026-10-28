@@ -121,13 +121,13 @@ func runAuthAll(cmd *cobra.Command, reason string, wait time.Duration) error {
 func primeAuth(cmd *cobra.Command, params map[string]any, wait time.Duration) (primeReply, error) {
 	var reply primeReply
 	if wait == 0 {
-		return reply, rpcCallJSON(cmd.Context(), "prime_auth", params, &reply)
+		return reply, rpcCallJSON(cmd.Context(), cmd.Root().Version, "prime_auth", params, &reply)
 	}
 	deadline := time.Now().Add(wait)
 	for remaining := wait; remaining > 0; remaining = time.Until(deadline) {
 		params["wait"] = remaining.Seconds()
 		reply = primeReply{}
-		if err := rpcCallJSON(cmd.Context(), "prime_auth", params, &reply); err != nil {
+		if err := rpcCallJSON(cmd.Context(), cmd.Root().Version, "prime_auth", params, &reply); err != nil {
 			return reply, err
 		}
 		switch reply.Status {
@@ -268,7 +268,7 @@ func runCookies(cmd *cobra.Command, urls []string, browser, profile, format stri
 		ProtocolVersion uint64              `json:"protocol_version"`
 		Cookies         []cookie.WireCookie `json:"cookies"`
 	}
-	if err := rpc.CallJSON(cmd.Context(), "get_cookies", params, &result); err != nil {
+	if err := rpc.CallJSON(cmd.Context(), cmd.Root().Version, "get_cookies", params, &result); err != nil {
 		return err
 	}
 	if result.ProtocolVersion != cookie.ProtocolVersion {
@@ -299,7 +299,7 @@ func runCookiesAll(cmd *cobra.Command, urls []string, format string) error {
 		Cookies         []cookie.WireCookie `json:"cookies"`
 		Warnings        []string            `json:"warnings"`
 	}
-	if err := rpc.CallJSON(cmd.Context(), "get_cookies", params, &result); err != nil {
+	if err := rpc.CallJSON(cmd.Context(), cmd.Root().Version, "get_cookies", params, &result); err != nil {
 		return err
 	}
 	if result.ProtocolVersion != cookie.ProtocolVersion {
@@ -342,7 +342,7 @@ func fetchOrigins(cmd *cobra.Command, urls []string, browser, profile, format st
 		Origins         []cookie.WireOrigin `json:"origins"`
 		Warnings        []string            `json:"warnings"`
 	}
-	if err := rpc.CallJSON(cmd.Context(), "get_web_storage", params, &result); err != nil {
+	if err := rpc.CallJSON(cmd.Context(), cmd.Root().Version, "get_web_storage", params, &result); err != nil {
 		return nil, err
 	}
 	if result.ProtocolVersion != cookie.ProtocolVersion {

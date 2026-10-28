@@ -43,7 +43,7 @@ func newRPCCmd() *cobra.Command {
 // compact JSON line to the command's stdout — the frozen shape peers and the
 // agent-browser skill parse off ssh.
 func rpcPassthrough(cmd *cobra.Command, method string, params map[string]any) error {
-	result, err := rpcCall(cmd.Context(), method, params)
+	result, err := rpcCall(cmd.Context(), cmd.Root().Version, method, params)
 	if err != nil {
 		return err
 	}
@@ -330,7 +330,7 @@ func runBridgeKeepalive(cmd *cobra.Command) error {
 	}
 	callDone := make(chan struct{})
 	go func() {
-		_, _ = rpc.Call(context.Background(), "bridge_keepalive", map[string]any{"capability": capability})
+		_, _ = rpc.Call(context.Background(), cmd.Root().Version, "bridge_keepalive", map[string]any{"capability": capability})
 		close(callDone)
 	}()
 	stdinDone := make(chan struct{})

@@ -14,12 +14,13 @@ import (
 
 const lifecycleBudget = 30 * time.Second
 
-func open(ctx context.Context) (*daemonkit.Client, error) {
-	resident, err := helperClient()
+func open(ctx context.Context, build string) (*daemonkit.Client, error) {
+	resident, err := helperClient(build)
 	if err != nil {
 		return nil, err
 	}
 	if _, err := ensure(ctx, resident); err != nil {
+		closeClient(ctx, resident)
 		return nil, err
 	}
 	return resident, nil
@@ -29,11 +30,12 @@ func open(ctx context.Context) (*daemonkit.Client, error) {
 // `cookiesync supervise`: it starts the helper, or restarts it onto this build,
 // and reports what that took. With no supervisor it fails naming the command to
 // start one.
-func Ensure(ctx context.Context) (daemonkit.Ensured, error) {
-	resident, err := helperClient()
+func Ensure(ctx context.Context, build string) (daemonkit.Ensured, error) {
+	resident, err := helperClient(build)
 	if err != nil {
 		return daemonkit.Ensured{}, err
 	}
+	defer closeClient(ctx, resident)
 	return ensure(ctx, resident)
 }
 
@@ -41,18 +43,19 @@ func Ensure(ctx context.Context) (daemonkit.Ensured, error) {
 // restarted supervisor no longer resumes it. Stopping a helper that was never
 // applied succeeds: daemonkit proves the observed program departed before it
 // clears the inventory.
-func Stop(ctx context.Context) error {
-	resident, err := helperClient()
+func Stop(ctx context.Context, build string) error {
+	resident, err := helperClient(build)
 	if err != nil {
 		return err
 	}
+	defer closeClient(ctx, resident)
 	ctx, cancel := context.WithTimeout(ctx, lifecycleBudget)
 	defer cancel()
 	return supervisorHint(resident.Stop(ctx))
 }
 
-func helperClient() (*daemonkit.Client, error) {
-	spec, err := daemon.HelperSpec()
+func helperClient(build string) (*daemonkit.Client, error) {
+	spec, err := daemon.HelperSpec(build)
 	if err != nil {
 		return nil, err
 	}

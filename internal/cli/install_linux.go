@@ -20,7 +20,7 @@ func runInstall(cmd *cobra.Command, _ []string) error {
 	if err := state.New(paths.Config).Initialize(cmd.Context()); err != nil {
 		return fmt.Errorf("initialize cookie-sync state: %w", err)
 	}
-	ensured, err := rpc.Ensure(cmd.Context())
+	ensured, err := rpc.Ensure(cmd.Context(), cmd.Root().Version)
 	if err != nil {
 		return fmt.Errorf("ensure the resident helper: %w", err)
 	}
@@ -29,7 +29,7 @@ func runInstall(cmd *cobra.Command, _ []string) error {
 }
 
 func runUninstall(cmd *cobra.Command, _ []string) error {
-	if err := rpc.Stop(cmd.Context()); err != nil {
+	if err := rpc.Stop(cmd.Context(), cmd.Root().Version); err != nil {
 		return fmt.Errorf("stop the resident helper: %w", err)
 	}
 	cmd.Println("Stopped the resident helper; 'cookiesync supervise' no longer runs it.")

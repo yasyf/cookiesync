@@ -47,7 +47,6 @@ func OpenKeepalive(ctx context.Context, spawner Spawner, target, addr, capabilit
 		Path: argv[0], Args: argv[1:],
 		Env:     bridgeEnvironment(),
 		Session: true,
-		Exec:    daemonkit.ServingSameUser(),
 	}, daemonkit.ChannelStdio, io.Discard)
 	if err != nil {
 		return nil, fmt.Errorf("start keepalive to %s: %w", addr, err)

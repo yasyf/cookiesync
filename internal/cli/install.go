@@ -12,7 +12,7 @@ func newHelperServeCmd() *cobra.Command {
 		Short: helperServeShort,
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			return daemon.Serve(cmd.Context())
+			return daemon.Serve(cmd.Context(), cmd.Root().Version)
 		},
 	}
 	return cmd

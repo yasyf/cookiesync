@@ -97,7 +97,7 @@ type bridgeListJSON struct {
 // openBridge runs the tapped, consent-gated bridge_open behind both `bridge
 // open` and the plugin's browser.launch, persisting the capability and tearing
 // the session down if it can't be saved. A package var for the plugin tests' stub.
-var openBridge = func(ctx context.Context, host, browser, profile string, window bridge.WindowMode) (bridgeOpenResult, error) {
+var openBridge = func(ctx context.Context, build, host, browser, profile string, window bridge.WindowMode) (bridgeOpenResult, error) {
 	key := bridgeCapKey(host, browser, profile)
 	params := map[string]any{
 		"browser": browser,
@@ -116,7 +116,7 @@ var openBridge = func(ctx context.Context, host, browser, profile string, window
 		params["capability"] = capability
 	}
 	var resp bridgeOpenResult
-	if err := rpc.CallJSON(ctx, "bridge_open", params, &resp); err != nil {
+	if err := rpc.CallJSON(ctx, build, "bridge_open", params, &resp); err != nil {
 		return bridgeOpenResult{}, err
 	}
 	if resp.ProtocolVersion != cookie.ProtocolVersion {
@@ -127,7 +127,7 @@ var openBridge = func(ctx context.Context, host, browser, profile string, window
 			ProtocolVersion uint64 `json:"protocol_version"`
 			Closed          bool   `json:"closed"`
 		}
-		_ = rpc.CallJSON(ctx, "bridge_close", map[string]any{"capability": resp.Capability}, &closed)
+		_ = rpc.CallJSON(ctx, build, "bridge_close", map[string]any{"capability": resp.Capability}, &closed)
 		return bridgeOpenResult{}, err
 	}
 	return resp, nil
@@ -135,7 +135,7 @@ var openBridge = func(ctx context.Context, host, browser, profile string, window
 
 // stopBridge closes the saved bridge for key host:browser:profile and drops its
 // capability, behind both `bridge stop` and the plugin's browser.close.
-var stopBridge = func(ctx context.Context, key string) error {
+var stopBridge = func(ctx context.Context, build, key string) error {
 	capability, ok, err := loadCap(key)
 	if err != nil {
 		return err
@@ -147,7 +147,7 @@ var stopBridge = func(ctx context.Context, key string) error {
 		ProtocolVersion uint64 `json:"protocol_version"`
 		Closed          bool   `json:"closed"`
 	}
-	if err := rpc.CallJSON(ctx, "bridge_close", map[string]any{"capability": capability}, &resp); err != nil {
+	if err := rpc.CallJSON(ctx, build, "bridge_close", map[string]any{"capability": capability}, &resp); err != nil {
 		return err
 	}
 	if resp.ProtocolVersion != cookie.ProtocolVersion {
@@ -179,7 +179,7 @@ func newBridgeOpenCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			resp, err := openBridge(cmd.Context(), host, br, prof, windowMode(cmd, headed, headless))
+			resp, err := openBridge(cmd.Context(), cmd.Root().Version, host, br, prof, windowMode(cmd, headed, headless))
 			if err != nil {
 				return err
 			}
@@ -219,7 +219,7 @@ func newBridgeLsCmd() *cobra.Command {
 			live := []bridgeStatusResult{}
 			for _, entry := range caps {
 				var st bridgeStatusResult
-				if err := rpc.CallJSON(cmd.Context(), "bridge_status", map[string]any{"capability": entry.capability}, &st); err != nil {
+				if err := rpc.CallJSON(cmd.Context(), cmd.Root().Version, "bridge_status", map[string]any{"capability": entry.capability}, &st); err != nil {
 					return err
 				}
 				if st.ProtocolVersion != cookie.ProtocolVersion {
@@ -259,7 +259,7 @@ func newBridgeStopCmd() *cobra.Command {
 				return err
 			}
 			key := bridgeCapKey(host, br, prof)
-			if err := stopBridge(cmd.Context(), key); err != nil {
+			if err := stopBridge(cmd.Context(), cmd.Root().Version, key); err != nil {
 				return err
 			}
 			if asJSON {

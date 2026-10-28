@@ -62,7 +62,7 @@ func newDoctorCmd() *cobra.Command {
 		Short: doctorShort,
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			return runDoctor(cmd, realDoctorEnv())
+			return runDoctor(cmd, realDoctorEnv(cmd.Root().Version))
 		},
 	}
 	return cmd
@@ -117,11 +117,11 @@ type keyCacheStatus struct {
 // checkKeyCache confirms the resident daemon's current key-cache wrapping state. The
 // flags are cache-global, so the probe reads them off auth_status for the default chrome
 // endpoint — the endpoint itself is immaterial — and keyCacheCheck renders them.
-func checkKeyCache(ctx context.Context) check {
+func checkKeyCache(ctx context.Context, build string) check {
 	probeCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
 	var status keyCacheStatus
-	if err := rpc.CallJSON(probeCtx, "auth_status", map[string]any{"browser": "chrome"}, &status); err != nil {
+	if err := rpc.CallJSON(probeCtx, build, "auth_status", map[string]any{"browser": "chrome"}, &status); err != nil {
 		return check{label: "key cache", detail: fmt.Sprintf("auth_status probe failed: %v", err)}
 	}
 	return keyCacheCheck(status)
