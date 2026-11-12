@@ -32,6 +32,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `cookies --format webstorage` without `--browser` reads web storage alone and
   no longer decrypts the cookies it never printed.
 
+### Fixed
+
+- **`cookies --format webstorage` without `--browser` fails closed.** When no
+  browser on this host contributed web storage, because each one needs
+  `cookiesync auth` or consent was declined, the command fails with the skip
+  lines instead of printing an empty document.
+
+### Security
+
+- **Build with Go 1.26.11 and `klauspost/compress` 1.20.2.** They fix
+  [GO-2026-6859](https://pkg.go.dev/vuln/GO-2026-6859), a `net/http` server crash,
+  and [GO-2026-6865](https://pkg.go.dev/vuln/GO-2026-6865), a panic decoding a
+  two-block frame, which `govulncheck` finds reachable from the bridge and the
+  wire encoder.
+
 ## [0.34.1] - 2026-10-28
 
 ### Changed

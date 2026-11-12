@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os/user"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -475,33 +476,18 @@ func TestHandleGetWebStorageNoLocalBrowsersFailsClosed(t *testing.T) {
 	}
 }
 
-// TestHandleGetWebStorageColdUnattendedReturnsNoStorage proves the consent gate: on a
-// cold, unattended host with no live peer, get_web_storage releases nothing, reads no
-// storage (the prime fails before ExtractWebStorage), and returns an empty origins set
-// with a skip warning — never leaking web storage without consent, and never prompting
-// Touch ID on an unattended host (an unattended release routes, it does not tap).
-func TestHandleGetWebStorageColdUnattendedReturnsNoStorage(t *testing.T) {
+func TestHandleGetWebStorageColdUnattendedFailsClosed(t *testing.T) {
 	fakeMesh(t, "me@laptop")
 	consent := &fakeConsent{}
 	st := stateWith("me@laptop", "", stateEndpoint("me@laptop", "chrome", "Default"))
 	d := New(consent, newFakeCache(), nil, staticProbe(SessionSnapshot{}), &recordingRunner{}, fixedState{st: st}, fixedState{st: st})
 
 	got, err := dispatchSelf(t, d, "get_web_storage", map[string]any{"urls": []any{"https://x.com"}})
-	if err != nil {
-		t.Fatalf("get_web_storage cold: %v", err)
+	if err == nil {
+		t.Fatalf("cold get_web_storage served %s without consent, want a fail-closed error", got)
 	}
-	var reply struct {
-		Origins  []cookie.WireOrigin `json:"origins"`
-		Warnings []string            `json:"warnings"`
-	}
-	if err := json.Unmarshal(got, &reply); err != nil {
-		t.Fatalf("decode get_web_storage reply %s: %v", got, err)
-	}
-	if len(reply.Origins) != 0 {
-		t.Fatalf("cold get_web_storage leaked %d origins without consent", len(reply.Origins))
-	}
-	if len(reply.Warnings) == 0 {
-		t.Fatalf("cold get_web_storage should warn about the skipped endpoint")
+	if want := "no endpoint contributed web storage; run cookiesync auth\n  skip cold "; !strings.HasPrefix(err.Error(), want) {
+		t.Fatalf("cold get_web_storage error = %q, want prefix %q", err, want)
 	}
 	if len(consent.promptedReasons) != 0 {
 		t.Fatalf("an unattended host must route consent, not prompt Touch ID; got %v", consent.promptedReasons)

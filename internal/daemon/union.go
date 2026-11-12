@@ -53,11 +53,11 @@ func renderPeerReadWarning(endpoint string, err *PeerReadError) string {
 // noContributionError renders a total union shutout: a summary line — naming
 // the peers whose reads timed out (consent may be pending there), else the
 // plain auth hint — followed by every accumulated skip warning.
-func noContributionError(warnings, pending []string) error {
-	summary := "no endpoint contributed cookies; run cookiesync auth"
+func noContributionError(what string, warnings, pending []string) error {
+	summary := fmt.Sprintf("no endpoint contributed %s; run cookiesync auth", what)
 	if len(pending) > 0 {
 		hosts := slices.Compact(slices.Sorted(slices.Values(pending)))
-		summary = fmt.Sprintf("no endpoint contributed cookies; consent may be pending on %s — approve it there and retry", strings.Join(hosts, ", "))
+		summary = fmt.Sprintf("no endpoint contributed %s; consent may be pending on %s — approve it there and retry", what, strings.Join(hosts, ", "))
 	}
 	return fmt.Errorf("%s\n  %s", summary, strings.Join(warnings, "\n  "))
 }
