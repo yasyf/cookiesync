@@ -380,8 +380,10 @@ func TestBridgeSeedPrefersALiveImport(t *testing.T) {
 	imported := []cookie.Cookie{importCSRF, importPref, importSID, stale}
 	fromImport := cookie.StorageState{Cookies: []cookie.Cookie{importCSRF, importPref, importSID}, Origins: []cookie.OriginStorage{importOrigin}}
 	fromProfile := cookie.StorageState{Cookies: []cookie.Cookie{{HostKey: "profile.test", Name: "local", Value: "v", Path: "/"}}}
+	every := []string{"https://app.example.test/", "www.other.test", "api.third.test"}
 	tests := []struct {
 		name       string
+		urls       []string
 		expiresIn  time.Duration
 		imported   bool
 		wantState  cookie.StorageState
@@ -392,19 +394,24 @@ func TestBridgeSeedPrefersALiveImport(t *testing.T) {
 		wantTaps   int32
 		wantReads  int32
 	}{
-		{"live import seeds without a tap", time.Minute, true, fromImport, cookie.SeedCounts{Attempted: 4, Expired: 1}, time.Minute, importT0.Add(time.Minute), "", 0, 0},
-		{"lease caps a longer import", time.Hour, true, fromImport, cookie.SeedCounts{Attempted: 4, Expired: 1}, 10 * time.Minute, importT0.Add(time.Hour), "", 0, 0},
-		{"no import taps and reads the profile", 0, false, fromProfile, cookie.SeedCounts{Attempted: 1}, 10 * time.Minute, time.Time{}, "", 1, 1},
-		{"a target resolved on disk ignores a live import", time.Minute, false, fromProfile, cookie.SeedCounts{Attempted: 1}, 10 * time.Minute, time.Time{}, "", 1, 1},
-		{"an import that lapsed after resolution is refused", 0, true, cookie.StorageState{}, cookie.SeedCounts{}, 0, time.Time{}, "import for chrome/Default expired before bridge startup", 0, 0},
+		{"live import seeds without a tap", every, time.Minute, true, fromImport, cookie.SeedCounts{Attempted: 4, Expired: 1}, time.Minute, importT0.Add(time.Minute), "", 0, 0},
+		{"lease caps a longer import", every, time.Hour, true, fromImport, cookie.SeedCounts{Attempted: 4, Expired: 1}, 10 * time.Minute, importT0.Add(time.Hour), "", 0, 0},
+		{"an import seeds only the requested host's cookies and storage", []string{"https://app.example.test/"}, time.Minute, true, cookie.StorageState{Cookies: []cookie.Cookie{importSID}, Origins: []cookie.OriginStorage{importOrigin}}, cookie.SeedCounts{Attempted: 2, Expired: 1}, time.Minute, importT0.Add(time.Minute), "", 0, 0},
+		{"an import seeds no storage for a host without any", []string{"www.other.test"}, time.Minute, true, cookie.StorageState{Cookies: []cookie.Cookie{importPref}}, cookie.SeedCounts{Attempted: 1}, time.Minute, importT0.Add(time.Minute), "", 0, 0},
+		{"no import taps and reads the profile", every, 0, false, fromProfile, cookie.SeedCounts{Attempted: 1}, 10 * time.Minute, time.Time{}, "", 1, 1},
+		{"a target resolved on disk ignores a live import", every, time.Minute, false, fromProfile, cookie.SeedCounts{Attempted: 1}, 10 * time.Minute, time.Time{}, "", 1, 1},
+		{"an import that lapsed after resolution is refused", every, 0, true, cookie.StorageState{}, cookie.SeedCounts{}, 0, time.Time{}, "import for chrome/Default expired before bridge startup", 0, 0},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			fakeMesh(t, importTestSelf)
 			s := newImportServeDaemon(t, staticProbe(liveSession(currentUser(t))))
 			var reads atomic.Int32
-			s.d.seedSource = func(context.Context, cookie.Browser, string, cookie.AesKey) (cookie.StorageState, cookie.SeedCounts, error) {
+			s.d.seedSource = func(_ context.Context, urls []string, _ cookie.Browser, _ string, _ cookie.AesKey) (cookie.StorageState, cookie.SeedCounts, error) {
 				reads.Add(1)
+				if !reflect.DeepEqual(urls, tt.urls) {
+					t.Errorf("seedSource urls = %q, want the open's %q", urls, tt.urls)
+				}
 				return fromProfile, cookie.SeedCounts{Attempted: len(fromProfile.Cookies)}, nil
 			}
 			if tt.expiresIn != 0 {
@@ -414,7 +421,7 @@ func TestBridgeSeedPrefersALiveImport(t *testing.T) {
 			if err != nil {
 				t.Fatalf("lookup chrome: %v", err)
 			}
-			state, counts, ttl, expiry, err := s.d.bridgeSeed(context.Background(), "req:a", "chrome", "Default", chrome, "", tt.imported)
+			state, counts, ttl, expiry, err := s.d.bridgeSeed(context.Background(), "req:a", "chrome", "Default", chrome, "", tt.imported, tt.urls)
 			if tt.wantErr != "" {
 				if err == nil || err.Error() != tt.wantErr {
 					t.Fatalf("bridgeSeed error = %v, want %q", err, tt.wantErr)

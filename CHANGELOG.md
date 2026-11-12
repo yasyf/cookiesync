@@ -6,6 +6,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **`bridge open` seeds only the URLs you name.** `cookiesync bridge open
+  [host:browser:profile] <url>...` requires at least one URL and seeds the
+  bridge's Chrome with only the cookies and web storage that apply to those
+  hosts, from a profile read or a live import, instead of the whole profile.
+  The Touch ID prompt names the hosts. A re-attach naming a host the live bridge
+  was not seeded with fails and names the `cookiesync bridge stop` that frees
+  it. A cross-host open passes the URLs to the peer after `--`, so a peer older
+  than this release refuses the open instead of seeding its whole profile.
+  `cookiesync rpc bridge_open <url>...` and the agent-browser provider,
+  `cookiesync bridge plugin <url>...`, take the URLs the same way.
+- **`cookies` without `--browser` reads this host's browsers only.** It no
+  longer reads every peer on the mesh over SSH. `--host <host>`, as
+  `cookiesync browser ls` prints it, reads that host's registered browsers
+  instead; it leaves out web storage, which only this host's browsers serve.
+- **`cookies` names the next step for a URL that gets no cookie.** Without
+  `--browser`, each such URL gets a stderr line naming the untracked Chrome or
+  Arc profile on this host with the most unexpired cookies for it, counted
+  without decrypting a value, and the `cookiesync cookies --browser …
+  --profile …` command that reads it, or else where to sign in. When no URL
+  gets a cookie the command fails with those lines instead of printing an
+  empty document.
+- `cookies --format webstorage` without `--browser` reads web storage alone and
+  no longer decrypts the cookies it never printed.
+
 ## [0.34.1] - 2026-10-28
 
 ### Changed

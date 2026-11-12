@@ -23,7 +23,7 @@ func importOnlyBridgeDaemon(t *testing.T) (*Daemon, *fakeConsent) {
 	d := New(consent, newFakeCache(), nil, staticProbe(liveSession(currentUser(t))), &recordingRunner{}, fixedState{st: st}, fixedState{st: st})
 	d.processes = testBridgeProcesses(t)
 	t.Cleanup(func() { d.closeAllBridges(context.Background()) })
-	d.seedSource = func(context.Context, cookie.Browser, string, cookie.AesKey) (cookie.StorageState, cookie.SeedCounts, error) {
+	d.seedSource = func(context.Context, []string, cookie.Browser, string, cookie.AesKey) (cookie.StorageState, cookie.SeedCounts, error) {
 		t.Errorf("seedSource called: an open over a live import must never read the profile")
 		return cookie.StorageState{}, cookie.SeedCounts{}, errors.New("profile read forbidden")
 	}
@@ -55,11 +55,13 @@ func TestBridgeOpenResolvesAnImportedTargetWithoutLocalProfile(t *testing.T) {
 		name      string
 		record    bool
 		advertise string
+		url       string
 		wantErr   string
 	}{
-		{"a live import stands in for the missing profile", true, "", "resolve chrome: launcher stubbed"},
-		{"no import refuses the missing profile before launch", false, "", `unknown profile "Default" for browser chrome`},
-		{"an advertised open ignores the import", true, "host:1", `unknown profile "Default" for browser chrome`},
+		{"a live import stands in for the missing profile", true, "", "https://example.com/", "resolve chrome: launcher stubbed"},
+		{"no import refuses the missing profile before launch", false, "", "https://example.com/", `unknown profile "Default" for browser chrome`},
+		{"an advertised open ignores the import", true, "host:1", "https://example.com/", `unknown profile "Default" for browser chrome`},
+		{"an import missing a requested host does not stand in", true, "", "https://github.com/", `unknown profile "Default" for browser chrome`},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -68,7 +70,7 @@ func TestBridgeOpenResolvesAnImportedTargetWithoutLocalProfile(t *testing.T) {
 			if tt.record {
 				d.imports.put(importKey{browser: "chrome", profile: "Default"}, bridgeProbeRecord(time.Now().Add(time.Minute)))
 			}
-			params := map[string]any{"browser": "chrome", "profile": "Default", "headed": false}
+			params := map[string]any{"browser": "chrome", "profile": "Default", "headed": false, "urls": []any{tt.url}}
 			if tt.advertise != "" {
 				params["advertise"] = tt.advertise
 			}
@@ -102,7 +104,7 @@ func TestBridgeOpenSeedsFromAnImportWithoutLocalProfile(t *testing.T) {
 	d.imports.put(importKey{browser: "chrome", profile: "Default"}, bridgeProbeRecord(time.Now().Add(time.Minute)))
 
 	ctx := context.Background()
-	res, err := dispatchSelf(t, d, "bridge_open", map[string]any{"browser": "chrome", "profile": "Default", "headed": false})
+	res, err := dispatchSelf(t, d, "bridge_open", map[string]any{"browser": "chrome", "profile": "Default", "headed": false, "urls": []any{"https://example.com/"}})
 	if err != nil {
 		t.Fatalf("bridge_open over an import with no local profile: %v", err)
 	}

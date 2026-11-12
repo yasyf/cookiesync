@@ -75,16 +75,22 @@ func (r importRecord) originsFor(hosts map[cookie.Host]bool) []cookie.OriginStor
 	return out
 }
 
-func (r importRecord) seed(now time.Time) (cookie.StorageState, cookie.SeedCounts) {
+func (r importRecord) seed(now time.Time, hosts []cookie.Host) (cookie.StorageState, cookie.SeedCounts) {
 	nowSeconds := unixSeconds(now)
-	live := make([]cookie.Cookie, 0, len(r.cookies))
+	var live []cookie.Cookie
+	var counts cookie.SeedCounts
 	for _, c := range r.cookies {
-		if cookie.Live(c, nowSeconds) {
-			live = append(live, c)
+		if !cookie.AppliesAny(c.HostKey, hosts) {
+			continue
 		}
+		counts.Attempted++
+		if !cookie.Live(c, nowSeconds) {
+			counts.Expired++
+			continue
+		}
+		live = append(live, c)
 	}
-	counts := cookie.SeedCounts{Attempted: len(r.cookies), Expired: len(r.cookies) - len(live)}
-	return cookie.StorageState{Cookies: live, Origins: r.origins}, counts
+	return cookie.StorageState{Cookies: live, Origins: r.originsFor(r.namedHosts(hosts))}, counts
 }
 
 func (d *Daemon) importedCookies(browser, profile string, urls []string) (map[string]any, bool) {

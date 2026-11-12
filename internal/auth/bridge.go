@@ -45,9 +45,9 @@ func (b *Broker) ReleaseBridge(ctx context.Context, st *state.State, req Req) (c
 		return key, SurfaceRouted, b.BridgeTTL(), nil
 	}
 	pid, hasPID := synckit.PeerPID(ctx)
-	reason := "open a live browser bridge"
+	reason := req.Reason
 	if req.Origin != "" {
-		reason = "open a live browser bridge for " + req.Origin
+		reason += " from " + req.Origin
 	}
 	reason = requestorReason(ctx, req.Requestor, reason, pid, hasPID)
 	b.promptGate.Lock()

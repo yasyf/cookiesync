@@ -24,7 +24,7 @@ func TestUnderivableRequestorRefusedBeforeImportLookup(t *testing.T) {
 		{"get_cookies union", "get_cookies", map[string]any{"urls": urls}},
 		{"get_web_storage single", "get_web_storage", map[string]any{"browser": "chrome", "profile": "Default", "urls": urls}},
 		{"get_web_storage union", "get_web_storage", map[string]any{"urls": urls}},
-		{"bridge_open", "bridge_open", map[string]any{"browser": "chrome", "profile": "Default"}},
+		{"bridge_open", "bridge_open", map[string]any{"browser": "chrome", "profile": "Default", "urls": urls}},
 	}
 	for _, peer := range []struct {
 		name string

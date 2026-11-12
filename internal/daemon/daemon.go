@@ -101,7 +101,7 @@ type Daemon struct {
 
 	// seedSource and hostBinary are the local-bridge test seams: the profile read
 	// and the Chrome resolver, defaulted in New and overridden in tests.
-	seedSource func(context.Context, cookie.Browser, string, cookie.AesKey) (cookie.StorageState, cookie.SeedCounts, error)
+	seedSource func(context.Context, []string, cookie.Browser, string, cookie.AesKey) (cookie.StorageState, cookie.SeedCounts, error)
 	hostBinary func() (string, error)
 
 	imports *importStore

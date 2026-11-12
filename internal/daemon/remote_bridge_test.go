@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -76,17 +77,12 @@ func newProxyDaemon(t *testing.T, runner *recordingRunner) (*Daemon, *bridge.Tun
 	return d, &gotSpec, &gotKeepaliveAddr
 }
 
-// TestRemoteBridgeOpenDispatch proves the cross-host open shells the peer's own
-// bridge_open with --origin and the forwarded --advertise and NO --host, feeds the
-// reply's token + proxy port into the forward, supervises it over the tunnel's
-// proven-up addr, and registers a proxy session under a locally-minted capability
-// that never leaks the peer's.
 func TestRemoteBridgeOpenDispatch(t *testing.T) {
 	runner := &recordingRunner{byMethod: map[string]string{"bridge_open": cannedBridgeOpenReply}}
 	d, gotSpec, gotKeepaliveAddr := newProxyDaemon(t, runner)
 	t.Cleanup(func() { d.closeAllBridges(context.Background()) })
 
-	got, err := dispatchSelf(t, d, "bridge_open", map[string]any{"browser": "chrome", "host": "you@desktop"})
+	got, err := dispatchSelf(t, d, "bridge_open", map[string]any{"browser": "chrome", "host": "you@desktop", "urls": []any{"https://app.slack.com/", "slack.com"}})
 	if err != nil {
 		t.Fatalf("cross-host bridge_open: %v", err)
 	}
@@ -140,6 +136,9 @@ func TestRemoteBridgeOpenDispatch(t *testing.T) {
 	if strings.Contains(shelled, "--host") {
 		t.Fatalf("shelled bridge_open must not carry --host (peer defaults to local): %q", shelled)
 	}
+	if !strings.HasSuffix(shelled, " -- 'https://app.slack.com/' 'slack.com'") {
+		t.Fatalf("shelled bridge_open = %q, want the requested urls after --", shelled)
+	}
 
 	// A proxy session is registered under capA, holding the peer capability for close.
 	sess, ok := proxyBridgeSessionFor(d, capA)
@@ -148,6 +147,9 @@ func TestRemoteBridgeOpenDispatch(t *testing.T) {
 	}
 	if sess.capB != "cap-b-secret" {
 		t.Fatalf("proxy capB = %q, want the peer capability", sess.capB)
+	}
+	if want := []cookie.Host{"app.slack.com", "slack.com"}; !slices.Equal(sess.hosts, want) {
+		t.Fatalf("proxy hosts = %q, want %q", sess.hosts, want)
 	}
 	if got := bridgeCount(d); got != 1 {
 		t.Fatalf("live sessions = %d, want 1", got)
@@ -160,7 +162,7 @@ func TestRemoteBridgeOpenRejectsUnknownHost(t *testing.T) {
 	runner := &recordingRunner{byMethod: map[string]string{"bridge_open": cannedBridgeOpenReply}}
 	d, _, _ := newProxyDaemon(t, runner)
 
-	_, err := dispatchSelf(t, d, "bridge_open", map[string]any{"browser": "chrome", "host": "stranger@host"})
+	_, err := dispatchSelf(t, d, "bridge_open", map[string]any{"browser": "chrome", "host": "stranger@host", "urls": []any{"https://app.slack.com/"}})
 	if err == nil || !strings.Contains(err.Error(), "unknown host") {
 		t.Fatalf("open to a non-peer = %v, want an unknown-host reject", err)
 	}
@@ -171,8 +173,6 @@ func TestRemoteBridgeOpenRejectsUnknownHost(t *testing.T) {
 	}
 }
 
-// TestRemoteBridgeReattachPrecedesDispatch proves a live proxy capability
-// re-attaches — same reply, no fresh ssh open — ahead of the cross-host branch.
 func TestRemoteBridgeReattachPrecedesDispatch(t *testing.T) {
 	runner := &recordingRunner{byMethod: map[string]string{"bridge_open": cannedBridgeOpenReply}}
 	d, _, _ := newProxyDaemon(t, runner)
@@ -186,6 +186,7 @@ func TestRemoteBridgeReattachPrecedesDispatch(t *testing.T) {
 		browser:      "chrome",
 		profile:      "Default",
 		wsURL:        "ws://127.0.0.1:5555/tok-b/devtools/browser/uuid-b",
+		hosts:        []cookie.Host{"app.slack.com", "slack.com"},
 		proxyPort:    5555,
 		expiry:       time.Now().Add(time.Minute),
 		tunnel:       &fakeTunnel{done: make(chan struct{})},
@@ -197,13 +198,20 @@ func TestRemoteBridgeReattachPrecedesDispatch(t *testing.T) {
 	d.bridges["cap-a-live"] = sess
 
 	got, err := dispatchSelf(t, d, "bridge_open", map[string]any{
-		"browser": "chrome", "host": "you@desktop", "capability": "cap-a-live",
+		"browser": "chrome", "host": "you@desktop", "capability": "cap-a-live", "urls": []any{"https://app.slack.com/"},
 	})
 	if err != nil {
 		t.Fatalf("re-attach: %v", err)
 	}
 	if url, _ := resultMap(t, got)["url"].(string); url != sess.wsURL {
 		t.Fatalf("re-attach url = %q, want %q", url, sess.wsURL)
+	}
+	_, err = dispatchSelf(t, d, "bridge_open", map[string]any{
+		"browser": "chrome", "host": "you@desktop", "capability": "cap-a-live", "urls": []any{"https://app.slack.com/", "https://github.com/"},
+	})
+	want := "bridge you@desktop:chrome:Default is open for app.slack.com, slack.com, not github.com: run `cookiesync bridge stop you@desktop:chrome:Default`, then open it again with every URL the task needs"
+	if err == nil || err.Error() != want {
+		t.Fatalf("re-attach for an unseeded host = %v, want %q", err, want)
 	}
 	runner.mu.Lock()
 	defer runner.mu.Unlock()
@@ -295,7 +303,7 @@ func TestRemoteBridgeOpenRetriesOnlyOnForwardExit(t *testing.T) {
 				return nil, tc.tunnelErr
 			}
 
-			_, err := dispatchSelf(t, d, "bridge_open", map[string]any{"browser": "chrome", "host": "you@desktop"})
+			_, err := dispatchSelf(t, d, "bridge_open", map[string]any{"browser": "chrome", "host": "you@desktop", "urls": []any{"https://app.slack.com/"}})
 			if err == nil {
 				t.Fatal("a forward that never comes up must fail the open")
 			}
@@ -320,7 +328,7 @@ func TestRemoteBridgeOpenClosesIncompleteReply(t *testing.T) {
 	runner := &recordingRunner{byMethod: map[string]string{"bridge_open": incomplete}}
 	d, _, _ := newProxyDaemon(t, runner)
 
-	_, err := dispatchSelf(t, d, "bridge_open", map[string]any{"browser": "chrome", "host": "you@desktop"})
+	_, err := dispatchSelf(t, d, "bridge_open", map[string]any{"browser": "chrome", "host": "you@desktop", "urls": []any{"https://app.slack.com/"}})
 	if err == nil {
 		t.Fatal("an incomplete reply must fail the open")
 	}

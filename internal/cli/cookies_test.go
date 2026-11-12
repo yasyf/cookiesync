@@ -1,12 +1,16 @@
 package cli
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/yasyf/cookiesync/internal/cookie"
 	"github.com/yasyf/cookiesync/internal/paths"
 	"github.com/yasyf/cookiesync/internal/state"
 	"github.com/yasyf/cookiesync/internal/testutil"
@@ -58,5 +62,52 @@ func TestEnsureLocalEndpointsNoOpWhenLocalPresent(t *testing.T) {
 	}
 	if len(st.Endpoints()) != 1 || string(st.Endpoints()[0].ID()) != "me@laptop:chrome:Work" {
 		t.Fatalf("ensureLocalEndpoints mutated the registry: %v", st.Endpoints())
+	}
+}
+
+func TestCookiesHostReadsThatHostAlone(t *testing.T) {
+	testutil.IsolateHostConfig(t, paths.Config)
+	t.Setenv("HOME", t.TempDir())
+	var calls []string
+	var gotParams map[string]any
+	orig := rpcCallJSON
+	rpcCallJSON = func(_ context.Context, _ string, method string, params map[string]any, out any) error {
+		calls = append(calls, method)
+		gotParams = params
+		return json.Unmarshal([]byte(fmt.Sprintf(`{"protocol_version":%d,"cookies":[]}`, cookie.ProtocolVersion)), out)
+	}
+	t.Cleanup(func() { rpcCallJSON = orig })
+
+	run := func(args ...string) error {
+		cmd := newCookiesCmd()
+		cmd.SetOut(&bytes.Buffer{})
+		cmd.SetErr(&bytes.Buffer{})
+		cmd.SetArgs(args)
+		cmd.SilenceUsage = true
+		cmd.SilenceErrors = true
+		return cmd.Execute()
+	}
+
+	if err := run("--host", "you@desktop", "https://app.slack.com"); err != nil {
+		t.Fatalf("cookies --host: %v", err)
+	}
+	if len(calls) != 1 || calls[0] != "get_cookies" || gotParams["host"] != "you@desktop" {
+		t.Fatalf("cookies --host called %v with %v, want one get_cookies naming you@desktop", calls, gotParams)
+	}
+
+	for _, refused := range []struct {
+		args []string
+		want string
+	}{
+		{[]string{"--host", "you@desktop", "--browser", "chrome", "https://app.slack.com"}, "drop --browser"},
+		{[]string{"--host", "you@desktop", "--format", "webstorage", "https://app.slack.com"}, "drop --host"},
+	} {
+		calls = nil
+		if err := run(refused.args...); err == nil || !strings.Contains(err.Error(), refused.want) {
+			t.Fatalf("cookies %v = %v, want a refusal containing %q", refused.args, err, refused.want)
+		}
+		if len(calls) != 0 {
+			t.Fatalf("cookies %v reached the daemon: %v", refused.args, calls)
+		}
 	}
 }

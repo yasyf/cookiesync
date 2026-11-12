@@ -275,16 +275,17 @@ func newRPCBridgeOpenCmd() *cobra.Command {
 	var browser, profile, host, origin, advertise string
 	var headed, headless bool
 	cmd := &cobra.Command{
-		Use:   "bridge_open",
-		Short: "Ask the daemon to open a cookie-seeded CDP bridge and return its ws endpoint.",
-		Args:  cobra.NoArgs,
-		RunE: func(cmd *cobra.Command, _ []string) error {
+		Use:   "bridge_open <url>...",
+		Short: "Ask the daemon to open a CDP bridge seeded for the urls' hosts and return its ws endpoint.",
+		Args:  cobra.MinimumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
 			params := map[string]any{
 				"host":      host,
 				"browser":   browser,
 				"profile":   profile,
 				"origin":    origin,
 				"advertise": advertise,
+				"urls":      asAnySlice(args),
 			}
 			setWindowParam(params, windowMode(cmd, headed, headless))
 			return rpcPassthrough(cmd, "bridge_open", params)

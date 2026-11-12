@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -55,13 +57,15 @@ func TestBridgeOpenReattachClose(t *testing.T) {
 		}},
 	}
 	var seedCalls atomic.Int32
-	d.seedSource = func(_ context.Context, _ cookie.Browser, _ string, _ cookie.AesKey) (cookie.StorageState, cookie.SeedCounts, error) {
+	var seededURLs []string
+	d.seedSource = func(_ context.Context, urls []string, _ cookie.Browser, _ string, _ cookie.AesKey) (cookie.StorageState, cookie.SeedCounts, error) {
 		seedCalls.Add(1)
+		seededURLs = urls
 		return fixture, cookie.SeedCounts{Attempted: len(fixture.Cookies)}, nil
 	}
 
 	ctx := context.Background()
-	openParams := map[string]any{"browser": "chrome", "profile": profile, "headed": false}
+	openParams := map[string]any{"browser": "chrome", "profile": profile, "headed": false, "urls": []any{"https://example.com/"}}
 
 	// (1) open returns a url + capability; the seeded cookie round-trips over ws.
 	res1, err := dispatchSelf(t, d, "bridge_open", openParams)
@@ -76,6 +80,9 @@ func TestBridgeOpenReattachClose(t *testing.T) {
 	}
 	if got := seedCalls.Load(); got != 1 {
 		t.Fatalf("seedSource calls = %d, want 1", got)
+	}
+	if want := []string{"https://example.com/"}; !slices.Equal(seededURLs, want) {
+		t.Fatalf("seedSource urls = %q, want the open's %q", seededURLs, want)
 	}
 	if got := consent.biometricCalls.Load(); got != 1 {
 		t.Fatalf("ObtainKeyBiometric calls = %d, want 1", got)
@@ -101,7 +108,7 @@ func TestBridgeOpenReattachClose(t *testing.T) {
 	// (2) re-attach WITH the capability returns the same url, no second tap, no
 	// second session, and no lease extension.
 	res2, err := dispatchSelf(t, d, "bridge_open", map[string]any{
-		"browser": "chrome", "profile": profile, "headed": false, "capability": cap1,
+		"browser": "chrome", "profile": profile, "headed": false, "capability": cap1, "urls": []any{"https://example.com/"},
 	})
 	if err != nil {
 		t.Fatalf("bridge_open re-attach: %v", err)
@@ -124,6 +131,15 @@ func TestBridgeOpenReattachClose(t *testing.T) {
 	}
 	if sess, _ := bridgeSessionFor(d, cap1); sess.expiry != expiry1 {
 		t.Fatalf("re-attach extended the lease: expiry %v != %v", sess.expiry, expiry1)
+	}
+	_, err = dispatchSelf(t, d, "bridge_open", map[string]any{
+		"browser": "chrome", "profile": profile, "headed": false, "capability": cap1, "urls": []any{"https://example.com/", "https://app.slack.com/"},
+	})
+	if want := "is open for example.com, not app.slack.com: run `cookiesync bridge stop chrome:" + profile + "`"; err == nil || !strings.Contains(err.Error(), want) {
+		t.Fatalf("re-attach for a host the session was not seeded with = %v, want it to contain %q", err, want)
+	}
+	if got := bridgeCount(d); got != 1 {
+		t.Fatalf("the refused re-attach changed the live sessions: %d, want 1", got)
 	}
 
 	// (3) a wrong capability leaks nothing beyond the exact protocol version,
@@ -200,7 +216,7 @@ func TestBridgeOpenSeedsFromAnImport(t *testing.T) {
 	d := New(consent, newFakeCache(), nil, staticProbe(liveSession(currentUser(t))), &recordingRunner{}, fixedState{st: st}, fixedState{st: st})
 	d.processes = testBridgeProcesses(t)
 	t.Cleanup(func() { d.closeAllBridges(context.Background()) })
-	d.seedSource = func(context.Context, cookie.Browser, string, cookie.AesKey) (cookie.StorageState, cookie.SeedCounts, error) {
+	d.seedSource = func(context.Context, []string, cookie.Browser, string, cookie.AesKey) (cookie.StorageState, cookie.SeedCounts, error) {
 		t.Errorf("seedSource called: an open over a live import must never read the profile")
 		return cookie.StorageState{}, cookie.SeedCounts{}, errors.New("profile read forbidden")
 	}
@@ -213,7 +229,7 @@ func TestBridgeOpenSeedsFromAnImport(t *testing.T) {
 		importExpiresAt))
 
 	ctx := context.Background()
-	res, err := dispatchSelf(t, d, "bridge_open", map[string]any{"browser": "chrome", "profile": profile, "headed": false})
+	res, err := dispatchSelf(t, d, "bridge_open", map[string]any{"browser": "chrome", "profile": profile, "headed": false, "urls": []any{"https://example.com/"}})
 	if err != nil {
 		t.Fatalf("bridge_open over an import: %v", err)
 	}
@@ -273,7 +289,7 @@ func TestBridgeOpenRefusesAnImportThatExpiresDuringStartup(t *testing.T) {
 	d := New(consent, newFakeCache(), nil, staticProbe(liveSession(currentUser(t))), &recordingRunner{}, fixedState{st: st}, fixedState{st: st})
 	d.processes = testBridgeProcesses(t)
 	t.Cleanup(func() { d.closeAllBridges(context.Background()) })
-	d.seedSource = func(context.Context, cookie.Browser, string, cookie.AesKey) (cookie.StorageState, cookie.SeedCounts, error) {
+	d.seedSource = func(context.Context, []string, cookie.Browser, string, cookie.AesKey) (cookie.StorageState, cookie.SeedCounts, error) {
 		t.Errorf("seedSource called: an open over a live import must never read the profile")
 		return cookie.StorageState{}, cookie.SeedCounts{}, errors.New("profile read forbidden")
 	}
@@ -290,7 +306,7 @@ func TestBridgeOpenRefusesAnImportThatExpiresDuringStartup(t *testing.T) {
 		[]cookie.Cookie{{HostKey: "example.com", Name: "bridge_probe", Value: "ok", Path: "/", IsSecure: true, SameSite: 2}},
 		nil, start.Add(time.Minute)))
 
-	_, err = dispatchSelf(t, d, "bridge_open", map[string]any{"browser": "chrome", "profile": profile, "headed": false})
+	_, err = dispatchSelf(t, d, "bridge_open", map[string]any{"browser": "chrome", "profile": profile, "headed": false, "urls": []any{"https://example.com/"}})
 	want := "import for " + endpointID("me@laptop", "chrome", profile) + " expired during bridge startup"
 	if err == nil || err.Error() != want {
 		t.Fatalf("bridge_open error = %v, want %q", err, want)
@@ -388,7 +404,7 @@ func TestBridgeFreshOpensDoNotShareSecrets(t *testing.T) {
 	t.Cleanup(func() { d.closeAllBridges(context.Background()) })
 
 	var seedCalls atomic.Int32
-	d.seedSource = func(_ context.Context, _ cookie.Browser, _ string, _ cookie.AesKey) (cookie.StorageState, cookie.SeedCounts, error) {
+	d.seedSource = func(context.Context, []string, cookie.Browser, string, cookie.AesKey) (cookie.StorageState, cookie.SeedCounts, error) {
 		seedCalls.Add(1)
 		return cookie.StorageState{Cookies: []cookie.Cookie{{
 			HostKey: "example.com", Name: "bridge_probe", Value: "ok", Path: "/",
@@ -410,7 +426,7 @@ func TestBridgeFreshOpensDoNotShareSecrets(t *testing.T) {
 			defer wg.Done()
 			// A private param copy per goroutine: same requestor+endpoint (the
 			// former collision key), no shared-map write.
-			res, err := dispatchSelf(t, d, "bridge_open", map[string]any{"browser": "chrome", "profile": profile, "headed": false})
+			res, err := dispatchSelf(t, d, "bridge_open", map[string]any{"browser": "chrome", "profile": profile, "headed": false, "urls": []any{"https://example.com/"}})
 			results[i] = outcome{res: res, err: err}
 		}(i)
 	}

@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 
@@ -74,17 +75,14 @@ type pluginErrorResponse struct {
 	Error    string `json:"error"`
 }
 
-// newBridgePluginCmd builds the hidden agent-browser provider adapter: an
-// exec-once JSON handler mapping browser.launch to `bridge open` and
-// browser.close to `bridge stop`.
 func newBridgePluginCmd() *cobra.Command {
 	return &cobra.Command{
-		Use:    "plugin",
-		Short:  "agent-browser provider plugin (exec-once JSON protocol over stdin/stdout).",
+		Use:    "plugin <url>...",
+		Short:  "agent-browser provider plugin (exec-once JSON protocol over stdin/stdout) seeding the URLs its args name.",
 		Hidden: true,
-		Args:   cobra.NoArgs,
-		RunE: func(cmd *cobra.Command, _ []string) error {
-			return runBridgePlugin(cmd.Context(), cmd.Root().Version, cmd.InOrStdin(), cmd.OutOrStdout())
+		Args:   cobra.ArbitraryArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return runBridgePlugin(cmd.Context(), cmd.Root().Version, args, cmd.InOrStdin(), cmd.OutOrStdout())
 		},
 	}
 }
@@ -93,7 +91,7 @@ func newBridgePluginCmd() *cobra.Command {
 // dispatches on its type, and writes exactly one JSON response to out. A protocol
 // failure emits a success:false envelope and still exits 0; only a stdout write
 // failure returns non-nil.
-func runBridgePlugin(ctx context.Context, build string, in io.Reader, out io.Writer) error {
+func runBridgePlugin(ctx context.Context, build string, urls []string, in io.Reader, out io.Writer) error {
 	raw, err := io.ReadAll(in)
 	if err != nil {
 		return err
@@ -117,7 +115,7 @@ func runBridgePlugin(ctx context.Context, build string, in io.Reader, out io.Wri
 			},
 		})
 	case "browser.launch":
-		return pluginLaunch(ctx, build, out, req.Request)
+		return pluginLaunch(ctx, build, urls, out, req.Request)
 	case "browser.close":
 		return pluginClose(ctx, build, out, req.Request)
 	default:
@@ -129,10 +127,10 @@ func runBridgePlugin(ctx context.Context, build string, in io.Reader, out io.Wri
 // bridge seeds from; the CDP bridge is Chrome-only.
 var engineBrowser = map[string]string{"chrome": "chrome"}
 
-// pluginLaunch maps a browser.launch to a fresh local `bridge open` (default
-// profile) and returns its ws:// endpoint as cdpUrl. directPage stays false so
-// agent-browser runs its own target discovery and attaches the seeded page.
-func pluginLaunch(ctx context.Context, build string, out io.Writer, body json.RawMessage) error {
+func pluginLaunch(ctx context.Context, build string, urls []string, out io.Writer, body json.RawMessage) error {
+	if len(urls) == 0 {
+		return pluginFail(out, errors.New(`the cookiesync provider seeds only the URLs its args name: configure it as command "cookiesync", args ["bridge", "plugin", "<url>", ...]`))
+	}
 	var lr pluginLaunchRequest
 	if err := json.Unmarshal(body, &lr); err != nil {
 		return pluginFail(out, fmt.Errorf("parse browser.launch request: %w", err))
@@ -145,7 +143,7 @@ func pluginLaunch(ctx context.Context, build string, out io.Writer, body json.Ra
 	if lr.LaunchOptions.Headed {
 		window = bridge.WindowHeaded
 	}
-	resp, err := openBridge(ctx, build, "", browser, bridgeDefaultProfile, window)
+	resp, err := openBridge(ctx, build, "", browser, bridgeDefaultProfile, urls, window)
 	if err != nil {
 		return pluginFail(out, err)
 	}

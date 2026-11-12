@@ -218,33 +218,32 @@ func primaryProfile(browser cookie.Browser) (string, error) {
 }
 
 func newCookiesCmd() *cobra.Command {
-	var browser, profile, format string
+	var browser, profile, host, format string
 	cmd := &cobra.Command{
 		Use:   "cookies <url>...",
-		Short: "Stream the cookies for one or more URLs in the chosen format, merged into one document; omit --browser to union every registered browser and host.",
+		Short: "Stream the cookies for one or more URLs in the chosen format, merged into one document; omit --browser to union this host's registered browsers.",
 		Long: "Stream the cookies for one or more URLs in the chosen format, merged into one " +
 			"document.\n\nPass several hosts (e.g. an app and the API host it calls) to get a single " +
 			"storageState spanning them all — one cached-key decrypt, no extra Touch ID prompt.\n\n" +
-			"With --browser omitted the result is a best-effort union across every registered browser " +
-			"and host — local stores and remote peers over ssh — skipping any that fail with a stderr " +
-			"warning; --browser is the single-browser escape hatch.",
+			"With --browser omitted the result is a best-effort union across this host's registered " +
+			"browsers, skipping any that fail with a stderr warning; --host reads another host's " +
+			"registered browsers over ssh instead, and --browser is the single-browser escape hatch.\n\n" +
+			"A URL the union finds no cookie for gets a stderr line naming the next step: the " +
+			"profile on this host that holds its cookies and the command that reads it, or where to " +
+			"sign in. When no URL gets a cookie the command fails with those lines.",
 		Args: cobra.MinimumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runCookies(cmd, args, browser, profile, format)
+			return runCookies(cmd, args, browser, profile, host, format)
 		},
 	}
-	cmd.Flags().StringVar(&browser, "browser", "", "The browser to read cookies from; omitted unions every registered browser and host, skipping any that fail.")
+	cmd.Flags().StringVar(&browser, "browser", "", "The browser to read cookies from; omitted unions this host's registered browsers, skipping any that fail.")
 	cmd.Flags().StringVar(&profile, "profile", "Default", "The profile to read cookies from (requires --browser).")
+	cmd.Flags().StringVar(&host, "host", "", "Union the registered browsers of this other host, as cookiesync browser ls names it, over ssh instead of this host's; web storage stays this host's, so it is left out (excludes --browser).")
 	cmd.Flags().StringVar(&format, "format", "playwright", "The output wire format (playwright|netscape|header|json|webstorage).")
 	return cmd
 }
 
-// runCookies renders the merged cookies for every url in the chosen format. With an
-// explicit --browser it fetches that one browser in a single daemon call. With --browser
-// omitted it auto-registers this host's installed browsers when the registry has none,
-// then unions every registered endpoint — local and remote — rendering the merged set
-// on stdout with per-endpoint skips on stderr.
-func runCookies(cmd *cobra.Command, urls []string, browser, profile, format string) error {
+func runCookies(cmd *cobra.Command, urls []string, browser, profile, host, format string) error {
 	switch cookie.OutputFormat(format) {
 	case cookie.FormatPlaywright, cookie.FormatNetscape, cookie.FormatHeader, cookie.FormatJSON, cookie.FormatWebStorage:
 	default:
@@ -253,8 +252,11 @@ func runCookies(cmd *cobra.Command, urls []string, browser, profile, format stri
 	if cmd.Flags().Changed("profile") && browser == "" {
 		return errors.New("--profile requires --browser")
 	}
+	if host != "" && browser != "" {
+		return errors.New("--host unions every registered browser on that host; drop --browser")
+	}
 	if browser == "" {
-		return runCookiesAll(cmd, urls, format)
+		return runCookiesAll(cmd, urls, host, format)
 	}
 	params := map[string]any{
 		"urls":    asAnySlice(urls),
@@ -282,15 +284,28 @@ func runCookies(cmd *cobra.Command, urls []string, browser, profile, format stri
 	return nil
 }
 
-// runCookiesAll auto-registers this host's installed browsers when the registry has no
-// local endpoint, then unions the cookies for every url across every registered endpoint
-// in one daemon call, renders the merged set on stdout, and writes each per-endpoint
-// skip on stderr.
-func runCookiesAll(cmd *cobra.Command, urls []string, format string) error {
-	if err := ensureLocalEndpoints(cmd.Context()); err != nil {
-		return err
+func runCookiesAll(cmd *cobra.Command, urls []string, host, format string) error {
+	webStorage := cookie.OutputFormat(format) == cookie.FormatWebStorage
+	if host != "" && webStorage {
+		return errors.New("--format webstorage reads this host's browsers only; drop --host")
+	}
+	if host == "" {
+		if err := ensureLocalEndpoints(cmd.Context()); err != nil {
+			return err
+		}
+	}
+	if webStorage {
+		origins, err := fetchOrigins(cmd, urls, "", "", format)
+		if err != nil {
+			return err
+		}
+		renderCookies(cmd, nil, origins, format)
+		return nil
 	}
 	params := map[string]any{"urls": asAnySlice(urls)}
+	if host != "" {
+		params["host"] = host
+	}
 	if r, ok := resolveRequestor(); ok {
 		params["requestor"] = r
 	}
@@ -299,15 +314,18 @@ func runCookiesAll(cmd *cobra.Command, urls []string, format string) error {
 		Cookies         []cookie.WireCookie `json:"cookies"`
 		Warnings        []string            `json:"warnings"`
 	}
-	if err := rpc.CallJSON(cmd.Context(), cmd.Root().Version, "get_cookies", params, &result); err != nil {
+	if err := rpcCallJSON(cmd.Context(), cmd.Root().Version, "get_cookies", params, &result); err != nil {
 		return err
 	}
 	if result.ProtocolVersion != cookie.ProtocolVersion {
 		return fmt.Errorf("cookie protocol version %d, want %d", result.ProtocolVersion, cookie.ProtocolVersion)
 	}
-	origins, err := fetchOrigins(cmd, urls, "", "", format)
-	if err != nil {
-		return err
+	var origins []cookie.WireOrigin
+	if host == "" {
+		var err error
+		if origins, err = fetchOrigins(cmd, urls, "", "", format); err != nil {
+			return err
+		}
 	}
 	renderCookies(cmd, result.Cookies, origins, format)
 	for _, warning := range result.Warnings {

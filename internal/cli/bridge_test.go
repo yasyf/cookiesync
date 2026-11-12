@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"testing"
@@ -16,7 +17,7 @@ import (
 )
 
 // stubOpenBridge swaps the openBridge seam for the duration of a test.
-func stubOpenBridge(t *testing.T, fn func(context.Context, string, string, string, string, bridge.WindowMode) (bridgeOpenResult, error)) {
+func stubOpenBridge(t *testing.T, fn func(context.Context, string, string, string, string, []string, bridge.WindowMode) (bridgeOpenResult, error)) {
 	t.Helper()
 	orig := openBridge
 	openBridge = fn
@@ -35,9 +36,12 @@ func stubStopBridge(t *testing.T, fn func(context.Context, string, string) error
 // bridgeOpenJSON object (no human lines), carries the url, and never leaks the
 // management capability openBridge persists client-side.
 func TestBridgeOpenJSON(t *testing.T) {
-	stubOpenBridge(t, func(_ context.Context, _ string, host, browser, profile string, window bridge.WindowMode) (bridgeOpenResult, error) {
+	stubOpenBridge(t, func(_ context.Context, _ string, host, browser, profile string, urls []string, window bridge.WindowMode) (bridgeOpenResult, error) {
 		if host != "" || browser != "chrome" || profile != bridgeDefaultProfile || window != bridge.WindowAuto {
 			t.Fatalf("openBridge args = %q/%q/%q window=%v, want ''/chrome/Default window=auto", host, browser, profile, window)
+		}
+		if want := []string{"https://app.slack.com", "slack.com"}; !slices.Equal(urls, want) {
+			t.Fatalf("openBridge urls = %q, want %q", urls, want)
 		}
 		return bridgeOpenResult{
 			URL:        "ws://127.0.0.1:9222/devtools/browser/tok",
@@ -53,7 +57,7 @@ func TestBridgeOpenJSON(t *testing.T) {
 	var out bytes.Buffer
 	cmd.SetOut(&out)
 	cmd.SetErr(&out)
-	cmd.SetArgs([]string{"--json", "chrome"})
+	cmd.SetArgs([]string{"--json", "chrome", "https://app.slack.com", "slack.com"})
 	if err := cmd.Execute(); err != nil {
 		t.Fatalf("bridge open --json: %v\n%s", err, out.String())
 	}
@@ -79,7 +83,7 @@ func TestBridgeOpenJSON(t *testing.T) {
 
 func TestBareBridgeOpenAndStopShareTheDefaultTarget(t *testing.T) {
 	var openedKey string
-	stubOpenBridge(t, func(_ context.Context, _ string, host, browser, profile string, window bridge.WindowMode) (bridgeOpenResult, error) {
+	stubOpenBridge(t, func(_ context.Context, _ string, host, browser, profile string, _ []string, window bridge.WindowMode) (bridgeOpenResult, error) {
 		if window != bridge.WindowAuto {
 			t.Fatalf("bare open window = %v, want auto", window)
 		}
@@ -96,7 +100,7 @@ func TestBareBridgeOpenAndStopShareTheDefaultTarget(t *testing.T) {
 	var openOut bytes.Buffer
 	open.SetOut(&openOut)
 	open.SetErr(&openOut)
-	open.SetArgs([]string{"--json"})
+	open.SetArgs([]string{"--json", "https://app.slack.com"})
 	if err := open.Execute(); err != nil {
 		t.Fatalf("bare bridge open --json: %v\n%s", err, openOut.String())
 	}
@@ -155,6 +159,48 @@ func TestParseBridgeTarget(t *testing.T) {
 	}
 }
 
+func TestSplitBridgeArgs(t *testing.T) {
+	tests := []struct {
+		args       []string
+		wantTarget string
+		wantURLs   []string
+	}{
+		{args: []string{"https://app.slack.com"}, wantURLs: []string{"https://app.slack.com"}},
+		{args: []string{"slack.com", "github.com"}, wantURLs: []string{"slack.com", "github.com"}},
+		{args: []string{"localhost:3000"}, wantURLs: []string{"localhost:3000"}},
+		{args: []string{"https://x.com:8443/p"}, wantURLs: []string{"https://x.com:8443/p"}},
+		{args: []string{"chrome", "https://app.slack.com"}, wantTarget: "chrome", wantURLs: []string{"https://app.slack.com"}},
+		{args: []string{"arc:Profile 1", "slack.com"}, wantTarget: "arc:Profile 1", wantURLs: []string{"slack.com"}},
+		{args: []string{"desk:chrome:Work", "https://a.com", "https://b.com"}, wantTarget: "desk:chrome:Work", wantURLs: []string{"https://a.com", "https://b.com"}},
+		{args: []string{"chrome"}, wantTarget: "chrome"},
+	}
+	for _, tt := range tests {
+		t.Run(strings.Join(tt.args, " "), func(t *testing.T) {
+			target, urls := splitBridgeArgs(tt.args)
+			if target != tt.wantTarget || !slices.Equal(urls, tt.wantURLs) {
+				t.Fatalf("splitBridgeArgs(%q) = %q, %q, want %q, %q", tt.args, target, urls, tt.wantTarget, tt.wantURLs)
+			}
+		})
+	}
+}
+
+func TestBridgeOpenWithoutURLsOpensNothing(t *testing.T) {
+	stubOpenBridge(t, func(context.Context, string, string, string, string, []string, bridge.WindowMode) (bridgeOpenResult, error) {
+		t.Fatal("an open with no URLs must not reach the daemon")
+		return bridgeOpenResult{}, nil
+	})
+	for _, args := range [][]string{{"chrome"}, {"desk:arc:Default"}, {}} {
+		cmd := newBridgeOpenCmd()
+		var out bytes.Buffer
+		cmd.SetOut(&out)
+		cmd.SetErr(&out)
+		cmd.SetArgs(args)
+		if err := cmd.Execute(); err == nil {
+			t.Fatalf("bridge open %q succeeded with no URLs", args)
+		}
+	}
+}
+
 func TestParseBridgeTargetRefusesAnEmptyBrowser(t *testing.T) {
 	for _, target := range []string{"desk:", "desk::Work"} {
 		t.Run(target, func(t *testing.T) {
@@ -181,7 +227,7 @@ func TestBridgeOpenWindowFlags(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			got := bridge.WindowMode(-1)
-			stubOpenBridge(t, func(_ context.Context, _, _, _, _ string, window bridge.WindowMode) (bridgeOpenResult, error) {
+			stubOpenBridge(t, func(_ context.Context, _, _, _, _ string, _ []string, window bridge.WindowMode) (bridgeOpenResult, error) {
 				got = window
 				return bridgeOpenResult{}, nil
 			})
@@ -189,7 +235,7 @@ func TestBridgeOpenWindowFlags(t *testing.T) {
 			var out bytes.Buffer
 			cmd.SetOut(&out)
 			cmd.SetErr(&out)
-			cmd.SetArgs(append([]string{"--json"}, tt.args...))
+			cmd.SetArgs(append([]string{"--json", "https://app.slack.com"}, tt.args...))
 			if err := cmd.Execute(); err != nil {
 				t.Fatalf("bridge open %v: %v\n%s", tt.args, err, out.String())
 			}
@@ -304,7 +350,7 @@ func TestInvalidBridgeCapabilityStateFailsLoudlyAndRemains(t *testing.T) {
 	if err := os.WriteFile(path, []byte(invalid), 0o600); err != nil {
 		t.Fatalf("write invalid capability: %v", err)
 	}
-	if _, err := openBridge(t.Context(), "test", "", "chrome", bridgeDefaultProfile, bridge.WindowHeadless); err == nil {
+	if _, err := openBridge(t.Context(), "test", "", "chrome", bridgeDefaultProfile, []string{"https://app.slack.com"}, bridge.WindowHeadless); err == nil {
 		t.Fatal("openBridge accepted invalid persisted capability")
 	}
 	if err := stopBridge(t.Context(), "test", key); err == nil {
@@ -380,9 +426,10 @@ func TestBridgePluginManifest(t *testing.T) {
 // key :chrome:Default — never the capability openBridge returned.
 func TestBridgePluginLaunch(t *testing.T) {
 	var gotHost, gotBrowser, gotProfile string
+	var gotURLs []string
 	var gotWindow bridge.WindowMode
-	stubOpenBridge(t, func(_ context.Context, _ string, host, browser, profile string, window bridge.WindowMode) (bridgeOpenResult, error) {
-		gotHost, gotBrowser, gotProfile, gotWindow = host, browser, profile, window
+	stubOpenBridge(t, func(_ context.Context, _ string, host, browser, profile string, urls []string, window bridge.WindowMode) (bridgeOpenResult, error) {
+		gotHost, gotBrowser, gotProfile, gotURLs, gotWindow = host, browser, profile, urls, window
 		return bridgeOpenResult{
 			URL:        "ws://127.0.0.1:9222/devtools/browser/tok",
 			Endpoint:   "me@laptop:chrome:Default",
@@ -392,7 +439,7 @@ func TestBridgePluginLaunch(t *testing.T) {
 
 	req := `{"protocol":"agent-browser.plugin.v1","type":"browser.launch","capability":"browser.provider",` +
 		`"request":{"provider":"cookiesync","session":"default","launchOptions":{"headed":true,"engine":"chrome"}}}`
-	out := runPlugin(t, req)
+	out := runPlugin(t, req, "https://app.slack.com", "https://slack.com")
 	assertNoCapability(t, out)
 
 	var top map[string]any
@@ -425,6 +472,25 @@ func TestBridgePluginLaunch(t *testing.T) {
 	if gotHost != "" || gotBrowser != "chrome" || gotProfile != bridgeDefaultProfile || gotWindow != bridge.WindowHeaded {
 		t.Fatalf("openBridge got %q/%q/%q window=%v, want ''/chrome/Default window=headed", gotHost, gotBrowser, gotProfile, gotWindow)
 	}
+	if want := []string{"https://app.slack.com", "https://slack.com"}; !slices.Equal(gotURLs, want) {
+		t.Fatalf("openBridge urls = %q, want the plugin args %q", gotURLs, want)
+	}
+}
+
+func TestBridgePluginLaunchWithoutURLsOpensNothing(t *testing.T) {
+	stubOpenBridge(t, func(context.Context, string, string, string, string, []string, bridge.WindowMode) (bridgeOpenResult, error) {
+		t.Fatal("a provider with no URLs must not open a bridge")
+		return bridgeOpenResult{}, nil
+	})
+	out := runPlugin(t, `{"protocol":"agent-browser.plugin.v1","type":"browser.launch","request":{"launchOptions":{"engine":"chrome"}}}`)
+
+	var resp map[string]any
+	if err := json.Unmarshal([]byte(out), &resp); err != nil {
+		t.Fatalf("no-URL response is not valid JSON: %v\n%s", err, out)
+	}
+	if resp["success"] != false || !strings.Contains(resp["error"].(string), `"bridge", "plugin", "<url>"`) {
+		t.Fatalf("no-URL envelope = %v, want success=false naming the provider args", resp)
+	}
 }
 
 // TestBridgePluginLaunchBadEngine proves an empty or unknown engine yields a
@@ -433,12 +499,12 @@ func TestBridgePluginLaunch(t *testing.T) {
 func TestBridgePluginLaunchBadEngine(t *testing.T) {
 	for _, engine := range []string{"", "lightpanda", "firefox"} {
 		t.Run("engine="+engine, func(t *testing.T) {
-			stubOpenBridge(t, func(context.Context, string, string, string, string, bridge.WindowMode) (bridgeOpenResult, error) {
+			stubOpenBridge(t, func(context.Context, string, string, string, string, []string, bridge.WindowMode) (bridgeOpenResult, error) {
 				t.Fatal("a bad engine must not open a bridge")
 				return bridgeOpenResult{}, nil
 			})
 			req := `{"protocol":"agent-browser.plugin.v1","type":"browser.launch","request":{"launchOptions":{"engine":"` + engine + `"}}}`
-			out := runPlugin(t, req)
+			out := runPlugin(t, req, "https://app.slack.com")
 
 			var resp map[string]any
 			if err := json.Unmarshal([]byte(out), &resp); err != nil {
@@ -458,11 +524,11 @@ func TestBridgePluginLaunchBadEngine(t *testing.T) {
 // success:false envelope carrying the error and exit 0 (nil return) — a valid
 // protocol response is a successful program run.
 func TestBridgePluginLaunchError(t *testing.T) {
-	stubOpenBridge(t, func(_ context.Context, _, _, _, _ string, _ bridge.WindowMode) (bridgeOpenResult, error) {
+	stubOpenBridge(t, func(_ context.Context, _, _, _, _ string, _ []string, _ bridge.WindowMode) (bridgeOpenResult, error) {
 		return bridgeOpenResult{}, errBoom
 	})
 	req := `{"protocol":"agent-browser.plugin.v1","type":"browser.launch","request":{"launchOptions":{"engine":"chrome"}}}`
-	out := runPlugin(t, req)
+	out := runPlugin(t, req, "https://app.slack.com")
 
 	var resp map[string]any
 	if err := json.Unmarshal([]byte(out), &resp); err != nil {
@@ -505,7 +571,7 @@ func TestBridgePluginClose(t *testing.T) {
 // TestBridgePluginUnknownType proves an unrecognized type yields a success:false
 // envelope and exit 0 (nil return), without touching a bridge.
 func TestBridgePluginUnknownType(t *testing.T) {
-	stubOpenBridge(t, func(context.Context, string, string, string, string, bridge.WindowMode) (bridgeOpenResult, error) {
+	stubOpenBridge(t, func(context.Context, string, string, string, string, []string, bridge.WindowMode) (bridgeOpenResult, error) {
 		t.Fatal("unknown type must not open a bridge")
 		return bridgeOpenResult{}, nil
 	})
@@ -526,7 +592,7 @@ func TestBridgePluginUnknownType(t *testing.T) {
 // TestBridgePluginBadProtocol proves a mismatched protocol tag yields a
 // success:false envelope and exit 0 (nil return), not a panic or non-zero exit.
 func TestBridgePluginBadProtocol(t *testing.T) {
-	stubOpenBridge(t, func(context.Context, string, string, string, string, bridge.WindowMode) (bridgeOpenResult, error) {
+	stubOpenBridge(t, func(context.Context, string, string, string, string, []string, bridge.WindowMode) (bridgeOpenResult, error) {
 		t.Fatal("a bad protocol must not open a bridge")
 		return bridgeOpenResult{}, nil
 	})
@@ -552,12 +618,10 @@ type stubError struct{ msg string }
 
 func (e *stubError) Error() string { return e.msg }
 
-// runPlugin feeds req to runBridgePlugin, asserts it exits 0 (nil return — a valid
-// protocol response is a successful run), and returns its stdout.
-func runPlugin(t *testing.T, req string) string {
+func runPlugin(t *testing.T, req string, urls ...string) string {
 	t.Helper()
 	var out bytes.Buffer
-	if err := runBridgePlugin(context.Background(), "test", strings.NewReader(req), &out); err != nil {
+	if err := runBridgePlugin(context.Background(), "test", urls, strings.NewReader(req), &out); err != nil {
 		t.Fatalf("runBridgePlugin(%s) = %v, want nil", req, err)
 	}
 	return out.String()

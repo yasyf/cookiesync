@@ -9,7 +9,9 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"slices"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -37,6 +39,7 @@ var errBridgeShutdown = errors.New("bridge: daemon shutting down")
 type session interface {
 	Capability() string
 	Endpoint() string
+	Hosts() []cookie.Host
 	Expiry() time.Time
 	Live() bool
 	OpenResult() map[string]any
@@ -44,14 +47,12 @@ type session interface {
 	Teardown()
 }
 
-// bridgeSession is one live CDP-bridge session the daemon owns: its wire
-// identity, the capability that proves possession, the browser and WS relay,
-// and the detached cancel that unwinds it.
 type bridgeSession struct {
 	sessionID    string
 	token        string
 	capability   string
 	endpoint     string
+	hosts        []cookie.Host
 	browser      string
 	profile      string
 	wsURL        string
@@ -69,6 +70,8 @@ func (s *bridgeSession) Capability() string { return s.capability }
 
 // Endpoint is the host:browser:profile identity a re-attach must match.
 func (s *bridgeSession) Endpoint() string { return s.endpoint }
+
+func (s *bridgeSession) Hosts() []cookie.Host { return s.hosts }
 
 // Expiry is when the lease lapses.
 func (s *bridgeSession) Expiry() time.Time { return s.expiry }
@@ -126,11 +129,12 @@ func (s *bridgeSession) Teardown() {
 	s.releaseSlots()
 }
 
-// handleBridgeOpen launches a cookie-seeded CDP bridge and registers its
-// session, or silently re-attaches a caller that presents a live capability.
-// Phase A is LOCAL-only: another host fails with a not-yet-available error.
 func (d *Daemon) handleBridgeOpen(ctx context.Context, params map[string]any) (any, error) {
 	requestor, err := requestorID(ctx, params)
+	if err != nil {
+		return nil, err
+	}
+	urls, err := urlsParam(params)
 	if err != nil {
 		return nil, err
 	}
@@ -166,20 +170,28 @@ func (d *Daemon) handleBridgeOpen(ctx context.Context, params map[string]any) (a
 	// The capability is proof-of-possession: re-attach never taps or extends, and
 	// it short-circuits ahead of the cross-host dispatch so a live proxy is reused.
 	if capability := optionalString(params, "capability", ""); capability != "" {
-		if resp, ok := d.reattachBridge(capability, endpoint); ok {
+		target := browser + ":" + profile
+		if named := optionalString(params, "host", ""); named != "" {
+			target = named + ":" + target
+		}
+		resp, ok, err := d.reattachBridge(capability, endpoint, requestHosts(urls), target)
+		if err != nil {
+			return nil, err
+		}
+		if ok {
 			return resp, nil
 		}
 	}
 
 	if host != self {
-		return d.remoteBridgeOpen(ctx, self, host, browser, profile, window)
+		return d.remoteBridgeOpen(ctx, self, host, browser, profile, urls, window)
 	}
 
 	browserObj, err := cookie.Lookup(cookie.BrowserName(browser))
 	if err != nil {
 		return nil, err
 	}
-	resolved, imported, err := d.resolveBridgeTarget(browserObj, browser, profile, advertise)
+	resolved, imported, err := d.resolveBridgeTarget(browserObj, browser, profile, advertise, requestHosts(urls))
 	if err != nil {
 		return nil, err
 	}
@@ -188,12 +200,12 @@ func (d *Daemon) handleBridgeOpen(ctx context.Context, params map[string]any) (a
 		return nil, err
 	}
 	// Never collapsed: a shared open would piggyback one tap and share its token.
-	return d.openBridge(ctx, requestor, endpoint, browser, resolved, browserObj, headed, origin, advertise, imported)
+	return d.openBridge(ctx, requestor, endpoint, browser, resolved, browserObj, headed, origin, advertise, imported, urls)
 }
 
-func (d *Daemon) resolveBridgeTarget(browserObj cookie.Browser, browser, profile, advertise string) (string, bool, error) {
+func (d *Daemon) resolveBridgeTarget(browserObj cookie.Browser, browser, profile, advertise string, hosts []cookie.Host) (string, bool, error) {
 	if advertise == "" {
-		if _, ok := d.imports.live(importKey{browser: browser, profile: profile}, d.now()); ok {
+		if rec, ok := d.imports.live(importKey{browser: browser, profile: profile}, d.now()); ok && rec.covers(hosts) {
 			return profile, true, nil
 		}
 	}
@@ -201,22 +213,42 @@ func (d *Daemon) resolveBridgeTarget(browserObj cookie.Browser, browser, profile
 	return resolved, false, err
 }
 
-// reattachBridge returns the live session's reply when capability keys it and
-// its endpoint matches, without extending the lease.
-func (d *Daemon) reattachBridge(capability, endpoint string) (any, bool) {
+func (d *Daemon) reattachBridge(capability, endpoint string, hosts []cookie.Host, target string) (any, bool, error) {
 	d.bridgeMu.Lock()
 	sess, ok := d.bridges[capability]
 	d.bridgeMu.Unlock()
 	if !ok || sess.Endpoint() != endpoint || !sess.Live() {
-		return nil, false
+		return nil, false, nil
 	}
-	return sess.OpenResult(), true
+	if missing := uncoveredHosts(sess.Hosts(), hosts); len(missing) > 0 {
+		return nil, false, fmt.Errorf("bridge %s is open for %s, not %s: run `cookiesync bridge stop %s`, then open it again with every URL the task needs",
+			target, joinHosts(sess.Hosts()), joinHosts(missing), target)
+	}
+	return sess.OpenResult(), true, nil
+}
+
+func uncoveredHosts(have, want []cookie.Host) []cookie.Host {
+	var missing []cookie.Host
+	for _, h := range want {
+		if !slices.Contains(have, h) {
+			missing = append(missing, h)
+		}
+	}
+	return missing
+}
+
+func joinHosts(hosts []cookie.Host) string {
+	names := make([]string, len(hosts))
+	for i, h := range hosts {
+		names[i] = string(h)
+	}
+	return strings.Join(names, ", ")
 }
 
 // openBridge is the fresh-open critical path: the biometric tap, the seed read,
 // launch, CDP seed, and WS relay. A deferred cleanup installed before launch
 // tears down a half-open browser on any failure.
-func (d *Daemon) openBridge(ctx context.Context, requestor, endpoint, browser, profile string, browserObj cookie.Browser, headed bool, origin, advertise string, imported bool) (any, error) {
+func (d *Daemon) openBridge(ctx context.Context, requestor, endpoint, browser, profile string, browserObj cookie.Browser, headed bool, origin, advertise string, imported bool, urls []string) (any, error) {
 	if d.processes == nil {
 		return nil, errors.New("bridge: managed process owner is unavailable")
 	}
@@ -230,7 +262,7 @@ func (d *Daemon) openBridge(ctx context.Context, requestor, endpoint, browser, p
 			releaseSlots()
 		}
 	}()
-	storage, counts, ttl, importExpiry, err := d.bridgeSeed(ctx, requestor, browser, profile, browserObj, origin, imported)
+	storage, counts, ttl, importExpiry, err := d.bridgeSeed(ctx, requestor, browser, profile, browserObj, origin, imported, urls)
 	if err != nil {
 		return nil, err
 	}
@@ -314,6 +346,7 @@ func (d *Daemon) openBridge(ctx context.Context, requestor, endpoint, browser, p
 		token:        token,
 		capability:   capability,
 		endpoint:     endpoint,
+		hosts:        requestHosts(urls),
 		browser:      browser,
 		profile:      profile,
 		wsURL:        server.URL(),
@@ -362,14 +395,15 @@ func (d *Daemon) publishBridge(sess *bridgeSession, ttl time.Duration, importExp
 	return nil
 }
 
-func (d *Daemon) bridgeSeed(ctx context.Context, requestor, browser, profile string, browserObj cookie.Browser, origin string, imported bool) (cookie.StorageState, cookie.SeedCounts, time.Duration, time.Time, error) {
+func (d *Daemon) bridgeSeed(ctx context.Context, requestor, browser, profile string, browserObj cookie.Browser, origin string, imported bool, urls []string) (cookie.StorageState, cookie.SeedCounts, time.Duration, time.Time, error) {
+	hosts := requestHosts(urls)
 	if imported {
 		now := d.now()
 		rec, ok := d.imports.live(importKey{browser: browser, profile: profile}, now)
 		if !ok {
 			return cookie.StorageState{}, cookie.SeedCounts{}, 0, time.Time{}, fmt.Errorf("import for %s/%s expired before bridge startup", browser, profile)
 		}
-		storage, counts := rec.seed(now)
+		storage, counts := rec.seed(now, hosts)
 		return storage, counts, min(d.broker.BridgeTTL(), rec.expiresAt.Sub(now)), rec.expiresAt, nil
 	}
 	st, err := d.state.Load(ctx)
@@ -380,13 +414,14 @@ func (d *Daemon) bridgeSeed(ctx context.Context, requestor, browser, profile str
 		Requestor: requestor,
 		Browser:   browser,
 		Profile:   profile,
+		Reason:    "open a live browser bridge for " + joinHosts(hosts),
 		Origin:    origin,
 		Mode:      auth.ModeLocal,
 	})
 	if err != nil {
 		return cookie.StorageState{}, cookie.SeedCounts{}, 0, time.Time{}, err
 	}
-	storage, counts, err := d.seedSource(ctx, browserObj, profile, key)
+	storage, counts, err := d.seedSource(ctx, urls, browserObj, profile, key)
 	if err != nil {
 		return cookie.StorageState{}, cookie.SeedCounts{}, 0, time.Time{}, fmt.Errorf("seed source %s/%s: %w", browser, profile, err)
 	}

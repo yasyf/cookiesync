@@ -159,7 +159,7 @@ func TestUnderivableRequestorRefusedBeforeAnyGrantOrCacheUse(t *testing.T) {
 		{"get_web_storage single", "get_web_storage", map[string]any{"browser": "chrome", "urls": []any{"https://x.com/"}}},
 		{"get_web_storage all", "get_web_storage", map[string]any{"urls": []any{"https://x.com/"}}},
 		{"extract", "extract", map[string]any{"browser": "chrome"}},
-		{"bridge_open", "bridge_open", map[string]any{"browser": "chrome"}},
+		{"bridge_open", "bridge_open", map[string]any{"browser": "chrome", "urls": []any{"https://x.com/"}}},
 	}
 	for _, peer := range []struct {
 		name string
