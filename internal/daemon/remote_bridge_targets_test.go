@@ -23,7 +23,7 @@ func TestRemoteBridgeOpenForwardsTheWindowMode(t *testing.T) {
 			d, _, _ := newProxyDaemon(t, runner)
 			t.Cleanup(func() { d.closeAllBridges(context.Background()) })
 
-			params := map[string]any{"browser": "chrome", "host": "you@desktop"}
+			params := map[string]any{"browser": "chrome", "host": "you@desktop", "urls": []any{"https://app.slack.com/"}}
 			for k, v := range tt.params {
 				params[k] = v
 			}
@@ -31,7 +31,7 @@ func TestRemoteBridgeOpenForwardsTheWindowMode(t *testing.T) {
 				t.Fatalf("cross-host bridge_open %v: %v", tt.params, err)
 			}
 			want := regexp.MustCompile(`^cookiesync rpc bridge_open --browser 'chrome' --profile 'Default' --origin 'me@laptop' --advertise '127\.0\.0\.1:[0-9]+'` +
-				regexp.QuoteMeta(tt.suffix) + `$`)
+				regexp.QuoteMeta(tt.suffix) + ` -- 'https://app\.slack\.com/'$`)
 			if shelled := shelledCmd(t, runner, "bridge_open"); !want.MatchString(shelled) {
 				t.Fatalf("shelled bridge_open = %q, want it to match %s", shelled, want)
 			}
@@ -44,7 +44,7 @@ func TestRemoteBridgeOpenAcceptsAnyPlatformsBrowser(t *testing.T) {
 	d, _, _ := newProxyDaemon(t, runner)
 	t.Cleanup(func() { d.closeAllBridges(context.Background()) })
 
-	if _, err := dispatchSelf(t, d, "bridge_open", map[string]any{"browser": "arc", "host": "you@desktop"}); err != nil {
+	if _, err := dispatchSelf(t, d, "bridge_open", map[string]any{"browser": "arc", "host": "you@desktop", "urls": []any{"https://app.slack.com/"}}); err != nil {
 		t.Fatalf("cross-host bridge_open of the peer's arc: %v", err)
 	}
 	if shelled := shelledCmd(t, runner, "bridge_open"); !strings.Contains(shelled, "--browser 'arc'") {
@@ -56,7 +56,7 @@ func TestRemoteBridgeOpenRejectsABrowserNoPlatformRegisters(t *testing.T) {
 	runner := &recordingRunner{byMethod: map[string]string{"bridge_open": cannedBridgeOpenReply}}
 	d, _, _ := newProxyDaemon(t, runner)
 
-	_, err := dispatchSelf(t, d, "bridge_open", map[string]any{"browser": "nosuch", "host": "you@desktop"})
+	_, err := dispatchSelf(t, d, "bridge_open", map[string]any{"browser": "nosuch", "host": "you@desktop", "urls": []any{"https://app.slack.com/"}})
 	if err == nil || err.Error() != `unknown browser "nosuch"` {
 		t.Fatalf("cross-host bridge_open of an unknown browser = %v, want unknown browser \"nosuch\"", err)
 	}

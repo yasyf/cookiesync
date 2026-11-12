@@ -51,6 +51,17 @@ func Applies(hostKey HostKey, host Host) bool {
 	return rh == hk
 }
 
+// AppliesAny reports whether a browser would send a cookie with this hostKey to
+// any of hosts.
+func AppliesAny(hostKey HostKey, hosts []Host) bool {
+	for _, host := range hosts {
+		if Applies(hostKey, host) {
+			return true
+		}
+	}
+	return false
+}
+
 func isScheme(s string) bool {
 	if s == "" || !isSchemeByte(s[0]) {
 		return false

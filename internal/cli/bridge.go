@@ -94,15 +94,13 @@ type bridgeListJSON struct {
 	Sessions        []bridgeStatusResult `json:"sessions"`
 }
 
-// openBridge runs the tapped, consent-gated bridge_open behind both `bridge
-// open` and the plugin's browser.launch, persisting the capability and tearing
-// the session down if it can't be saved. A package var for the plugin tests' stub.
-var openBridge = func(ctx context.Context, build, host, browser, profile string, window bridge.WindowMode) (bridgeOpenResult, error) {
+var openBridge = func(ctx context.Context, build, host, browser, profile string, urls []string, window bridge.WindowMode) (bridgeOpenResult, error) {
 	key := bridgeCapKey(host, browser, profile)
 	params := map[string]any{
 		"browser": browser,
 		"profile": profile,
 		"host":    host,
+		"urls":    asAnySlice(urls),
 	}
 	setWindowParam(params, window)
 	if r, ok := resolveRequestor(); ok {
@@ -171,15 +169,24 @@ func newBridgeOpenCmd() *cobra.Command {
 	var headed, headless, asJSON bool
 	var browser, profile string
 	cmd := &cobra.Command{
-		Use:   "open [host:browser:profile]",
-		Short: "Launch a throwaway Chrome seeded with your cookies and print its ws:// endpoint.",
-		Args:  cobra.MaximumNArgs(1),
+		Use:   "open [host:browser:profile] <url>...",
+		Short: "Launch a throwaway Chrome seeded with only the URLs' cookies and storage and print its ws:// endpoint.",
+		Long: "Launch a throwaway Chrome seeded with the cookies a browser would send to each URL's " +
+			"host, plus those hosts' local and session storage, and print its ws:// endpoint. " +
+			"Nothing else in the profile is read.\n\n" +
+			"Name every URL the task visits up front: a later open of the same target reuses the " +
+			"live bridge only when it was seeded for every URL asked for.",
+		Args: cobra.MinimumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			host, br, prof, err := parseBridgeTarget(arg(args), browser, profile)
+			target, urls := splitBridgeArgs(args)
+			if len(urls) == 0 {
+				return errors.New("bridge open: name the URLs to seed, as cookiesync bridge open [host:browser:profile] <url> [<url>]")
+			}
+			host, br, prof, err := parseBridgeTarget(target, browser, profile)
 			if err != nil {
 				return err
 			}
-			resp, err := openBridge(cmd.Context(), cmd.Root().Version, host, br, prof, windowMode(cmd, headed, headless))
+			resp, err := openBridge(cmd.Context(), cmd.Root().Version, host, br, prof, urls, windowMode(cmd, headed, headless))
 			if err != nil {
 				return err
 			}
@@ -302,6 +309,15 @@ func arg(args []string) string {
 		return args[0]
 	}
 	return ""
+}
+
+func splitBridgeArgs(args []string) (string, []string) {
+	if _, br, _, err := parseBridgeTarget(args[0], "", ""); err == nil {
+		if _, ok := cookie.BrowserNames[cookie.BrowserName(br)]; ok {
+			return args[0], args[1:]
+		}
+	}
+	return "", args
 }
 
 // parseBridgeTarget resolves a "[host:]browser[:profile]" target, with the

@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -21,8 +23,6 @@ import (
 
 const awaitSlice = synckit.DispatchTimeout / 2
 
-// unionSSHConcurrency bounds the concurrent ssh dials getCookiesAll's remote leg makes,
-// so a wide mesh does not open one ssh process per remote endpoint at once.
 const unionSSHConcurrency = 4
 
 // unionReadTimeout bounds one peer's get_cookies leg in the browser-less union read; the
@@ -391,13 +391,6 @@ func (d *Daemon) handleRequestBridgeConsent(ctx context.Context, params map[stri
 	}
 }
 
-// handleGetCookies renders cookies for one or more urls, merged into one set. With a
-// "browser" param it reads that one endpoint via getCookiesSingle — the frozen
-// {"cookies": [...]} path a peer's ssh leg drives. With no "browser" it unions every
-// registered endpoint — local browsers and remote hosts over ssh — via getCookiesAll,
-// emitting {"cookies": [...], "warnings": [...]}. The recursion guard lives in the CLI:
-// the remote leg always sends --browser, so a peer daemon takes the single path and
-// never re-fans-out the union over ssh.
 func (d *Daemon) handleGetCookies(ctx context.Context, params map[string]any) (any, error) {
 	if optionalString(params, "browser", "") == "" {
 		urls, err := urlsParam(params)
@@ -408,12 +401,13 @@ func (d *Daemon) handleGetCookies(ctx context.Context, params map[string]any) (a
 		if err != nil {
 			return nil, err
 		}
-		if optionalString(params, "origin", "") == "" {
+		host := optionalString(params, "host", "")
+		if host == "" && optionalString(params, "origin", "") == "" {
 			if reply, ok := d.importedCookiesUnion(urls); ok {
 				return reply, nil
 			}
 		}
-		return d.getCookiesAll(ctx, requestor, urls)
+		return d.getCookiesAll(ctx, requestor, urls, host)
 	}
 	return d.getCookiesSingle(ctx, params)
 }
@@ -473,19 +467,7 @@ func (d *Daemon) getCookiesSingle(ctx context.Context, params map[string]any) (a
 	return cookiesPayload(cookie.Merge(sets...)), nil
 }
 
-// getCookiesAll unions the cookies for every url across every registered endpoint —
-// local browsers and remote hosts — best-effort: an endpoint that fails is skipped with
-// a per-endpoint warning, and only a total shutout is an error. Zero endpoints at all
-// is the AuthRequired backstop (the CLI auto-registers locals first). The local leg is
-// one LocalKeys(OneFlight) broker sweep — at most one release flight for the whole
-// call, everything still cold after it a "skip cold" warning. The remote leg fans out
-// in parallel over a bounded ssh semaphore — never errgroup, whose first-error cancel
-// would abort the best-effort union. Deliberate asymmetry: the all path keys grants by
-// the local requestor ladder — it is never peer-driven, since the recursion guard
-// forbids a peer re-fanning out — where only the single path is peer-driven and
-// origin-keyed. MergeRanked breaks last_update_utc ties for the local machine. Emits
-// {"cookies": [...], "warnings": [...]}.
-func (d *Daemon) getCookiesAll(ctx context.Context, requestor string, urls []string) (any, error) {
+func (d *Daemon) getCookiesAll(ctx context.Context, requestor string, urls []string, host string) (any, error) {
 	self, err := meshSelf(ctx)
 	if err != nil {
 		return nil, err
@@ -494,25 +476,41 @@ func (d *Daemon) getCookiesAll(ctx context.Context, requestor string, urls []str
 	if err != nil {
 		return nil, err
 	}
-	var remotes []state.Endpoint
-	for _, ep := range st.Endpoints() {
-		if ep.Host != self {
-			remotes = append(remotes, ep)
-		}
+	var sets []cookie.RankedSet
+	var warnings, read []string
+	local := host == "" || host == self
+	if local {
+		host = self
+		sets, warnings, read, err = d.localCookieSets(ctx, requestor, st, urls)
+	} else {
+		sets, warnings, read, err = d.peerCookieSets(ctx, st, host, urls)
 	}
-	outcomes, err := d.broker.LocalKeysWithState(ctx, requestor, consentReason, auth.OneFlight, st)
 	if err != nil {
 		return nil, err
 	}
-	if len(outcomes)+len(remotes) == 0 {
-		return nil, &consentkit.AuthRequired{Msg: "no browsers are tracked; run cookiesync browser add"}
+	cookies := cookie.MergeRanked(sets...)
+	missing, err := missingCookies(ctx, host, local, urls, cookies, read)
+	if err != nil {
+		return nil, err
 	}
+	if len(cookies) == 0 {
+		return nil, errors.New(strings.Join(append(missing, warnings...), "\n"))
+	}
+	reply := cookiesPayload(cookies)
+	if notes := slices.Concat(warnings, missing); len(notes) > 0 {
+		reply["warnings"] = notes
+	}
+	return reply, nil
+}
 
-	var sets []cookie.RankedSet
-	var warnings []string
-
-	// LOCAL leg: render the broker sweep — a released or warm key extracts,
-	// everything else is a per-endpoint skip warning.
+func (d *Daemon) localCookieSets(ctx context.Context, requestor string, st *state.State, urls []string) (sets []cookie.RankedSet, warnings, read []string, err error) {
+	outcomes, err := d.broker.LocalKeysWithState(ctx, requestor, consentReason, auth.OneFlight, st)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	if len(outcomes) == 0 {
+		return nil, nil, nil, &consentkit.AuthRequired{Msg: "no browsers on this host are tracked; run cookiesync browser add"}
+	}
 	for _, oc := range outcomes {
 		switch {
 		case oc.Err != nil:
@@ -543,14 +541,29 @@ func (d *Daemon) getCookiesAll(ctx context.Context, requestor string, urls []str
 			continue
 		}
 		sets = append(sets, cookie.RankedSet{Cookies: cookie.Merge(urlSets...), Local: true})
+		read = append(read, oc.Browser+":"+oc.Profile)
 	}
+	if len(sets) == 0 {
+		return nil, nil, nil, noContributionError(warnings, nil)
+	}
+	return sets, warnings, read, nil
+}
 
-	// REMOTE leg: parallel over a bounded semaphore, best-effort.
+func (d *Daemon) peerCookieSets(ctx context.Context, st *state.State, host string, urls []string) (sets []cookie.RankedSet, warnings, read []string, err error) {
+	var endpoints []state.Endpoint
+	for _, ep := range st.Endpoints() {
+		if ep.Host == host {
+			endpoints = append(endpoints, ep)
+		}
+	}
+	if len(endpoints) == 0 {
+		return nil, nil, nil, fmt.Errorf("no browsers on %s are tracked; cookiesync browser ls lists every tracked host", host)
+	}
 	var mu sync.Mutex
 	var wg sync.WaitGroup
 	var pending []string
 	sem := make(chan struct{}, unionSSHConcurrency)
-	for _, ep := range remotes {
+	for _, ep := range endpoints {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -572,18 +585,83 @@ func (d *Daemon) getCookiesAll(ctx context.Context, requestor string, urls []str
 				return
 			}
 			sets = append(sets, cookie.RankedSet{Cookies: cookies, Local: false})
+			read = append(read, ep.Browser+":"+ep.Profile)
 		}()
 	}
 	wg.Wait()
-
 	if len(sets) == 0 {
-		return nil, noContributionError(warnings, pending)
+		return nil, nil, nil, noContributionError(warnings, pending)
 	}
-	reply := cookiesPayload(cookie.MergeRanked(sets...))
-	if len(warnings) > 0 {
-		reply["warnings"] = warnings
+	sort.Strings(read)
+	return sets, warnings, read, nil
+}
+
+func missingCookies(ctx context.Context, host string, local bool, urls []string, cookies []cookie.Cookie, read []string) ([]string, error) {
+	var missing []string
+	var hosts []cookie.Host
+	for _, url := range urls {
+		h := cookie.NormalizeHost(url)
+		if !slices.ContainsFunc(cookies, func(c cookie.Cookie) bool { return cookie.Applies(c.HostKey, h) }) {
+			missing = append(missing, url)
+			hosts = append(hosts, h)
+		}
 	}
-	return reply, nil
+	if len(missing) == 0 {
+		return nil, nil
+	}
+	holders := make([]profileHolder, len(hosts))
+	if local {
+		var err error
+		if holders, err = profilesHolding(ctx, hosts, read); err != nil {
+			return nil, err
+		}
+	}
+	lines := make([]string, len(missing))
+	for i, url := range missing {
+		lines[i] = fmt.Sprintf("no cookies for %s in %s on %s", hosts[i], strings.Join(read, ", "), host)
+		if h := holders[i]; h.count > 0 {
+			lines[i] += fmt.Sprintf("; %s:%s holds %d: run cookiesync cookies --browser %s --profile %q %s", h.browser, h.profile, h.count, h.browser, h.profile, url)
+			continue
+		}
+		lines[i] += fmt.Sprintf(": sign in at %s in Chrome or Arc on %s, then run this again", url, host)
+	}
+	return lines, nil
+}
+
+type profileHolder struct {
+	browser string
+	profile string
+	count   int
+}
+
+func profilesHolding(ctx context.Context, hosts []cookie.Host, read []string) ([]profileHolder, error) {
+	registry, err := cookie.Registry()
+	if err != nil {
+		return nil, err
+	}
+	best := make([]profileHolder, len(hosts))
+	for _, name := range slices.Sorted(maps.Keys(registry)) {
+		b := registry[name]
+		profiles, err := b.Profiles()
+		if err != nil {
+			return nil, err
+		}
+		for _, p := range profiles {
+			if slices.Contains(read, string(name)+":"+p.Dir) {
+				continue
+			}
+			counts, err := cookie.CountLive(ctx, b, p.Dir, hosts)
+			if err != nil {
+				return nil, fmt.Errorf("count %s:%s cookies: %w", name, p.Dir, err)
+			}
+			for i, n := range counts {
+				if n > best[i].count {
+					best[i] = profileHolder{browser: string(name), profile: p.Dir, count: n}
+				}
+			}
+		}
+	}
+	return best, nil
 }
 
 // handleGetWebStorage renders the web storage (localStorage + sessionStorage) for one
@@ -835,7 +913,7 @@ func wireCookiesParam(params map[string]any, key string) ([]cookie.Cookie, error
 func urlsParam(params map[string]any) ([]string, error) {
 	raw, ok := params["urls"].([]any)
 	if !ok || len(raw) == 0 {
-		return nil, errors.New("get_cookies requires non-empty urls")
+		return nil, errors.New("urls must be a non-empty list")
 	}
 	urls := make([]string, len(raw))
 	for i, v := range raw {

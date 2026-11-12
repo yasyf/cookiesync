@@ -23,6 +23,7 @@ func TestSeedState(t *testing.T) {
 	insertRaw(t, dbPath, ".alpha.example", "session", "/", mustEncrypt(t, "three", key, ".alpha.example"), 0)
 	insertRaw(t, dbPath, ".alpha.example", "garbage", "/", []byte{0xff}, live)
 	insertRaw(t, dbPath, ".beta.example", "expired", "/", mustEncrypt(t, "stale", key, ".beta.example"), expired)
+	insertRaw(t, dbPath, ".gamma.example", "gamma", "/", mustEncrypt(t, "unasked", key, ".gamma.example"), live)
 
 	if err := os.MkdirAll(browser.LocalStorageDir(profile), 0o700); err != nil {
 		t.Fatalf("mkdir local storage: %v", err)
@@ -30,6 +31,7 @@ func TestSeedState(t *testing.T) {
 	writeLevelDB(t, browser.LocalStorageDir(profile), map[string][]byte{
 		string(lsKey("https://alpha.example", "local-alpha")): latin1Val("one"),
 		string(lsKey("https://beta.example", "local-beta")):   latin1Val("two"),
+		string(lsKey("https://gamma.example", "local-gamma")): latin1Val("unasked"),
 	})
 	if err := os.MkdirAll(browser.SessionStorageDir(profile), 0o700); err != nil {
 		t.Fatalf("mkdir session storage: %v", err)
@@ -41,7 +43,8 @@ func TestSeedState(t *testing.T) {
 		"map-9-session-beta":                         utf16LEBytes("four"),
 	})
 
-	state, counts, err := darwinCodec.seedState(context.Background(), browser, profile, key)
+	urls := []string{"https://alpha.example/login", "beta.example"}
+	state, counts, err := darwinCodec.seedState(context.Background(), urls, browser, profile, key)
 	if err != nil {
 		t.Fatalf("SeedState: %v", err)
 	}
@@ -103,5 +106,27 @@ func TestSeedState(t *testing.T) {
 	}
 	if !reflect.DeepEqual(state, want) {
 		t.Fatalf("SeedState = %#v, want %#v", state, want)
+	}
+}
+
+func TestCountLiveDecryptsNothing(t *testing.T) {
+	browser := makeBrowser(t, t.TempDir(), "Default")
+	dbPath := browser.CookiesDB("Default")
+	initDB(t, dbPath, v24SQL)
+
+	now := float64(time.Now().Unix())
+	live := unixSecondsToChromeMicros(now + 86_400)
+	expired := unixSecondsToChromeMicros(now - 86_400)
+	insertRaw(t, dbPath, ".slack.com", "d", "/", []byte{0xff}, live)
+	insertRaw(t, dbPath, "app.slack.com", "lc", "/", []byte{0xff}, 0)
+	insertRaw(t, dbPath, ".slack.com", "stale", "/", []byte{0xff}, expired)
+	insertRaw(t, dbPath, ".github.com", "user_session", "/", []byte{0xff}, live)
+
+	got, err := darwinCodec.countLive(context.Background(), browser, "Default", []Host{"app.slack.com", "slack.com", "example.com"})
+	if err != nil {
+		t.Fatalf("countLive: %v", err)
+	}
+	if want := []int{2, 1, 0}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("countLive = %v, want %v", got, want)
 	}
 }

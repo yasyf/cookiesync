@@ -46,7 +46,11 @@ An agent that needs your GitHub session shouldn't hold your GitHub password. Str
 cookiesync cookies https://github.com --format header
 ```
 
-One Touch ID tap approves the requestor, and the command prints a ready-to-paste `Cookie` header — the one output this README deliberately doesn't screenshot. It unions every registered browser and host by default; add `--browser chrome` to pin one. Pass several URLs (an app plus the API host it calls) to get a single Playwright `storageState` spanning them all, off one cached-key decrypt.
+One Touch ID tap approves the requestor, and the command prints a ready-to-paste `Cookie` header — the one output this README deliberately doesn't screenshot. It unions this Mac's registered browsers by default; add `--browser chrome` to pin one, or `--host` with a host from `cookiesync browser ls` to read that host's browsers over SSH instead. Pass several URLs (an app plus the API host it calls) to get a single Playwright `storageState` spanning them all, off one cached-key decrypt.
+
+When a URL gets no cookie, a stderr line says what to do next: the untracked Chrome or Arc profile on this Mac that holds that site's cookies, with the `cookiesync cookies --browser … --profile …` command that reads it, or where to sign in. The profile count reads cookie rows and decrypts no value. When no URL gets a cookie, the command fails with those lines instead of printing an empty document.
+
+An agent that needs a live browser gets one seeded with only the sites it names. `cookiesync bridge open https://github.com` starts a Chrome holding just github.com's cookies and storage and prints its CDP URL; the Touch ID prompt names those hosts.
 
 ### Keep 2FA and SSO logins alive on every machine
 
@@ -145,7 +149,8 @@ TTL expiry does not revoke cookies already returned by `cookies`, stored by your
 | `browser add/ls/rm` | Track, list, and untrack the browser profiles synced across hosts. |
 | `browser profiles <browser>` | List this host's profiles for a browser that hold a cookie store. |
 | `auth` | Release the Safe Storage key behind one Touch ID tap and cache it for a short window; omit `--browser` to prime every registered browser at once. `--wait <d>` holds until a Mac with a live session can approve, then prompts once; a denial exits 3 and a timeout exits 4. |
-| `cookies <url>...` | Stream cookies for one or more URLs as `playwright`, `netscape`, `header`, `json`, or `webstorage`; omit `--browser` to union every registered browser and host. |
+| `cookies <url>...` | Stream cookies for one or more URLs as `playwright`, `netscape`, `header`, `json`, or `webstorage`; omit `--browser` to union this host's registered browsers, or add `--host <host>` to union another host's. |
+| `bridge open [host:browser:profile] <url>...` | Start a Chrome seeded with only the named URLs' cookies and storage and print its CDP URL; `bridge stop` closes it. |
 | `import --ttl <d> --format <f> --browser <b> --profile <p> -- <host>...` | Linux only. Hold a Mac-exported cookies or web-storage document in memory for the named hosts until the TTL lapses. |
 | `route-consent <target>` | Route the consent gate to a host that already has a live, unlocked session. |
 | `settings watch-debounce <d>` | Store the watch debounce in `state.json` without touching the manifest or any service; the next `install` writes it into the synckit manifest. |

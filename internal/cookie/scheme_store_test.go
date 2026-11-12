@@ -111,7 +111,7 @@ func TestSchemeLinuxKeyringRowsFailTheWholeReadWithoutTheKey(t *testing.T) {
 	if state, err := linuxCodec.extract(context.Background(), "https://x.com/", browser, linuxBasicKey, "Default", true, false); !errors.Is(err, ErrV11KeyUnavailable) || len(state.Cookies) != 0 {
 		t.Fatalf("extract = %v, %v; want ErrV11KeyUnavailable and no cookies", state.Cookies, err)
 	}
-	if state, counts, err := linuxCodec.seedState(context.Background(), browser, "Default", linuxBasicKey); !errors.Is(err, ErrV11KeyUnavailable) || len(state.Cookies) != 0 || counts != (SeedCounts{}) {
+	if state, counts, err := linuxCodec.seedState(context.Background(), []string{"https://x.com/"}, browser, "Default", linuxBasicKey); !errors.Is(err, ErrV11KeyUnavailable) || len(state.Cookies) != 0 || counts != (SeedCounts{}) {
 		t.Fatalf("seedState = %v, %+v, %v; want ErrV11KeyUnavailable", state.Cookies, counts, err)
 	}
 }

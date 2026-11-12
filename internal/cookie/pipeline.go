@@ -89,14 +89,12 @@ func (c codec) decryptRow(row EncryptedRow, key AesKey, counts *DecryptCounts) (
 // session cookie (no expiry) is always live; otherwise its expiry must not be in the
 // past. now is Unix seconds, matching the Python expires >= now comparison.
 func isLive(cookie Cookie, now float64, includeExpired bool) bool {
-	if includeExpired {
-		return true
-	}
-	expires, session := chromeMicrosToUnix(cookie.ExpiresUTC)
-	if session {
-		return true
-	}
-	return expires >= now
+	return includeExpired || unexpired(cookie.ExpiresUTC, now)
+}
+
+func unexpired(expiresUTC ChromeMicros, now float64) bool {
+	expires, session := chromeMicrosToUnix(expiresUTC)
+	return session || expires >= now
 }
 
 // Live reports whether cookie survives Extract's expiry filter at now (Unix seconds): a

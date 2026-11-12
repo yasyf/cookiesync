@@ -51,11 +51,11 @@ func TestRPCBridgeOpenForwardsTheWindowMode(t *testing.T) {
 			var out bytes.Buffer
 			cmd.SetOut(&out)
 			cmd.SetErr(&out)
-			cmd.SetArgs(append([]string{"--browser", "chrome"}, tt.args...))
+			cmd.SetArgs(append(append([]string{"--browser", "chrome"}, tt.args...), "--", "https://app.slack.com/", "--flag-shaped"))
 			if err := cmd.Execute(); err != nil {
 				t.Fatalf("rpc bridge_open %v: %v\n%s", tt.args, err, out.String())
 			}
-			want := map[string]any{"host": "", "browser": "chrome", "profile": "Default", "origin": "", "advertise": ""}
+			want := map[string]any{"host": "", "browser": "chrome", "profile": "Default", "origin": "", "advertise": "", "urls": []any{"https://app.slack.com/", "--flag-shaped"}}
 			if tt.headed != nil {
 				want["headed"] = tt.headed
 			}
@@ -63,5 +63,22 @@ func TestRPCBridgeOpenForwardsTheWindowMode(t *testing.T) {
 				t.Fatalf("rpc bridge_open %v called %s %v, want bridge_open %v", tt.args, gotMethod, gotParams, want)
 			}
 		})
+	}
+}
+
+func TestRPCBridgeOpenRequiresAURL(t *testing.T) {
+	orig := rpcCall
+	rpcCall = func(context.Context, string, string, map[string]any) (any, error) {
+		t.Fatal("a bridge_open with no URL must not reach the daemon")
+		return nil, nil
+	}
+	t.Cleanup(func() { rpcCall = orig })
+
+	cmd := newRPCBridgeOpenCmd()
+	cmd.SetOut(&bytes.Buffer{})
+	cmd.SetErr(&bytes.Buffer{})
+	cmd.SetArgs([]string{"--browser", "chrome", "--origin", "me@laptop", "--advertise", "127.0.0.1:5555"})
+	if err := cmd.Execute(); err == nil {
+		t.Fatal("rpc bridge_open with no URL succeeded")
 	}
 }

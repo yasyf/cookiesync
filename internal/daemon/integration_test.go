@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -160,12 +161,7 @@ func TestGetCookiesHostFilters(t *testing.T) {
 	}
 }
 
-// TestGetCookiesUnionLocalAndRemote proves a browser-less get_cookies unions a warm
-// local endpoint with a remote one — the remote leg driving the peer's single-browser
-// get_cookies over ssh — into one merged set. The recorded ssh command carries the
-// recursion guard (--browser) and the origin tag, so the peer takes the single path and
-// never re-fans-out.
-func TestGetCookiesUnionLocalAndRemote(t *testing.T) {
+func TestGetCookiesReadsThisHostUnlessAHostIsNamed(t *testing.T) {
 	ctx := context.Background()
 	browser := chromeStoreUnderHome(t)
 	key := cookie.DeriveKey(cookie.SafeStorageKey("peanuts"))
@@ -189,28 +185,95 @@ func TestGetCookiesUnionLocalAndRemote(t *testing.T) {
 	_, _ = cache.Put(ctx, endpointID(self, "chrome", "Default"), []byte(key), 0)
 	d.grant(ownSessionPrincipal(t), []cookie.BrowserName{"chrome"}, time.Hour)
 
-	got, err := dispatchSelf(t, d, "get_cookies", map[string]any{"urls": []any{"https://x.com/"}})
-	if err != nil {
-		t.Fatalf("handleGetCookies union: %v", err)
+	remoteReads := func() []string {
+		var cmds []string
+		for _, call := range runner.calls {
+			if strings.Contains(call.cmd, "rpc get_cookies") {
+				cmds = append(cmds, call.cmd)
+			}
+		}
+		return cmds
 	}
-	cookies := wireCookieNames(t, got)
-	if len(cookies) != 2 || cookies["loc"].Value != "here" || cookies["rem"].Value != "there" {
-		t.Fatalf("union = %+v, want loc=here rem=there", cookies)
+
+	for _, params := range []map[string]any{
+		{"urls": []any{"https://x.com/"}},
+		{"urls": []any{"https://x.com/"}, "host": self},
+	} {
+		got, err := dispatchSelf(t, d, "get_cookies", params)
+		if err != nil {
+			t.Fatalf("get_cookies %v: %v", params, err)
+		}
+		if cookies := wireCookieNames(t, got); len(cookies) != 1 || cookies["loc"].Value != "here" {
+			t.Fatalf("get_cookies %v = %+v, want only this host's loc=here", params, cookies)
+		}
+	}
+	if cmds := remoteReads(); len(cmds) != 0 {
+		t.Fatalf("a read of this host dialed a peer: %q", cmds)
 	}
 	if len(consent.promptedReasons) != 0 {
 		t.Fatalf("a warm+granted local endpoint must not prompt, got %v", consent.promptedReasons)
 	}
-	remoteCmd := ""
-	for _, call := range runner.calls {
-		if strings.Contains(call.cmd, "rpc get_cookies") {
-			remoteCmd = call.cmd
-		}
+
+	got, err := dispatchSelf(t, d, "get_cookies", map[string]any{"urls": []any{"https://x.com/"}, "host": "you@desktop"})
+	if err != nil {
+		t.Fatalf("get_cookies --host you@desktop: %v", err)
 	}
-	if remoteCmd == "" {
-		t.Fatalf("the remote leg never drove rpc get_cookies; calls = %+v", runner.calls)
+	if cookies := wireCookieNames(t, got); len(cookies) != 1 || cookies["rem"].Value != "there" {
+		t.Fatalf("the named host's read = %+v, want only its rem=there", cookies)
 	}
-	if !strings.Contains(remoteCmd, "rpc get_cookies --browser") || !strings.Contains(remoteCmd, "--origin") {
-		t.Fatalf("remote cmd = %q, want the single-path recursion guard (--browser) and --origin", remoteCmd)
+	cmds := remoteReads()
+	if len(cmds) != 1 {
+		t.Fatalf("the named host's read drove rpc get_cookies %d times, want 1; calls = %+v", len(cmds), runner.calls)
+	}
+	if !strings.Contains(cmds[0], "rpc get_cookies --browser") || !strings.Contains(cmds[0], "--origin") {
+		t.Fatalf("remote cmd = %q, want the single-path recursion guard (--browser) and --origin", cmds[0])
+	}
+
+	_, err = dispatchSelf(t, d, "get_cookies", map[string]any{"urls": []any{"https://x.com/"}, "host": "stranger@host"})
+	if err == nil || !strings.Contains(err.Error(), "no browsers on stranger@host are tracked") {
+		t.Fatalf("a read of an untracked host = %v, want it to name the host", err)
+	}
+}
+
+func TestGetCookiesNamesTheNextStepForAMissingHost(t *testing.T) {
+	ctx := context.Background()
+	browser := chromeStoreUnderHome(t)
+	key := cookie.DeriveKey(cookie.SafeStorageKey("peanuts"))
+	tracked := []cookie.Cookie{{HostKey: "x.com", Name: "sid", Value: "abc", Path: "/", LastUpdateUTC: 13_350_000_000_000_000, SameSite: 2, IsSecure: true, SourceScheme: 2, SourcePort: 443}}
+	if _, err := cookie.Apply(ctx, tracked, browser, "Default", key); err != nil {
+		t.Fatalf("seed Default: %v", err)
+	}
+	addChromeProfileStore(t, browser, "Profile 1")
+	untracked := []cookie.Cookie{{HostKey: ".slack.com", Name: "d", Value: "xoxd", Path: "/", ExpiresUTC: liveExpiresUTC, LastUpdateUTC: 13_350_000_000_000_000, SameSite: 0, IsSecure: true, SourceScheme: 2, SourcePort: 443}}
+	if _, err := cookie.Apply(ctx, untracked, browser, "Profile 1", key); err != nil {
+		t.Fatalf("seed Profile 1: %v", err)
+	}
+
+	self := "me@laptop"
+	fakeMesh(t, self)
+	st := stateWith(self, "", stateEndpoint(self, "chrome", "Default"))
+	cache := newFakeCache()
+	d := New(&fakeConsent{key: key}, cache, nil, staticProbe(SessionSnapshot{}), &recordingRunner{}, fixedState{st: st}, fixedState{st: st})
+	_, _ = cache.Put(ctx, endpointID(self, "chrome", "Default"), []byte(key), 0)
+	d.grant(ownSessionPrincipal(t), []cookie.BrowserName{"chrome"}, time.Hour)
+
+	slackStep := `no cookies for app.slack.com in chrome:Default on me@laptop; chrome:Profile 1 holds 1: run cookiesync cookies --browser chrome --profile "Profile 1" https://app.slack.com/`
+	signInStep := "no cookies for github.com in chrome:Default on me@laptop: sign in at https://github.com/ in Chrome or Arc on me@laptop, then run this again"
+
+	got, err := dispatchSelf(t, d, "get_cookies", map[string]any{"urls": []any{"https://x.com/", "https://app.slack.com/", "https://github.com/"}})
+	if err != nil {
+		t.Fatalf("get_cookies with two missing hosts: %v", err)
+	}
+	if cookies := wireCookieNames(t, got); len(cookies) != 1 || cookies["sid"].Value != "abc" {
+		t.Fatalf("get_cookies = %+v, want only the tracked profile's sid=abc", cookies)
+	}
+	if warnings := decodeWarnings(t, got); !slices.Equal(warnings, []string{slackStep, signInStep}) {
+		t.Fatalf("warnings = %q, want the two next steps %q", warnings, []string{slackStep, signInStep})
+	}
+
+	_, err = dispatchSelf(t, d, "get_cookies", map[string]any{"urls": []any{"https://app.slack.com/"}})
+	if err == nil || err.Error() != slackStep {
+		t.Fatalf("a read with no cookie for any url = %v, want the error %q", err, slackStep)
 	}
 }
 
@@ -226,53 +289,23 @@ func (r *timeoutDiagnosticRunner) Run(ctx context.Context, target, _ string, _ [
 	return "", &hostregistry.SSHError{Addr: target, Stderr: r.diagnostic + "\n", Err: ctx.Err()}
 }
 
-func unionRemoteCookie() cookie.Cookie {
-	return cookie.Cookie{HostKey: "x.com", Name: "rem", Value: "there", Path: "/", LastUpdateUTC: 13_350_000_000_000_000, SameSite: 2, IsSecure: true, SourceScheme: 2, SourcePort: 443}
-}
-
-func unionWarning(t *testing.T, peers []string, runner engine.SSHRunner, wantRemote bool) string {
+func peerReadFailure(t *testing.T, peer string, runner engine.SSHRunner) string {
 	t.Helper()
-	ctx := context.Background()
-	browser := chromeStoreUnderHome(t)
-	key := cookie.DeriveKey(cookie.SafeStorageKey("peanuts"))
-	local := []cookie.Cookie{{HostKey: "x.com", Name: "loc", Value: "here", Path: "/", LastUpdateUTC: 13_350_000_000_000_000, SameSite: 2, IsSecure: true, SourceScheme: 2, SourcePort: 443}}
-	if _, err := cookie.Apply(ctx, local, browser, "Default", key); err != nil {
-		t.Fatalf("seed apply: %v", err)
-	}
-
+	chromeStoreUnderHome(t)
 	self := "me@laptop"
-	fakeMesh(t, self, peers...)
-	endpoints := make([]state.Endpoint, 0, 1+len(peers))
-	endpoints = append(endpoints, stateEndpoint(self, "chrome", "Default"))
-	for _, peer := range peers {
-		endpoints = append(endpoints, stateEndpoint(peer, "chrome", "Default"))
-	}
-	st := stateWith(self, "", endpoints...)
-	cache := newFakeCache()
-	d := New(&fakeConsent{key: key}, cache, nil, staticProbe(SessionSnapshot{}), runner, fixedState{st: st}, fixedState{st: st})
-	_, _ = cache.Put(ctx, endpointID(self, "chrome", "Default"), []byte(key), 0)
-	d.grant(ownSessionPrincipal(t), []cookie.BrowserName{"chrome"}, time.Hour)
+	fakeMesh(t, self, peer)
+	st := stateWith(self, "", stateEndpoint(self, "chrome", "Default"), stateEndpoint(peer, "chrome", "Default"))
+	d := New(&fakeConsent{}, newFakeCache(), nil, staticProbe(SessionSnapshot{}), runner, fixedState{st: st}, fixedState{st: st})
 
 	start := time.Now()
-	got, err := dispatchSelf(t, d, "get_cookies", map[string]any{"urls": []any{"https://x.com/"}})
-	if err != nil {
-		t.Fatalf("handleGetCookies union: %v", err)
-	}
+	_, err := dispatchSelf(t, d, "get_cookies", map[string]any{"urls": []any{"https://x.com/"}, "host": peer})
 	if elapsed := time.Since(start); elapsed > 2*time.Second {
-		t.Fatalf("union waited %v on a wedged peer; unionReadTimeout must bound it", elapsed)
+		t.Fatalf("the read waited %v on a wedged peer; unionReadTimeout must bound it", elapsed)
 	}
-	cookies := wireCookieNames(t, got)
-	if cookies["loc"].Value != "here" {
-		t.Fatalf("union dropped the warm local cookie: %+v", cookies)
+	if err == nil {
+		t.Fatalf("a read whose one endpoint failed must error")
 	}
-	if _, gotRemote := cookies["rem"]; gotRemote != wantRemote {
-		t.Fatalf("union rem present = %v, want %v: %+v", gotRemote, wantRemote, cookies)
-	}
-	warnings := decodeWarnings(t, got)
-	if len(warnings) != 1 {
-		t.Fatalf("want exactly one skip warning, got %v", warnings)
-	}
-	return warnings[0]
+	return err.Error()
 }
 
 // TestUnionSkipPreservesPeerStderrOnTimeout proves the stderr an SSHError
@@ -284,7 +317,7 @@ func TestUnionSkipPreservesPeerStderrOnTimeout(t *testing.T) {
 
 	host := "wedged@desktop"
 	diagnostic := "cookiesync: profile locked by another process"
-	warning := unionWarning(t, []string{host}, &timeoutDiagnosticRunner{diagnostic: diagnostic}, false)
+	warning := peerReadFailure(t, host, &timeoutDiagnosticRunner{diagnostic: diagnostic})
 	if !strings.Contains(warning, "peer reported: "+diagnostic) {
 		t.Fatalf("warning = %q, want the captured peer stderr %q verbatim", warning, diagnostic)
 	}
@@ -297,43 +330,23 @@ func TestUnionSkipDistinguishesPeerErrorFromTimeout(t *testing.T) {
 	unionReadTimeout = 25 * time.Millisecond
 	t.Cleanup(func() { unionReadTimeout = restore })
 
+	const peer = "wedged@desktop"
 	tests := []struct {
-		name       string
-		peers      []string
-		runner     func(t *testing.T) engine.SSHRunner
-		wantRemote bool
-		contains   []string
-		absent     []string
+		name     string
+		runner   engine.SSHRunner
+		contains []string
+		absent   []string
 	}{
 		{
-			name:  "bare timeout",
-			peers: []string{"wedged@desktop"},
-			runner: func(*testing.T) engine.SSHRunner {
-				return &wedgedTargetRunner{inner: &recordingRunner{}, wedged: "wedged@desktop"}
-			},
-			contains: []string{endpointID("wedged@desktop", "chrome", "Default"), "consent may be pending", "cookiesync doctor on wedged@desktop", "TCC / Full Disk Access"},
+			name:     "bare timeout",
+			runner:   &wedgedTargetRunner{inner: &recordingRunner{}, wedged: peer},
+			contains: []string{endpointID(peer, "chrome", "Default"), "consent may be pending", "cookiesync doctor on " + peer, "TCC / Full Disk Access"},
 			absent:   []string{"is the daemon running"},
 		},
 		{
-			name:  "bare timeout beside healthy peer",
-			peers: []string{"wedged@desktop", "healthy@desktop"},
-			runner: func(t *testing.T) engine.SSHRunner {
-				return &wedgedTargetRunner{
-					inner:  &recordingRunner{perTarget: map[string]string{"healthy@desktop": peerExtractReply(t, unionRemoteCookie())}},
-					wedged: "wedged@desktop",
-				}
-			},
-			wantRemote: true,
-			contains:   []string{endpointID("wedged@desktop", "chrome", "Default"), "consent may be pending"},
-			absent:     []string{endpointID("healthy@desktop", "chrome", "Default")},
-		},
-		{
-			name:  "peer error",
-			peers: []string{"wedged@desktop"},
-			runner: func(*testing.T) engine.SSHRunner {
-				return &recordingRunner{err: errors.New("ssh: connect refused")}
-			},
-			contains: []string{endpointID("wedged@desktop", "chrome", "Default"), "ssh: connect refused", "is the daemon running on wedged@desktop?"},
+			name:     "peer error",
+			runner:   &recordingRunner{err: errors.New("ssh: connect refused")},
+			contains: []string{endpointID(peer, "chrome", "Default"), "ssh: connect refused", "is the daemon running on " + peer + "?"},
 			absent:   []string{"consent may be pending", "cookiesync doctor"},
 		},
 	}
@@ -341,7 +354,7 @@ func TestUnionSkipDistinguishesPeerErrorFromTimeout(t *testing.T) {
 	warnings := make(map[string]string, len(tests))
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			warning := unionWarning(t, tc.peers, tc.runner(t), tc.wantRemote)
+			warning := peerReadFailure(t, peer, tc.runner)
 			for _, want := range tc.contains {
 				if !strings.Contains(warning, want) {
 					t.Fatalf("warning = %q, want it to contain %q", warning, want)
@@ -369,49 +382,7 @@ func TestUnionReadTimeoutIsDataPlane(t *testing.T) {
 	}
 }
 
-// TestGetCookiesUnionLocalWinsTie proves the conflict rule: when a local and a remote
-// endpoint carry the same logical cookie with an equal last_update_utc but a different
-// value, MergeRanked keeps the LOCAL machine's value.
-func TestGetCookiesUnionLocalWinsTie(t *testing.T) {
-	ctx := context.Background()
-	browser := chromeStoreUnderHome(t)
-	key := cookie.DeriveKey(cookie.SafeStorageKey("peanuts"))
-	const stamp = 13_350_000_000_000_000
-	local := []cookie.Cookie{{HostKey: "x.com", Name: "sid", Value: "localwins", Path: "/", LastUpdateUTC: stamp, SameSite: 2, IsSecure: true, SourceScheme: 2, SourcePort: 443}}
-	if _, err := cookie.Apply(ctx, local, browser, "Default", key); err != nil {
-		t.Fatalf("seed apply: %v", err)
-	}
-
-	self := "me@laptop"
-	fakeMesh(t, self, "you@desktop")
-	st := stateWith(self, "",
-		stateEndpoint(self, "chrome", "Default"),
-		stateEndpoint("you@desktop", "chrome", "Default"),
-	)
-	runner := &recordingRunner{byMethod: map[string]string{
-		"rpc get_cookies": peerExtractReply(t, cookie.Cookie{HostKey: "x.com", Name: "sid", Value: "remotewins", Path: "/", LastUpdateUTC: stamp, SameSite: 2, IsSecure: true, SourceScheme: 2, SourcePort: 443}),
-	}}
-	cache := newFakeCache()
-	d := New(&fakeConsent{key: key}, cache, nil, staticProbe(SessionSnapshot{}), runner, fixedState{st: st}, fixedState{st: st})
-	_, _ = cache.Put(ctx, endpointID(self, "chrome", "Default"), []byte(key), 0)
-	d.grant(ownSessionPrincipal(t), []cookie.BrowserName{"chrome"}, time.Hour)
-
-	got, err := dispatchSelf(t, d, "get_cookies", map[string]any{"urls": []any{"https://x.com/"}})
-	if err != nil {
-		t.Fatalf("handleGetCookies union: %v", err)
-	}
-	cookies := wireCookieNames(t, got)
-	if len(cookies) != 1 || cookies["sid"].Value != "localwins" {
-		t.Fatalf("tie union = %+v, want the local value 'localwins'", cookies)
-	}
-}
-
-// TestGetCookiesUnionColdLocalRoutesRemoteContributes proves the unified routing rule on
-// the union's local leg: a cold local endpoint now ROUTES consent to a live peer (exactly
-// like auth) rather than being skipped, releasing its own key non-interactively after the
-// routed approval, so the local leg contributes its cookie alongside the remote one — one
-// unified release, no local Touch ID sheet.
-func TestGetCookiesUnionColdLocalRoutesRemoteContributes(t *testing.T) {
+func TestGetCookiesColdLocalRoutesConsent(t *testing.T) {
 	ctx := context.Background()
 	browser := chromeStoreUnderHome(t)
 	key := cookie.DeriveKey(cookie.SafeStorageKey("peanuts"))
@@ -433,7 +404,6 @@ func TestGetCookiesUnionColdLocalRoutesRemoteContributes(t *testing.T) {
 		replies: map[string]string{"cookiesync rpc whoami": liveWhoami},
 		byMethod: map[string]string{
 			"request_consent": approvedReply(t, nonce, endpoint),
-			"rpc get_cookies": peerExtractReply(t, cookie.Cookie{HostKey: "x.com", Name: "rem", Value: "there", Path: "/", LastUpdateUTC: 13_350_000_000_000_000, SameSite: 2, IsSecure: true, SourceScheme: 2, SourcePort: 443}),
 		},
 	}
 	consent := &fakeConsent{key: key}
@@ -442,16 +412,19 @@ func TestGetCookiesUnionColdLocalRoutesRemoteContributes(t *testing.T) {
 
 	got, err := dispatchSelf(t, d, "get_cookies", map[string]any{"urls": []any{"https://x.com/"}})
 	if err != nil {
-		t.Fatalf("handleGetCookies union: %v", err)
+		t.Fatalf("handleGetCookies: %v", err)
 	}
 	cookies := wireCookieNames(t, got)
-	if len(cookies) != 2 || cookies["loc"].Value != "here" || cookies["rem"].Value != "there" {
-		t.Fatalf("union = %+v, want the routed-local loc=here and the remote rem=there", cookies)
+	if len(cookies) != 1 || cookies["loc"].Value != "here" {
+		t.Fatalf("get_cookies = %+v, want only the routed-local loc=here", cookies)
 	}
 	routed := false
 	for _, call := range runner.calls {
 		if strings.Contains(call.cmd, "request_consent") {
 			routed = true
+		}
+		if strings.Contains(call.cmd, "rpc get_cookies") {
+			t.Fatalf("a read of this host read the peer's browsers: %q", call.cmd)
 		}
 	}
 	if !routed {
@@ -465,10 +438,7 @@ func TestGetCookiesUnionColdLocalRoutesRemoteContributes(t *testing.T) {
 	}
 }
 
-// TestGetCookiesUnionColdLocalRouteDeniedRemoteContributes proves the best-effort skip: a
-// cold local leg that tries to route but finds no live approver is skipped with a warning
-// naming the endpoint, the remote endpoint still contributes, and no key is released.
-func TestGetCookiesUnionColdLocalRouteDeniedRemoteContributes(t *testing.T) {
+func TestGetCookiesColdLocalRouteDeniedErrors(t *testing.T) {
 	chromeStoreUnderHome(t)
 	self := "me@laptop"
 	peer := "you@desktop"
@@ -477,40 +447,27 @@ func TestGetCookiesUnionColdLocalRouteDeniedRemoteContributes(t *testing.T) {
 		stateEndpoint(self, "chrome", "Default"),
 		stateEndpoint(peer, "chrome", "Default"),
 	)
-	// The peer is locked, so routing finds no live approver: the cold local leg fails
-	// closed and is skipped while the remote leg still contributes.
-	runner := &recordingRunner{
-		replies: map[string]string{"cookiesync rpc whoami": deadWhoami},
-		byMethod: map[string]string{
-			"rpc get_cookies": peerExtractReply(t, cookie.Cookie{HostKey: "x.com", Name: "rem", Value: "there", Path: "/", LastUpdateUTC: 13_350_000_000_000_000, SameSite: 2, IsSecure: true, SourceScheme: 2, SourcePort: 443}),
-		},
-	}
+	runner := &recordingRunner{replies: map[string]string{"cookiesync rpc whoami": deadWhoami}}
 	consent := &fakeConsent{key: cookie.DeriveKey(cookie.SafeStorageKey("peanuts"))}
 	d := New(consent, newFakeCache(), nil, staticProbe(SessionSnapshot{}), runner, fixedState{st: st}, fixedState{st: st})
 
-	got, err := dispatchSelf(t, d, "get_cookies", map[string]any{"urls": []any{"https://x.com/"}})
-	if err != nil {
-		t.Fatalf("handleGetCookies union: %v", err)
-	}
-	cookies := wireCookieNames(t, got)
-	if len(cookies) != 1 || cookies["rem"].Value != "there" {
-		t.Fatalf("union = %+v, want only the remote rem=there", cookies)
+	_, err := dispatchSelf(t, d, "get_cookies", map[string]any{"urls": []any{"https://x.com/"}})
+	if err == nil || !strings.Contains(err.Error(), "skip cold") || !strings.Contains(err.Error(), endpointID(self, "chrome", "Default")) {
+		t.Fatalf("get_cookies = %v, want an error carrying one 'skip cold' naming the local endpoint", err)
 	}
 	if consent.unpromptedCalled != 0 || len(consent.promptedReasons) != 0 {
 		t.Fatalf("a denied route must neither release nor prompt, got unprompted %d prompts %v", consent.unpromptedCalled, consent.promptedReasons)
 	}
-	warnings := decodeWarnings(t, got)
-	if len(warnings) != 1 || !strings.Contains(warnings[0], "skip cold") || !strings.Contains(warnings[0], endpointID(self, "chrome", "Default")) {
-		t.Fatalf("warnings = %v, want one 'skip cold' naming the local endpoint", warnings)
-	}
 }
 
-// TestGetCookiesUnionBrokenLocalStoreSkipped proves best-effort per endpoint: a
-// warm+granted local endpoint whose store cannot be read is skipped with a warning
-// instead of failing the whole union, and the remote endpoint still contributes.
 func TestGetCookiesUnionBrokenLocalStoreSkipped(t *testing.T) {
 	ctx := context.Background()
 	browser := chromeStoreUnderHome(t)
+	key := cookie.DeriveKey(cookie.SafeStorageKey("peanuts"))
+	local := []cookie.Cookie{{HostKey: "x.com", Name: "loc", Value: "here", Path: "/", LastUpdateUTC: 13_350_000_000_000_000, SameSite: 2, IsSecure: true, SourceScheme: 2, SourcePort: 443}}
+	if _, err := cookie.Apply(ctx, local, browser, "Default", key); err != nil {
+		t.Fatalf("seed apply: %v", err)
+	}
 	garbage := browser.CookiesDB("Ghost")
 	if err := os.MkdirAll(filepath.Dir(garbage), 0o750); err != nil {
 		t.Fatalf("mkdir ghost profile: %v", err)
@@ -520,27 +477,24 @@ func TestGetCookiesUnionBrokenLocalStoreSkipped(t *testing.T) {
 	}
 
 	self := "me@laptop"
-	fakeMesh(t, self, "you@desktop")
+	fakeMesh(t, self)
 	st := stateWith(self, "",
 		stateEndpoint(self, "chrome", "Ghost"),
-		stateEndpoint("you@desktop", "chrome", "Default"),
+		stateEndpoint(self, "chrome", "Default"),
 	)
-	runner := &recordingRunner{byMethod: map[string]string{
-		"rpc get_cookies": peerExtractReply(t, cookie.Cookie{HostKey: "x.com", Name: "rem", Value: "there", Path: "/", LastUpdateUTC: 13_350_000_000_000_000, SameSite: 2, IsSecure: true, SourceScheme: 2, SourcePort: 443}),
-	}}
-	key := cookie.DeriveKey(cookie.SafeStorageKey("peanuts"))
 	cache := newFakeCache()
-	d := New(&fakeConsent{key: key}, cache, nil, staticProbe(SessionSnapshot{}), runner, fixedState{st: st}, fixedState{st: st})
+	d := New(&fakeConsent{key: key}, cache, nil, staticProbe(SessionSnapshot{}), &recordingRunner{}, fixedState{st: st}, fixedState{st: st})
 	_, _ = cache.Put(ctx, endpointID(self, "chrome", "Ghost"), []byte(key), 0)
+	_, _ = cache.Put(ctx, endpointID(self, "chrome", "Default"), []byte(key), 0)
 	d.grant(ownSessionPrincipal(t), []cookie.BrowserName{"chrome"}, time.Hour)
 
 	got, err := dispatchSelf(t, d, "get_cookies", map[string]any{"urls": []any{"https://x.com/"}})
 	if err != nil {
-		t.Fatalf("handleGetCookies union: %v", err)
+		t.Fatalf("handleGetCookies: %v", err)
 	}
 	cookies := wireCookieNames(t, got)
-	if len(cookies) != 1 || cookies["rem"].Value != "there" {
-		t.Fatalf("union = %+v, want only the remote rem=there", cookies)
+	if len(cookies) != 1 || cookies["loc"].Value != "here" {
+		t.Fatalf("get_cookies = %+v, want only the readable profile's loc=here", cookies)
 	}
 	warnings := decodeWarnings(t, got)
 	if len(warnings) != 1 || !strings.Contains(warnings[0], endpointID(self, "chrome", "Ghost")) {
@@ -580,9 +534,6 @@ func TestGetCookiesUnionLiveLocalOneEvaluation(t *testing.T) {
 	}
 }
 
-// TestGetCookiesUnionZeroContributorsErrors proves a total shutout — cold local skipped,
-// remote ssh down — fails with an error that suggests cookiesync auth, rather than
-// serving an empty document.
 func TestGetCookiesUnionZeroContributorsErrors(t *testing.T) {
 	chromeStoreUnderHome(t)
 	self := "me@laptop"
@@ -600,9 +551,6 @@ func TestGetCookiesUnionZeroContributorsErrors(t *testing.T) {
 	}
 }
 
-// TestUnionTotalShutoutErrorCarriesWarnings proves a total shutout keeps every
-// accumulated skip warning in the error: a timed-out peer leads with the
-// consent-pending summary, a hard peer error keeps the auth hint.
 func TestUnionTotalShutoutErrorCarriesWarnings(t *testing.T) {
 	restore := unionReadTimeout
 	unionReadTimeout = 25 * time.Millisecond
@@ -630,29 +578,16 @@ func TestUnionTotalShutoutErrorCarriesWarnings(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			ctx := context.Background()
-			browser := chromeStoreUnderHome(t)
-			garbage := browser.CookiesDB("Ghost")
-			if err := os.MkdirAll(filepath.Dir(garbage), 0o750); err != nil {
-				t.Fatalf("mkdir ghost profile: %v", err)
-			}
-			if err := os.WriteFile(garbage, []byte("not a sqlite database"), 0o600); err != nil {
-				t.Fatalf("write ghost store: %v", err)
-			}
-
+			chromeStoreUnderHome(t)
 			self := "me@laptop"
 			fakeMesh(t, self, peer)
 			st := stateWith(self, "",
-				stateEndpoint(self, "chrome", "Ghost"),
 				stateEndpoint(peer, "chrome", "Default"),
+				stateEndpoint(peer, "chrome", "Profile 1"),
 			)
-			key := cookie.DeriveKey(cookie.SafeStorageKey("peanuts"))
-			cache := newFakeCache()
-			d := New(&fakeConsent{key: key}, cache, nil, staticProbe(SessionSnapshot{}), tc.runner(), fixedState{st: st}, fixedState{st: st})
-			_, _ = cache.Put(ctx, endpointID(self, "chrome", "Ghost"), []byte(key), 0)
-			d.grant(ownSessionPrincipal(t), []cookie.BrowserName{"chrome"}, time.Hour)
+			d := New(&fakeConsent{}, newFakeCache(), nil, staticProbe(SessionSnapshot{}), tc.runner(), fixedState{st: st}, fixedState{st: st})
 
-			_, err := dispatchSelf(t, d, "get_cookies", map[string]any{"urls": []any{"https://x.com/"}})
+			_, err := dispatchSelf(t, d, "get_cookies", map[string]any{"urls": []any{"https://x.com/"}, "host": peer})
 			if err == nil {
 				t.Fatalf("total shutout must error")
 			}
@@ -664,8 +599,8 @@ func TestUnionTotalShutoutErrorCarriesWarnings(t *testing.T) {
 				t.Fatalf("shutout error = %q, want it free of %q", msg, tc.absent)
 			}
 			for _, skip := range []string{
-				"\n  skip " + endpointID(self, "chrome", "Ghost"),
 				"\n  skip " + endpointID(peer, "chrome", "Default"),
+				"\n  skip " + endpointID(peer, "chrome", "Profile 1"),
 			} {
 				if !strings.Contains(msg, skip) {
 					t.Fatalf("shutout error = %q, want the indented skip warning %q", msg, skip)
@@ -801,10 +736,6 @@ func TestGetCookiesSinglePeerDrivenLivePromptsAndGrantsOrigin(t *testing.T) {
 	}
 }
 
-// TestRemoteGetCookiesFencesFlagShapedURL proves the union's remote leg fences untrusted
-// urls behind an end-of-flags "--": a url spelled like a flag reaches the peer as a
-// positional after "--", so it can neither flip the peer off its single path (the
-// recursion guard) nor override the origin the peer keys its grant on.
 func TestRemoteGetCookiesFencesFlagShapedURL(t *testing.T) {
 	chromeStoreUnderHome(t)
 	self := "me@laptop"
@@ -815,8 +746,8 @@ func TestRemoteGetCookiesFencesFlagShapedURL(t *testing.T) {
 	}}
 	d := New(&fakeConsent{}, newFakeCache(), nil, staticProbe(SessionSnapshot{}), runner, fixedState{st: st}, fixedState{st: st})
 
-	if _, err := dispatchSelf(t, d, "get_cookies", map[string]any{"urls": []any{"https://x.com/", "--browser="}}); err != nil {
-		t.Fatalf("union with a flag-shaped url: %v", err)
+	if _, err := dispatchSelf(t, d, "get_cookies", map[string]any{"urls": []any{"https://x.com/", "--browser="}, "host": "you@desktop"}); err != nil {
+		t.Fatalf("a named host's read with a flag-shaped url: %v", err)
 	}
 	remoteCmd := ""
 	for _, call := range runner.calls {
