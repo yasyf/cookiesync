@@ -97,7 +97,7 @@ bridge_from_import() {
     return
   fi
   set +e
-  "$bin" bridge open --json >"$root/stdout" 2>"$root/stderr"
+  "$bin" bridge open --json -- app.example.test >"$root/stdout" 2>"$root/stderr"
   status=$?
   set -e
   if [[ $status -ne 0 ]]; then
@@ -221,7 +221,7 @@ expect_closed "auth --reason smoke" auth --reason smoke
 for format in playwright webstorage header; do
   expect_closed "cookies --format $format" cookies --format "$format" -- example.com
 done
-expect_closed "bridge open --json" bridge open --json
+expect_closed "bridge open --json" bridge open --json -- example.com
 if grep -qF "no peer has a live session to approve consent" "$root/stderr"; then
   pass "bridge open: bare target reached consent routing with no live approver"
 else

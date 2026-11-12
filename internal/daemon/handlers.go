@@ -544,7 +544,7 @@ func (d *Daemon) localCookieSets(ctx context.Context, requestor string, st *stat
 		read = append(read, oc.Browser+":"+oc.Profile)
 	}
 	if len(sets) == 0 {
-		return nil, nil, nil, noContributionError(warnings, nil)
+		return nil, nil, nil, noContributionError("cookies", warnings, nil)
 	}
 	return sets, warnings, read, nil
 }
@@ -590,7 +590,7 @@ func (d *Daemon) peerCookieSets(ctx context.Context, st *state.State, host strin
 	}
 	wg.Wait()
 	if len(sets) == 0 {
-		return nil, nil, nil, noContributionError(warnings, pending)
+		return nil, nil, nil, noContributionError("cookies", warnings, pending)
 	}
 	sort.Strings(read)
 	return sets, warnings, read, nil
@@ -745,6 +745,7 @@ func (d *Daemon) getWebStorageAll(ctx context.Context, params map[string]any) (a
 
 	acc := map[string]*originAcc{}
 	var warnings []string
+	contributed := 0
 	for _, oc := range outcomes {
 		switch {
 		case oc.Err != nil:
@@ -765,6 +766,10 @@ func (d *Daemon) getWebStorageAll(ctx context.Context, params map[string]any) (a
 			continue
 		}
 		mergeOrigins(acc, origins)
+		contributed++
+	}
+	if contributed == 0 {
+		return nil, noContributionError("web storage", warnings, nil)
 	}
 	reply := originsPayload(collectOrigins(acc))
 	if len(warnings) > 0 {
