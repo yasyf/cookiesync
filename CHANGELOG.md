@@ -6,6 +6,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.35.1] - 2026-11-17
+
+### Fixed
+
+- **A failed key release says what failed.** When the key helper exits 1,
+  `cookiesync auth`, `cookiesync cookies` and the bridge now print the helper's
+  own error instead of `Touch ID authentication was cancelled or denied`. A
+  vault re-enrollment that macOS refused with OSStatus -25293 on a Mac with no
+  usable Touch ID read as a cancelled prompt after a correct passcode entry;
+  authkit 0.3.1 fixes that enrollment.
+
 ## [0.35.0] - 2026-11-12
 
 ### Changed

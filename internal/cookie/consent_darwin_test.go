@@ -282,15 +282,22 @@ func TestObtainKeysWholeBatchFailures(t *testing.T) {
 	cases := []struct {
 		name             string
 		batchCode        int
+		batchStderr      string
 		wantMsgPart      string
 		wantKeybagLocked bool
 	}{
-		{name: "denied sheet", batchCode: 1, wantMsgPart: "cancelled or denied"},
+		{name: "denied sheet", batchCode: 1, batchStderr: "authkit: vault-batch-retrieve: denied (LAError -2)\n", wantMsgPart: "denied (LAError -2)"},
+		{
+			name:        "failed enrollment is reported as itself",
+			batchCode:   1,
+			batchStderr: "authkit: vault-batch-retrieve: SecItemAdd failed: The user name or passphrase you entered is not correct. (OSStatus -25293)\n",
+			wantMsgPart: "SecItemAdd failed: The user name or passphrase you entered is not correct. (OSStatus -25293)",
+		},
 		{name: "keybag locked is retryable", batchCode: 3, wantMsgPart: "retry after unlock", wantKeybagLocked: true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			script, logPath, _ := writeFakeHelper(t, fakeHelperSpec{batchCode: tc.batchCode})
+			script, logPath, _ := writeFakeHelper(t, fakeHelperSpec{batchCode: tc.batchCode, batchStderr: tc.batchStderr})
 			c := TouchIDConsent{Helper: helper.Bridge{Binary: script}}
 
 			outcomes, err := c.ObtainKeys(context.Background(), []Browser{chrome(t), arc(t)}, "post a tweet")
@@ -303,6 +310,9 @@ func TestObtainKeysWholeBatchFailures(t *testing.T) {
 			}
 			if !strings.Contains(consentErr.Msg, tc.wantMsgPart) {
 				t.Fatalf("ConsentError msg = %q, want it to contain %q", consentErr.Msg, tc.wantMsgPart)
+			}
+			if strings.Contains(consentErr.Msg, "cancelled") {
+				t.Fatalf("ConsentError msg = %q, must report the helper's failure, never assume a cancel", consentErr.Msg)
 			}
 			if got := errors.Is(err, ErrKeybagLocked); got != tc.wantKeybagLocked {
 				t.Fatalf("errors.Is(err, ErrKeybagLocked) = %v, want %v", got, tc.wantKeybagLocked)

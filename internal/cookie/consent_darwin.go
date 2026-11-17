@@ -77,7 +77,7 @@ func (c TouchIDConsent) ObtainKeyBiometric(ctx context.Context, browser Browser,
 	case 0:
 		return DeriveKey(SafeStorageKey(res.Stdout)), nil
 	case 1:
-		return nil, &ConsentError{Msg: "Touch ID (biometric) was cancelled or denied"}
+		return nil, &ConsentError{Msg: fmt.Sprintf("Touch ID (biometric) release failed: %s", bytes.TrimSpace(res.Stderr))}
 	case helper.CodePresenceUnavailable:
 		return nil, &ConsentError{Msg: "biometric authentication unavailable (no enrolled biometry, locked out, or screen locked)", Err: ErrKeybagLocked}
 	case 2:
@@ -89,8 +89,9 @@ func (c TouchIDConsent) ObtainKeyBiometric(ctx context.Context, browser Browser,
 
 // ObtainKeys releases every browser's Safe Storage key behind one Touch ID (or
 // passcode) sheet via vault-batch-retrieve, which enrolls a missing vault item
-// under the same authentication. A denied sheet or a locked keybag fails the
-// whole batch with a ConsentError; no biometry and no passcode (exit 2) degrades
+// under the same authentication. Exit 1 (a denied sheet or a failed read or
+// enrollment) or a locked keybag fails the whole batch with a ConsentError
+// carrying the helper's stderr; no biometry and no passcode (exit 2) degrades
 // to bare per-browser Keychain reads; a rejected caller (exit 4) never degrades.
 func (c TouchIDConsent) ObtainKeys(ctx context.Context, browsers []Browser, reason string) ([]KeyOutcome, error) {
 	items := make([]helper.VaultItem, len(browsers))
@@ -105,7 +106,7 @@ func (c TouchIDConsent) ObtainKeys(ctx context.Context, browsers []Browser, reas
 	case 0:
 		return batchOutcomes(browsers, res)
 	case 1:
-		return nil, &ConsentError{Msg: "Touch ID authentication was cancelled or denied"}
+		return nil, &ConsentError{Msg: fmt.Sprintf("Touch ID key release failed: %s", bytes.TrimSpace(res.Stderr))}
 	case 2:
 		return bareOutcomes(ctx, browsers), nil
 	case helper.CodePresenceUnavailable:
